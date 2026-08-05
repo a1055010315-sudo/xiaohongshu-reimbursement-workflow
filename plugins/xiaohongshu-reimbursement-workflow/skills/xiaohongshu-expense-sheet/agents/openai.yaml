@@ -1,4 +1,0 @@
-interface:
-  display_name: "小红书支出表整理"
-  short_description: "安全整理、核验、排序、合并并规范小红书支出明细 Excel 表格"
-  default_prompt: "使用 $xiaohongshu-expense-sheet：先一次性扫描并逐项核对疑点，再从原表副本批量整理；保留原字体和格式，按相邻支出人+备注重建 D/E/F 费用组合，按要求统一居中，验收后按指定位置交付；删除任何垃圾文件前先向我确认。"

@@ -1,7 +1,7 @@
 {
   "name": "xiaohongshu-reimbursement-workflow",
-  "version": "0.2.0",
-  "description": "One-call Xiaohongshu reimbursement workflow with aggregate-only summaries and guarded master-ledger publishing.",
+  "version": "0.3.0",
+  "description": "Single-entry Xiaohongshu reimbursement workflow with embedded Excel rules and guarded master-ledger publishing.",
   "author": {
     "name": "a1055010315-sudo",
     "url": "https://github.com/a1055010315-sudo"

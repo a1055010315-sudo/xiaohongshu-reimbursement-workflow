@@ -4,8 +4,9 @@
 
 仓库只包含插件说明和 skill，不包含报销截图、财务数据、账号凭证或本机路径。
 
-## 0.2.0 输出与可靠性
+## 0.3.0 单一入口、输出与可靠性
 
+- 插件只暴露一个总工作流 skill；Excel 整理与验收规则已内嵌为内部 reference，`/` 或 `$` 选择器不再出现第二个 expense skill。
 - 报销文字说明只写时间段、每人/分类汇总、费用合计和实报合计，不写逐笔明细。
 - 文字说明不引用截图文件名、目录、路径、SHA256、序号或位置；截图与明细的对应关系仅用于任务内部核验。
 - 汇总金额使用整数分精确计算并由脚本稳定输出真实 TAB，最多两位小数并去掉无意义的末尾零。
@@ -74,8 +75,8 @@ codex plugin marketplace upgrade xiaohongshu-finance
 
 ## 插件内容
 
-- `xiaohongshu-reimbursement-workflow`：唯一需要用户显式调用的总控工作流。
-- `xiaohongshu-expense-sheet`：插件内部使用的 Excel 整理与验收能力。
+- `xiaohongshu-reimbursement-workflow`：唯一可调用的总控工作流，内部包含 Excel 整理与验收规则。
+- `expense-workbook-rules.md`：总工作流内部读取的普通 reference，不会显示为 skill 入口。
 - `build_reimbursement_summary.mjs`：确定性生成汇总文字说明。
 - `safe_publish.ps1`：在 Windows 上执行受控总表发布。
 - `cleanup_task_temp.mjs`：依据 ownership token 安全清理本任务扁平临时目录。
