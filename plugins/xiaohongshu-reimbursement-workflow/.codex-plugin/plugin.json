@@ -1,7 +1,7 @@
 {
   "name": "xiaohongshu-reimbursement-workflow",
-  "version": "0.1.0",
-  "description": "One-call Xiaohongshu reimbursement intake, archive, audit, and controlled master-ledger publishing workflow.",
+  "version": "0.2.0",
+  "description": "One-call Xiaohongshu reimbursement workflow with aggregate-only summaries and guarded master-ledger publishing.",
   "author": {
     "name": "a1055010315-sudo",
     "url": "https://github.com/a1055010315-sudo"
@@ -19,7 +19,7 @@
   "interface": {
     "displayName": "小红书报销归档工作流",
     "shortDescription": "一次调用完成报销归档、终审和受控更新总表",
-    "longDescription": "接收文字说明和报销截图，制作或续办本次明细与归档，生成不影响根目录的候选总表快照，并通过两次明确确认完成终审和最终发布。",
+    "longDescription": "接收业务说明和报销截图，生成不含逐笔明细或截图位置的汇总文字说明，制作或续办明细与归档，并通过两次确认、哈希复核和安全脚本完成 Windows 根目录总表发布。",
     "developerName": "a1055010315-sudo",
     "category": "Productivity",
     "capabilities": [

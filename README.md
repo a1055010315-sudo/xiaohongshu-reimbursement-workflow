@@ -4,6 +4,14 @@
 
 仓库只包含插件说明和 skill，不包含报销截图、财务数据、账号凭证或本机路径。
 
+## 0.2.0 输出与可靠性
+
+- 报销文字说明只写时间段、每人/分类汇总、费用合计和实报合计，不写逐笔明细。
+- 文字说明不引用截图文件名、目录、路径、SHA256、序号或位置；截图与明细的对应关系仅用于任务内部核验。
+- 汇总金额使用整数分精确计算并由脚本稳定输出真实 TAB，最多两位小数并去掉无意义的末尾零。
+- 发布前使用同目录锁和 SHA256 复核；临时目录必须具有随机 token 与 ownership marker，清理器不做递归删除。
+- 最终更新根目录总表仅支持 Windows 10/11；其他系统可以完成归档和候选总表，但必须在最终发布前停止。
+
 ## 给同事：只需把链接交给 Codex
 
 同事不需要手动复制下面的安装命令。只需在 Codex 桌面端或 Codex CLI 中发送：
@@ -68,5 +76,8 @@ codex plugin marketplace upgrade xiaohongshu-finance
 
 - `xiaohongshu-reimbursement-workflow`：唯一需要用户显式调用的总控工作流。
 - `xiaohongshu-expense-sheet`：插件内部使用的 Excel 整理与验收能力。
+- `build_reimbursement_summary.mjs`：确定性生成汇总文字说明。
+- `safe_publish.ps1`：在 Windows 上执行受控总表发布。
+- `cleanup_task_temp.mjs`：依据 ownership token 安全清理本任务扁平临时目录。
 
 `对公已付不实报` 会计入费用合计和支出总表，但不计入实报合计。
