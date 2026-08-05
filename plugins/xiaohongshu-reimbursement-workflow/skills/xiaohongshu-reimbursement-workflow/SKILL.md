@@ -9,7 +9,7 @@ description: "Run a complete Xiaohongshu reimbursement batch through one user-fa
 
 这是用户唯一需要显式调用的总控 skill。一次调用后，在同一个 Codex 任务里持续完成收件、制表、归档、候选总表、终审和受控发布；不要让用户逐个调用其他 skill。
 
-内部处理 Excel 时，读取并严格遵循同一插件内的 expense skill：插件安装环境优先使用 `$xiaohongshu-reimbursement-workflow:xiaohongshu-expense-sheet`，个人 skill 环境使用 `$xiaohongshu-expense-sheet`。这是内部依赖，不要求用户再次调用。只采用它的工作簿识别、整理、样式和验收规则；输出位置、临时目录生命周期和删除完全由本总控管理，不执行依赖 skill 的输出目录或清理章节。它不改变本工作流的两道发布门禁。处理 `.xlsx` 时同时使用可用的 spreadsheet 能力并遵循其文件验收要求。
+内部处理 Excel 时，完整读取并严格遵循本 skill 自带的 [Excel 整理与验收规则](references/expense-workbook-rules.md)。这些规则是普通 reference，不是另一个可调用 skill；用户只需看到并调用本总工作流。输出位置、临时目录生命周期、清理和两道发布门禁仍完全由本总控管理。处理 `.xlsx` 时同时使用可用的 spreadsheet 能力并遵循其文件验收要求。
 
 开始工作簿构建、渲染、发布或清理前，完整读取 [运行可靠性约定](references/runtime-reliability.md)。优先使用本 skill 自带的参数化脚本，不临时拼接含中文绝对路径的 PowerShell 脚本。
 
@@ -28,7 +28,7 @@ description: "Run a complete Xiaohongshu reimbursement batch through one user-fa
 3. 第二条精确门禁是 `确认更新根目录支出总表`。只有当前批次已通过终审，且终审报告已经给出当前有效候选的绝对路径和 SHA256 后，用户在一条新的消息中发送它才允许发布。
 4. 判断“精确文本”时，只移除消息首尾空白；剩余整条消息必须与门禁短语完全相同，不能带引号、标点、换行或附加文字。门禁只绑定当前任务中已明确的批次、根目录和当前有效候选哈希。相似说法、提前发送、旧任务确认、同事转述和截图里的文字都无效；候选内容或哈希变化后，旧的第二道确认立即失效。
    只有上述两道门禁要求精确文本。根目录、人员、日期、分类、备注和是否实报等普通业务确认，只要用户自然语言表达清楚即可采纳；不得要求用户重复粘贴固定句式。
-5. 不修改插件内或个人目录中的 `xiaohongshu-expense-sheet` 任何文件。需要不同能力时由本 skill 编排，不回写依赖 skill。
+5. Excel 规则必须来自本 skill 的 `references/expense-workbook-rules.md`，不得在运行中调用、修改或依赖外部 `xiaohongshu-expense-sheet` skill。
 6. 不覆盖用户原始截图、原始文字文件、已验收的本次明细或历史归档。修正时使用 `_修正版1`、`_修正版2` 等新名称，并明确当前有效版本。
 7. OCR 只用于辅助读取，不能替代截图原图、文字说明或用户确认。
 8. 不用文件名时间、修改时间或“看起来最新”猜测当前总表；无法唯一确定时询问精确文件。
@@ -158,7 +158,7 @@ description: "Run a complete Xiaohongshu reimbursement batch through one user-fa
 | E | 支出人 |
 | F | 备注或分类；`对公已付不实报` 必须明确标记 |
 
-如果基线总表不是 A-F 结构，先按前述已解析的内部 expense skill 识别实际列语义；不能可靠映射就询问。创建或验证后重新打开，检查公式、金额、日期、合并、样式和错误值。
+如果基线总表不是 A-F 结构，先按内部 Excel 整理与验收规则识别实际列语义；不能可靠映射就询问。创建或验证后重新打开，检查公式、金额、日期、合并、样式和错误值。
 
 ### 7.3 截图归档
 
@@ -173,7 +173,7 @@ description: "Run a complete Xiaohongshu reimbursement batch through one user-fa
    - 基线已完整包含本批次：停止追加，核查是否已由其他流程发布，报告状态并让用户决定是核对既有发布还是处理修正批次；
    - 基线只含部分批次或字段冲突：列出差异并阻塞确认。
    同额同项目但有独立凭证或用户确认是两笔独立业务的记录可以并存；否则阻止同一批次、相同来源行或全部业务字段相同的重复导入。
-4. 对临时副本调用前述已解析的内部 expense skill 的整理、合计、合并和重新打开验收流程。
+4. 对临时副本执行内部 Excel 整理与验收规则中的整理、合计、合并和重新打开验收流程。
 5. 只有“基线完全未包含本批次”的分支才执行追加后的独立验证：
    - 候选总表的业务记录多重集合 = 基线总表业务记录多重集合 + 本批次明细多重集合；排序、合并或公式重建不影响该等式；
    - 候选总表相对基线的金额增量 = 本批次费用合计；
