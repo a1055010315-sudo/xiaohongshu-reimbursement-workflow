@@ -1,0 +1,37 @@
+{
+  "name": "xiaohongshu-reimbursement-workflow",
+  "version": "0.1.0",
+  "description": "One-call Xiaohongshu reimbursement intake, archive, audit, and controlled master-ledger publishing workflow.",
+  "author": {
+    "name": "a1055010315-sudo",
+    "url": "https://github.com/a1055010315-sudo"
+  },
+  "homepage": "https://github.com/a1055010315-sudo/xiaohongshu-reimbursement-workflow",
+  "repository": "https://github.com/a1055010315-sudo/xiaohongshu-reimbursement-workflow",
+  "keywords": [
+    "xiaohongshu",
+    "reimbursement",
+    "excel",
+    "archive",
+    "finance"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "小红书报销归档工作流",
+    "shortDescription": "一次调用完成报销归档、终审和受控更新总表",
+    "longDescription": "接收文字说明和报销截图，制作或续办本次明细与归档，生成不影响根目录的候选总表快照，并通过两次明确确认完成终审和最终发布。",
+    "developerName": "a1055010315-sudo",
+    "category": "Productivity",
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "处理这一次小红书报销，先归档并生成候选总表快照。",
+      "从已有时间段归档文件夹继续小红书报销流程。"
+    ],
+    "brandColor": "#E94B64",
+    "websiteURL": "https://github.com/a1055010315-sudo/xiaohongshu-reimbursement-workflow"
+  }
+}

@@ -1,0 +1,6 @@
+interface:
+  display_name: "小红书报销归档工作流"
+  short_description: "一次调用完成报销收件、制表、快照、终审和受控更新总表"
+  default_prompt: "使用 $xiaohongshu-reimbursement-workflow 从当前材料或已有报销文件夹开始，完成归档与候选总表快照，并按两次确认门禁终审和更新根目录总表。"
+policy:
+  allow_implicit_invocation: false

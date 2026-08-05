@@ -1,0 +1,20 @@
+{
+  "name": "xiaohongshu-finance",
+  "interface": {
+    "displayName": "小红书财务工具"
+  },
+  "plugins": [
+    {
+      "name": "xiaohongshu-reimbursement-workflow",
+      "source": {
+        "source": "local",
+        "path": "./plugins/xiaohongshu-reimbursement-workflow"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}
