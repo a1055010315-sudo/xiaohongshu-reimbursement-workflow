@@ -4,9 +4,22 @@
 
 仓库只包含插件说明和 skill，不包含报销截图、财务数据、账号凭证或本机路径。
 
-## 安装
+## 给同事：只需把链接交给 Codex
 
-需要支持插件的 Codex 桌面端或 Codex CLI。先把本仓库添加为 marketplace，再安装插件：
+同事不需要手动复制下面的安装命令。只需在 Codex 桌面端或 Codex CLI 中发送：
+
+```text
+请读取下面的 GitHub 项目，并自动为我安装、配置和验证这个 Codex 插件；除非权限或当前产品不支持，否则不要让我手动执行安装命令：
+https://github.com/a1055010315-sudo/xiaohongshu-reimbursement-workflow
+```
+
+Codex 应读取本仓库根目录的 `AGENTS.md` 和本说明，自动完成 marketplace 添加、插件安装及结果验证。安装完成后，同事只需要按 Codex 提示重新打开 Codex 或新建任务。
+
+仅发送裸链接只授权读取，不足以授权安装；加上“请安装并配置”这句话即可，其余步骤交给 Codex。
+
+## Codex 自动执行的安装步骤
+
+以下命令供 Codex 自动执行，也可用于故障排查。插件需要支持插件功能的 Codex 桌面端或 Codex CLI：
 
 ```bash
 codex plugin marketplace add a1055010315-sudo/xiaohongshu-reimbursement-workflow --ref main
