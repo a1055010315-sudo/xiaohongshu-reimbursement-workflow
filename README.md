@@ -2,14 +2,18 @@
 
 这是一个面向 Codex 的 skills-only 插件，用一次显式调用完成小红书报销的材料核对、本次明细制作、归档、候选总表快照、终审和受控发布。
 
-仓库只包含插件说明和 skill，不包含报销截图、财务数据、账号凭证或本机路径。
+仓库只包含插件说明、skills、内部 references 和参数化脚本，不包含报销截图、财务数据、账号凭证或本机路径。
 
-## 0.3.0 单一入口、输出与可靠性
+## 快速路径、输出与可靠性
 
 - 插件只暴露一个总工作流 skill；Excel 整理与验收规则已内嵌为内部 reference，`/` 或 `$` 选择器不再出现第二个 expense skill。
+- 微信材料只连续收集一次，之后全部在本地按 SHA256 差分核验；未变化图片不重复打开、导入或渲染。
+- 完整逐笔截图只在本地对应截图表验收后展示一次；目标类目固定在 Sheet1，存在公司报销时固定在 Sheet2，每张图片独占一个 `图N` 列。
+- 公司报销等非目标类目进入文字说明、独立截图归档和对应截图表，但不会进入小红书明细、候选总表或根目录总表。
 - 报销文字说明只写时间段、每人/分类汇总、费用合计和实报合计，不写逐笔明细。
-- 文字说明不引用截图文件名、目录、路径、SHA256、序号或位置；截图与明细的对应关系仅用于任务内部核验。
-- 汇总金额使用整数分精确计算并由脚本稳定输出真实 TAB，最多两位小数并去掉无意义的末尾零。
+- 文字说明不引用截图文件名、目录、路径、SHA256、序号或位置；逐笔对应关系由带嵌入图片的归档工作簿和对话中的一次完整展示承担。
+- 汇总金额使用三位小数定点整数精确计算；摘要先零落盘预览并绑定 SHA256，第一道门禁后才写最终 TXT。
+- 工作簿按“一次批量构建、一次语义验证、一次有界视觉验证”执行；内部 manifest 和验收证书只在任务临时目录，不进入最终归档。
 - 发布前使用同目录锁和 SHA256 复核；临时目录必须具有随机 token 与 ownership marker，清理器不做递归删除。
 - 最终更新根目录总表仅支持 Windows 10/11；其他系统可以完成归档和候选总表，但必须在最终发布前停止。
 
@@ -61,7 +65,7 @@ codex plugin add xiaohongshu-reimbursement-workflow@xiaohongshu-finance
 
 ## 同事已经完成前半段
 
-如果同事已经做好文字说明、报销截图和本次明细，不需要重做。新任务仍只调用一次总控 skill，并给出已有时间段文件夹和支出表根目录。Codex 验证已有成果后会从对应检查点继续；两道用户确认需要在当前任务中重新取得。
+如果同事已经做好文字说明、报销截图和本次明细，不需要重做。新任务仍只调用一次总控 skill，并给出已有时间段文件夹和支出表根目录。Codex 会按文件哈希复用未变化成果并从检查点继续；两道用户确认需要在当前任务中重新取得。
 
 ## 更新
 
@@ -69,15 +73,17 @@ codex plugin add xiaohongshu-reimbursement-workflow@xiaohongshu-finance
 
 ```bash
 codex plugin marketplace upgrade xiaohongshu-finance
+codex plugin add xiaohongshu-reimbursement-workflow@xiaohongshu-finance
 ```
 
-更新后请重新打开 Codex，并在新任务中使用插件。
+第二条命令会依据插件 manifest 的 cachebuster 刷新已安装版本，无需先卸载。更新后请重新打开 Codex，并在新任务中使用插件。
 
 ## 插件内容
 
 - `xiaohongshu-reimbursement-workflow`：唯一可调用的总控工作流，内部包含 Excel 整理与验收规则。
-- `expense-workbook-rules.md`：总工作流内部读取的普通 reference，不会显示为 skill 入口。
-- `build_reimbursement_summary.mjs`：确定性生成汇总文字说明。
+- `references/`：按阶段加载微信取证、批次产物、Excel、候选发布和运行可靠性规则，不会显示为额外 skill 入口。
+- `audit_batch_manifest.mjs`：核验批次清单、定点金额、引用关系和文件哈希，支持安全复用验收结果。
+- `build_reimbursement_summary.mjs`：零落盘预览并按预览 SHA256 确定性写入汇总文字说明。
 - `safe_publish.ps1`：在 Windows 上执行受控总表发布。
 - `cleanup_task_temp.mjs`：依据 ownership token 安全清理本任务扁平临时目录。
 
