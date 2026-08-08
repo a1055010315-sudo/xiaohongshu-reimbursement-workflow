@@ -18,13 +18,13 @@
    codex plugin marketplace upgrade xiaohongshu-finance --json
    ```
 
-5. 如果插件尚未安装，执行：
+5. marketplace 新增或升级后都执行下面命令。插件已安装时，这一步依据 manifest 的 cachebuster 刷新现有安装；未安装时完成首次安装：
 
    ```bash
    codex plugin add xiaohongshu-reimbursement-workflow@xiaohongshu-finance --json
    ```
 
-6. 使用 `codex plugin list --json` 验证插件已安装且启用。不要只根据命令退出码声称成功。
+6. 使用 `codex plugin list --json` 验证插件已安装、启用且版本与当前 marketplace manifest 一致。不要只根据命令退出码声称成功。
 7. 告知用户重新打开 Codex 或新建任务，然后用下面的一次调用开始：
 
    ```text
@@ -37,6 +37,6 @@
 
 - 用户只发送裸链接、没有明确安装意图时，只读取和说明，不执行安装；用一句话确认是否要安装即可。
 - `codex` 命令不存在、当前产品不支持插件、组织策略阻止安装或需要系统级权限时，说明唯一的实际阻塞点；只有无法代为执行时才给用户最短的手动操作。
-- 已安装时不要重复安装或先卸载；验证现有版本并按需升级 marketplace。
+- 已安装时不要先卸载；先升级 marketplace，再使用带 cachebuster 的 manifest 执行 `codex plugin add` 刷新安装。
 - 不修改用户的报销文件、个人 skill 或本仓库内容。安装阶段只管理 Codex marketplace 和插件状态。
 - 不下载或保存任何报销截图、Excel、凭证或账号秘密。

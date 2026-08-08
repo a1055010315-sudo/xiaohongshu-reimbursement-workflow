@@ -101,7 +101,8 @@ try {
     }
 
     const currentNames = await fs.readdir(target);
-    if (currentNames.length !== names.length || currentNames.some((name) => !names.includes(name))) {
+    const initialNames = new Set(names);
+    if (currentNames.length !== names.length || currentNames.some((name) => !initialNames.has(name))) {
       throw new Error("Cleanup target contents changed during preflight.");
     }
     for (const entry of approved) {
