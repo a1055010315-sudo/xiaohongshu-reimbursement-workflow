@@ -1,6 +1,6 @@
 {
   "name": "xiaohongshu-reimbursement-workflow",
-  "version": "0.3.0+codex.20260808215932",
+  "version": "0.3.0+codex.20260809215134",
   "description": "Single-entry Xiaohongshu reimbursement workflow with one-pass evidence intake, hash-based local verification, embedded Excel rules, and guarded master-ledger publishing.",
   "author": {
     "name": "a1055010315-sudo",

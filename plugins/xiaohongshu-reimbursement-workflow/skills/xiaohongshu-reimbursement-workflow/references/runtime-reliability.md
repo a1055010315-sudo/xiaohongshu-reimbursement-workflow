@@ -2,9 +2,9 @@
 
 本页只约束执行方式，不改变父级业务口径、产物边界或两道门禁。同一任务中完整读取一次；只有本页在磁盘上变化时才重读。
 
-## 1. 最少进程编排
+## 1. 隔离阶段与最少重复 I/O
 
-将工作簿工作固定为三个主要进程，不能把三者合并；每个主要进程内部必须批量处理，不能按 Sheet、图片、检查项或单个工作簿反复启动：
+将工作簿工作固定为三个隔离阶段；关键边界是构建关闭后必须从持久化字节独立重开验证，而不是机械追求某个操作系统进程数量。每个阶段内部必须批量处理，不能按 Sheet、图片、检查项或单个工作簿反复启动：
 
 1. **构建/导出进程**：一次导入基线，批量生成本阶段全部工作簿；预先计算单元格、合并、行列尺寸和图片锚点，最后各保存一次。
 2. **语义验证进程**：每个输出工作簿只重新打开一次；在同一遍遍历中完成记录多重集合、金额、日期、公式、合并、锚点、图片映射和代表性样式检查。
@@ -24,12 +24,12 @@
 
 ## 3. Manifest 与验收证书
 
-在系统临时目录的本批专用目录中维护 `batch-manifest.json`。它只保存规范化业务事实和文件依赖；验收证书另存为临时 sidecar，不能写回 manifest 形成摘要自引用。推荐 `rulesVersion` 为 `xhs-reimbursement-fast-path-v1`，并包含：
+在系统临时目录的本批专用目录中维护 `batch-manifest.json`。它只保存规范化业务事实和文件依赖；验收证书另存为临时 sidecar，不能写回 manifest 形成摘要自引用。新建或因本规则重建的批次推荐 `rulesVersion` 为 `xhs-reimbursement-fast-path-v2`；既有批次保留其已登记版本，直到受影响产物需要重建。结构包含：
 
 ```json
 {
   "version": 1,
-  "rulesVersion": "xhs-reimbursement-fast-path-v1",
+  "rulesVersion": "xhs-reimbursement-fast-path-v2",
   "batch": {
     "rootPath": "绝对路径",
     "archivePath": "绝对路径",
@@ -62,7 +62,7 @@
 
 文件角色可使用 `material`、`archive-copy`、`detail`、`correspondence`、`candidate`、`summary-input`、`summary-output` 等稳定值。manifest 不得出现 `gate`、`approval`、`authorized` 或任何门禁/用户授权字段。
 
-`material` 文件必须标记 `kind`（`image`、`text` 或 `attachment`）和 `disposition`（`used` 或 `excluded`）；排除项还要写 `reason`。无图片交易用 `missingEvidenceConfirmed: true`，它可以保留文字证据引用，但不能同时引用图片。调用 `scripts/audit_batch_manifest.mjs <manifest.json>` 验证 Decimal 金额、类目合计、引用完整性和磁盘文件哈希，并取得 manifest、文件和交易摘要。语义/视觉验收证书的缓存键至少为：
+`reviewRevision` 必须是大于零的安全整数。`material` 文件必须标记 `kind`（`image`、`text` 或 `attachment`）和 `disposition`（`used` 或 `excluded`）；排除项还要写 `reason`。无图片交易用 `missingEvidenceConfirmed: true`，它可以保留文字证据引用，但不能同时引用图片。交易日期必须是合法日历日期的 `YYYY-MM-DD`，不能只验证字符串形状。用 `"<bundled-node>" scripts/audit_batch_manifest.mjs <manifest.json>` 验证 Decimal 金额、日期、类目合计、引用完整性和磁盘文件哈希，并取得 manifest、文件和交易摘要。语义/视觉验收证书的缓存键至少为：
 
 ```text
 rulesVersion + manifestDigest + 所有依赖文件SHA256 + 验收器版本
@@ -78,7 +78,7 @@ rulesVersion + manifestDigest + 所有依赖文件SHA256 + 验收器版本
 sourceId → sourcePath → SHA256 → width/height → archiveCopies[] → workbookImageId → anchors[]
 ```
 
-- 每张唯一原图只读取、取尺寸和解码一次。
+- 同一阶段、同一工作簿字节版本内，每张唯一原图只读取、取尺寸和解码一次；独立重开验证仍可读取已打包媒体。
 - 实现支持时，同一原图在 XLSX 中只写入一个 OOXML media part，但每个业务行保留独立锚点。
 - 重开 XLSX 时一次遍历 drawing relationship 和 media part，建立 SHA256 映射后核对全部锚点，不按图片实例重复解压整份工作簿。
 - 每个实体归档副本仍逐个与来源哈希比较；不得用硬链接代替跨类目原图副本。
@@ -86,7 +86,7 @@ sourceId → sourcePath → SHA256 → width/height → archiveCopies[] → work
 
 ## 5. Windows 与发布
 
-开始批次时检查 Windows PowerShell 5.1+ 和 Node.js。缺少发布环境时仍可制作归档和候选，但必须在第二道门禁后的发布前停止。
+开始批次时检查 Windows PowerShell 5.1+，并通过工作区依赖加载器取得捆绑 Node.js 的绝对路径；运行本 skill 的 `.mjs` 时使用该路径，不依赖系统 `PATH` 中碰巧存在的 `node`。缺少发布环境时仍可制作归档和候选，但必须在第二道门禁后的发布前停止。
 
 Windows PowerShell 5.1 可能错误解析无 BOM UTF-8 `.ps1` 中的中文路径字面量。脚本源保持 ASCII，中文路径只通过参数传入；发布命令形态：
 
@@ -98,7 +98,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File <safe_publish.ps1> -Base
 
 ## 6. 汇总文字说明
 
-将已核对记录写入任务临时目录 JSON。预览和最终文件必须由同一脚本、同一输入生成：
+从 `batch-manifest.json` 机械投影出任务临时 JSON；投影只改变字段形状，不得手工新增、删除或改写业务记录。预览和最终文件必须由同一脚本、同一输入生成：
 
 ```text
 node scripts/build_reimbursement_summary.mjs --input <input.json> --preview
@@ -115,6 +115,10 @@ node scripts/build_reimbursement_summary.mjs --input <input.json> --output <new-
 {"kind":"xiaohongshu-reimbursement-temp","version":1,"token":"<token>"}
 ```
 
-目录保持扁平，只允许普通文件及明确的 Junction/符号链接；不放清理脚本。工作期间依据 manifest 访问精确文件，禁止反复全目录扫描。
+上述 JSON 必须保存为精确文件名 `.codex-xhs-owner.json`。目录保持扁平，只允许普通文件及明确的 Junction/符号链接；连“旧版”“日志”也使用带前缀的扁平文件名，不创建普通子目录，不放清理脚本。工作期间依据 manifest 访问精确文件，禁止反复全目录扫描。工作簿检查器自动产生的 `.inspect.ndjson` 等 sidecar 必须定向到任务临时目录；若工具仍在交付目录产生，则只删除本任务刚创建且已核实归属的精确 sidecar，不能用通配符清理。
 
-结束时从 skill 目录调用 `cleanup_task_temp.mjs <temp-dir> <token>`。清理器必须保留 marker、路径、目录身份和内容的双重预检；目标已不存在视为幂等成功。遇到普通子目录、越界路径、身份变化或 token 不匹配时保留现场并报告，禁止宽泛递归删除。
+结束时从 skill 目录调用 `"<bundled-node>" scripts/cleanup_task_temp.mjs <temp-dir> <token>`。清理器必须保留 marker、路径、目录身份和内容的双重预检；目标已不存在视为幂等成功。遇到普通子目录、越界路径、身份变化或 token 不匹配时保留现场并报告，禁止宽泛递归删除。
+
+## 8. Skill 脚本维护回归
+
+只有修改本 skill 的运行脚本后才运行 `"<bundled-node>" --test tests/runtime-scripts.test.mjs`；普通报销批次不重复运行。测试必须只在 `os.tmpdir()` 的随机直接子目录创建匿名材料，并在完成后清理该精确目录。
