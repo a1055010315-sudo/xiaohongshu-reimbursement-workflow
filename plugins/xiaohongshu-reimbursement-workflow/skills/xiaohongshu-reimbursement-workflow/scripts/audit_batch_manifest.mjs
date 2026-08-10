@@ -2,8 +2,9 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
 import crypto from "node:crypto";
+import { TextDecoder } from "node:util";
 
-const VALIDATOR_VERSION = "1";
+const VALIDATOR_VERSION = "2";
 const AMOUNT_SCALE = 1000n;
 const SHA256_RE = /^[0-9a-f]{64}$/;
 
@@ -24,6 +25,21 @@ function cleanString(value, field) {
   const result = value.trim();
   if (!result || /[\r\n\t]/.test(result)) {
     throw new Error(`${field} must be non-empty and contain no tabs or newlines.`);
+  }
+  return result;
+}
+
+function cleanIsoDate(value, field) {
+  const result = cleanString(value, field);
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(result);
+  if (!match) throw new Error(`${field} must be a valid ISO date in YYYY-MM-DD form.`);
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const leap = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const daysInMonth = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  if (year < 1 || month < 1 || month > 12 || day < 1 || day > daysInMonth[month - 1]) {
+    throw new Error(`${field} must be a valid ISO date in YYYY-MM-DD form.`);
   }
   return result;
 }
@@ -72,7 +88,10 @@ function rejectAuthorizationState(value, field = "manifest") {
   if (!value || typeof value !== "object") return;
   for (const [key, child] of Object.entries(value)) {
     const normalizedKey = key.replace(/([a-z0-9])([A-Z])/g, "$1_$2").replace(/-/g, "_").toLowerCase();
-    if (/(^|_)(gate|gates|approval|approvals|authorization|authorized)(_|$)/.test(normalizedKey) || /门禁|授权/.test(key)) {
+    if (
+      /(^|_)(gate|gates|approval|approvals|approve|approved|authorization|authorized)(_|$)/.test(normalizedKey) ||
+      /门禁|授权|审批|批准/.test(key)
+    ) {
       throw new Error(`${field}.${key} must not persist user gates or authorization.`);
     }
     rejectAuthorizationState(child, `${field}.${key}`);
@@ -112,7 +131,8 @@ try {
     throw new Error("Use audit_batch_manifest.mjs <manifest.json>.");
   }
   const absoluteManifestPath = path.resolve(manifestPath);
-  const raw = await fsp.readFile(absoluteManifestPath, "utf8");
+  const rawBytes = await fsp.readFile(absoluteManifestPath);
+  const raw = new TextDecoder("utf-8", { fatal: true }).decode(rawBytes);
   const manifest = JSON.parse(raw);
   requireObject(manifest, "manifest");
   rejectAuthorizationState(manifest);
@@ -127,8 +147,8 @@ try {
   const archivePath = cleanString(batch.archivePath, "manifest.batch.archivePath");
   const period = cleanString(batch.period, "manifest.batch.period");
   const targetCategory = cleanString(batch.targetCategory, "manifest.batch.targetCategory");
-  if (!Number.isInteger(batch.reviewRevision) || batch.reviewRevision < 1) {
-    throw new Error("manifest.batch.reviewRevision must be a positive integer.");
+  if (!Number.isSafeInteger(batch.reviewRevision) || batch.reviewRevision < 1) {
+    throw new Error("manifest.batch.reviewRevision must be a positive safe integer.");
   }
   const reviewRevision = batch.reviewRevision;
   if (!path.isAbsolute(rootPath) || !path.isAbsolute(archivePath)) {
@@ -200,7 +220,7 @@ try {
     const id = cleanString(transaction.id, `manifest.transactions[${index}].id`);
     if (transactionIds.has(id)) throw new Error(`Duplicate transaction id: ${id}`);
     transactionIds.add(id);
-    const date = cleanString(transaction.date, `manifest.transactions[${index}].date`);
+    const date = cleanIsoDate(transaction.date, `manifest.transactions[${index}].date`);
     const person = cleanString(transaction.person, `manifest.transactions[${index}].person`);
     const project = cleanString(transaction.project, `manifest.transactions[${index}].project`);
     const label = cleanString(transaction.label, `manifest.transactions[${index}].label`);
@@ -305,7 +325,7 @@ try {
     ok: true,
     validatorVersion: VALIDATOR_VERSION,
     manifest: absoluteManifestPath,
-    manifestFileSha256: crypto.createHash("sha256").update(raw, "utf8").digest("hex"),
+    manifestFileSha256: crypto.createHash("sha256").update(rawBytes).digest("hex"),
     manifestDigest,
     filesDigest,
     transactionsDigest,

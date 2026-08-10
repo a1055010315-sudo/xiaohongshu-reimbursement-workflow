@@ -123,6 +123,10 @@ try {
     }
   }
 
+  if (!categoryTotals.has(targetCategory)) {
+    throw new Error("entries must contain at least one target-category record.");
+  }
+
   if (payload.expectedFeeTotal !== undefined && parseAmount(payload.expectedFeeTotal, "expectedFeeTotal") !== feeTotal) {
     throw new Error("Calculated fee total does not match expectedFeeTotal.");
   }
