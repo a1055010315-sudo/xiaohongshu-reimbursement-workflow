@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { loadPlan, validatePlan } from "../scripts/ledger_reorder_common.mjs";
 
 const skillRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const auditScript = path.join(skillRoot, "scripts", "audit_batch_manifest.mjs");
@@ -80,6 +81,33 @@ async function writeJson(name, value) {
   return { filePath, bytes };
 }
 
+function makeReorderPlan({ sourcePath, outputPath }) {
+  return {
+    version: 1,
+    mode: "ledger-reorder-correction",
+    sourcePath,
+    outputPath,
+    expectedSourceSha256: "0".repeat(64),
+    sheetName: "Ledger",
+    physicalRange: "A1:B1",
+    scopeStart: "2026-06-01",
+    scopeStartInclusive: true,
+    scopeEnd: "2026-06-01",
+    scopeEndInclusive: true,
+    sortKeys: ["date:asc", "baselineOrder:asc"],
+    stableTieBreaker: "baselineOrder",
+    blankRowsPolicy: "preserve-physical",
+    recordColumns: ["A", "B"],
+    dateColumn: "A",
+    amountColumn: "B",
+    records: [{ id: "R1", row: 1, dateSortKey: "2026-06-01", baselineOrder: 1 }],
+    expectedRecordCount: 1,
+    expectedScopedRecordCount: 1,
+    expectedScopedAmount: "0",
+    expectedAmountDelta: "0",
+  };
+}
+
 test.before(async () => {
   tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-xhs-runtime-test-"));
   baselinePath = path.join(tempDir, "baseline.bin");
@@ -103,7 +131,7 @@ test("manifest accepts a leap-day date and reports the raw-byte SHA256", async (
   const result = runJsonScript(auditScript, [filePath]);
   assert.equal(result.status, 0);
   assert.equal(result.payload.ok, true);
-  assert.equal(result.payload.validatorVersion, "2");
+  assert.equal(result.payload.validatorVersion, "4");
   assert.equal(result.payload.manifestFileSha256, sha256(bytes));
 });
 
@@ -142,6 +170,23 @@ test("manifest rejects invalid UTF-8 before JSON parsing", async () => {
   const result = runJsonScript(auditScript, [filePath]);
   assert.equal(result.status, 1);
   assert.equal(result.payload.ok, false);
+});
+
+test("ledger reorder plan rejects source and output paths that differ only by Windows casing", {
+  skip: process.platform !== "win32",
+}, () => {
+  const sourcePath = path.join(tempDir, "Case-Sensitive-Looking.xlsx");
+  const outputPath = sourcePath.toLowerCase();
+  assert.throws(
+    () => validatePlan(makeReorderPlan({ sourcePath, outputPath })),
+    /sourcePath and outputPath must be different/,
+  );
+});
+
+test("ledger reorder plan rejects invalid UTF-8 before JSON parsing", async () => {
+  const filePath = path.join(tempDir, "invalid-utf8-reorder-plan.json");
+  await fs.writeFile(filePath, Buffer.from([0x7b, 0x22, 0x78, 0x22, 0x3a, 0xff, 0x7d]), { flag: "wx" });
+  await assert.rejects(loadPlan(filePath), /Unable to read plan/);
 });
 
 test("summary requires the target category and still computes mixed-category totals", async () => {

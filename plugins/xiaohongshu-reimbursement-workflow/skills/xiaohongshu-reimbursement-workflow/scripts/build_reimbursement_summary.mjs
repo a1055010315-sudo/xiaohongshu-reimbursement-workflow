@@ -1,27 +1,49 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import crypto from "node:crypto";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
 const SCALE = 1000n;
+const SHA256_RE = /^[0-9a-f]{64}$/;
+const SETTLEMENTS = new Set(["employee_reimbursement", "company_paid_no_reimbursement"]);
+const ADJUSTMENT_TYPES = new Set(["refund", "adjustment"]);
 
 function fail(message) {
   process.stderr.write(`${JSON.stringify({ ok: false, error: message })}\n`);
   process.exitCode = 1;
 }
 
-function parseAmount(value, field) {
-  if (typeof value !== "string" || !/^(0|[1-9]\d*)(\.\d{1,3})?$/.test(value)) {
-    throw new Error(`${field} must be a non-negative decimal string with at most three decimal places.`);
+function requireObject(value, field) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`${field} must be an object.`);
   }
-  const [whole, fraction = ""] = value.split(".");
-  return BigInt(whole) * SCALE + BigInt((fraction + "000").slice(0, 3));
+  return value;
+}
+
+function parseAmount(value, field, { allowNegative = false } = {}) {
+  const expression = allowNegative ? /^-?(0|[1-9]\d*)(\.\d{1,3})?$/ : /^(0|[1-9]\d*)(\.\d{1,3})?$/;
+  if (typeof value !== "string" || !expression.test(value)) {
+    const signRule = allowNegative ? "signed" : "non-negative";
+    throw new Error(`${field} must be a ${signRule} decimal string with at most three decimal places.`);
+  }
+  const negative = value.startsWith("-");
+  const unsigned = negative ? value.slice(1) : value;
+  const [whole, fraction = ""] = unsigned.split(".");
+  const parsed = BigInt(whole) * SCALE + BigInt((fraction + "000").slice(0, 3));
+  if (negative && parsed === 0n) throw new Error(`${field} must not use a negative zero representation.`);
+  return negative ? -parsed : parsed;
 }
 
 function formatAmount(amount) {
-  const whole = amount / SCALE;
-  const fraction = amount % SCALE;
-  if (fraction === 0n) return whole.toString();
-  return `${whole}.${fraction.toString().padStart(3, "0").replace(/0+$/, "")}`;
+  const negative = amount < 0n;
+  const absolute = negative ? -amount : amount;
+  const whole = absolute / SCALE;
+  const fraction = absolute % SCALE;
+  const rendered = fraction === 0n
+    ? whole.toString()
+    : `${whole}.${fraction.toString().padStart(3, "0").replace(/0+$/, "")}`;
+  return negative ? `-${rendered}` : rendered;
 }
 
 function cleanField(value, field) {
@@ -42,24 +64,32 @@ function parseCli(args) {
       options.preview = true;
       continue;
     }
-    if (!["--input", "--output", "--expect-sha256"].includes(arg)) {
+    if (!["--input", "--manifest", "--output", "--expect-sha256"].includes(arg)) {
       throw new Error(`Unknown argument: ${arg}`);
     }
     const value = args[index + 1];
     if (!value || value.startsWith("--")) throw new Error(`${arg} requires a value.`);
-    const key = arg === "--input" ? "input" : arg === "--output" ? "output" : "expectedSha256";
+    const key = arg === "--input"
+      ? "input"
+      : arg === "--manifest"
+        ? "manifest"
+        : arg === "--output"
+          ? "output"
+          : "expectedSha256";
     if (options[key] !== undefined) throw new Error(`${arg} may only be supplied once.`);
     options[key] = value;
     index += 1;
   }
-  if (!options.input) throw new Error("--input is required.");
+  if ((options.input ? 1 : 0) + (options.manifest ? 1 : 0) !== 1) {
+    throw new Error("Exactly one of --manifest or --input is required.");
+  }
   if (options.preview) {
     if (options.output || options.expectedSha256) {
-      throw new Error("Preview mode accepts --input and --preview only.");
+      throw new Error("Preview mode accepts one source option and --preview only.");
     }
   } else {
     if (!options.output || !options.expectedSha256) {
-      throw new Error("Write mode requires --input, --output, and --expect-sha256.");
+      throw new Error("Write mode requires one source option, --output, and --expect-sha256.");
     }
     if (!SHA256_RE.test(options.expectedSha256)) {
       throw new Error("--expect-sha256 must be 64 lowercase hexadecimal characters.");
@@ -68,57 +98,257 @@ function parseCli(args) {
   return options;
 }
 
-const SHA256_RE = /^[0-9a-f]{64}$/;
+function parseSingleJsonLine(text, field) {
+  const trimmed = text.trim();
+  if (!trimmed || trimmed.split(/\r?\n/).length !== 1) {
+    throw new Error(`${field} must contain exactly one JSON line.`);
+  }
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    throw new Error(`${field} must contain valid JSON.`);
+  }
+}
+
+async function projectAuditedManifest(manifestPath) {
+  const absoluteManifestPath = path.resolve(manifestPath);
+  const auditScript = path.join(path.dirname(fileURLToPath(import.meta.url)), "audit_batch_manifest.mjs");
+  const audit = spawnSync(process.execPath, [auditScript, absoluteManifestPath], {
+    encoding: "utf8",
+    shell: false,
+    windowsHide: true,
+    maxBuffer: 16 * 1024 * 1024,
+  });
+  if (audit.error) throw new Error(`Manifest audit could not start: ${audit.error.message}`);
+  if (audit.signal) throw new Error(`Manifest audit was terminated by signal ${audit.signal}.`);
+  const auditStdout = audit.stdout ?? "";
+  const auditStderr = audit.stderr ?? "";
+  if (audit.status !== 0) {
+    if (auditStdout.trim()) throw new Error("Manifest audit failed with unexpected stdout content.");
+    let failure;
+    try {
+      failure = parseSingleJsonLine(auditStderr, "Manifest audit stderr");
+    } catch (error) {
+      throw new Error(`Manifest audit failed without a valid failure record: ${error.message}`);
+    }
+    const detail = failure?.ok === false && typeof failure.error === "string"
+      ? failure.error
+      : "the auditor did not return an ok:false error record";
+    throw new Error(`Manifest audit failed: ${detail}`);
+  }
+  if (auditStderr.trim()) throw new Error("Manifest audit succeeded with unexpected stderr content.");
+  const audited = parseSingleJsonLine(auditStdout, "Manifest audit stdout");
+  if (audited?.ok !== true) throw new Error("Manifest audit success record must contain ok:true.");
+  if (path.resolve(audited.manifest ?? "") !== absoluteManifestPath) {
+    throw new Error("Manifest audit result path does not match --manifest.");
+  }
+  if (!SHA256_RE.test(audited.manifestFileSha256 ?? "")) {
+    throw new Error("Manifest audit result must contain manifestFileSha256.");
+  }
+  if (!SHA256_RE.test(audited.factsDigest ?? "")) {
+    throw new Error("Manifest audit result must contain factsDigest.");
+  }
+  if (audited.operation?.mode !== "reimbursement-batch") {
+    throw new Error("--manifest requires a reimbursement-batch manifest.");
+  }
+  if (!Array.isArray(audited.normalizedTransactions) || audited.normalizedTransactions.length === 0) {
+    throw new Error("Manifest audit result must contain non-empty normalizedTransactions.");
+  }
+  const rawManifest = await fs.readFile(absoluteManifestPath);
+  const currentManifestSha256 = crypto.createHash("sha256").update(rawManifest).digest("hex");
+  if (currentManifestSha256 !== audited.manifestFileSha256) {
+    throw new Error("Manifest changed after audit.");
+  }
+  const manifest = JSON.parse(rawManifest.toString("utf8"));
+  if (![2, 3].includes(manifest?.version)) throw new Error("--manifest requires manifest.version 2 or 3.");
+  const batch = requireObject(audited.batch, "manifest audit batch");
+  const targetCategory = cleanField(batch.targetCategory, "manifest audit batch.targetCategory");
+  const categoryTotals = requireObject(audited.categoryTotals, "manifest audit categoryTotals");
+  const categoryRealTotals = requireObject(audited.categoryRealTotals, "manifest audit categoryRealTotals");
+  if (categoryTotals[targetCategory] === undefined) {
+    throw new Error("Manifest audit categoryTotals does not contain the target category.");
+  }
+  const orderedTransactions = [...audited.normalizedTransactions].sort((left, right) => {
+    if (!Number.isSafeInteger(left?.sourceOrder) || left.sourceOrder < 1) {
+      throw new Error("Manifest audit normalizedTransactions contain an invalid sourceOrder.");
+    }
+    if (!Number.isSafeInteger(right?.sourceOrder) || right.sourceOrder < 1) {
+      throw new Error("Manifest audit normalizedTransactions contain an invalid sourceOrder.");
+    }
+    return left.sourceOrder - right.sourceOrder;
+  });
+  const entries = orderedTransactions.map((transaction) => {
+    const entry = {
+      id: transaction.id,
+      label: transaction.label,
+      amount: transaction.amount,
+      category: transaction.category,
+      settlement: transaction.settlement,
+    };
+    if (transaction.adjustment !== undefined) entry.adjustment = transaction.adjustment;
+    return entry;
+  });
+  return {
+    payload: {
+      period: batch.period,
+      targetCategory,
+      entries,
+      expectedFeeTotal: categoryTotals[targetCategory],
+      expectedRealTotal: categoryRealTotals[targetCategory] ?? "0",
+      expectedCategoryTotals: categoryTotals,
+    },
+    metadata: {
+      factsDigest: audited.factsDigest,
+      manifestFileSha256: audited.manifestFileSha256,
+      ...(audited.sourceCoverageDigest ? { sourceCoverageDigest: audited.sourceCoverageDigest } : {}),
+    },
+  };
+}
+
+function resolveSettlement(entry, index) {
+  if (entry?.settlement !== undefined) {
+    const settlement = cleanField(entry.settlement, `entries[${index}].settlement`);
+    if (!SETTLEMENTS.has(settlement)) {
+      throw new Error(
+        `entries[${index}].settlement must be employee_reimbursement or company_paid_no_reimbursement.`,
+      );
+    }
+    if (entry.reimbursable !== undefined) {
+      if (typeof entry.reimbursable !== "boolean") {
+        throw new Error(`entries[${index}].reimbursable must be boolean when supplied.`);
+      }
+      if (entry.reimbursable !== (settlement === "employee_reimbursement")) {
+        throw new Error(`entries[${index}] has conflicting settlement and reimbursable values.`);
+      }
+    }
+    return settlement;
+  }
+  if (typeof entry?.reimbursable !== "boolean") {
+    throw new Error(`entries[${index}] must provide settlement, or reimbursable for legacy input.`);
+  }
+  return entry.reimbursable ? "employee_reimbursement" : "company_paid_no_reimbursement";
+}
+
+function normalizeAdjustment(entry, index, amount) {
+  if (amount >= 0n) {
+    if (entry.adjustment !== undefined) {
+      throw new Error(`entries[${index}].adjustment is only allowed for a negative amount.`);
+    }
+    return undefined;
+  }
+  const adjustment = requireObject(entry.adjustment, `entries[${index}].adjustment`);
+  const type = cleanField(adjustment.type, `entries[${index}].adjustment.type`);
+  if (!ADJUSTMENT_TYPES.has(type)) {
+    throw new Error(`entries[${index}].adjustment.type must be refund or adjustment.`);
+  }
+  return {
+    type,
+    sourceTransactionId: cleanField(
+      adjustment.sourceTransactionId,
+      `entries[${index}].adjustment.sourceTransactionId`,
+    ),
+    reason: cleanField(adjustment.reason, `entries[${index}].adjustment.reason`),
+  };
+}
 
 try {
   const options = parseCli(process.argv.slice(2));
-  const inputPath = options.input;
+  const sourcePath = options.manifest ?? options.input;
   const outputPath = options.output;
-  if (!options.preview && path.resolve(inputPath) === path.resolve(outputPath)) {
+  if (!options.preview && path.resolve(sourcePath) === path.resolve(outputPath)) {
     throw new Error("Input and output paths must be different.");
   }
 
-  const payload = JSON.parse(await fs.readFile(inputPath, "utf8"));
+  let payload;
+  let manifestMetadata;
+  if (options.manifest) {
+    const projected = await projectAuditedManifest(options.manifest);
+    payload = projected.payload;
+    manifestMetadata = projected.metadata;
+  } else {
+    payload = JSON.parse(await fs.readFile(options.input, "utf8"));
+  }
   const period = cleanField(payload.period, "period");
   const targetCategory = cleanField(payload.targetCategory ?? "小红书报销", "targetCategory");
   if (!Array.isArray(payload.entries) || payload.entries.length === 0) {
     throw new Error("entries must be a non-empty array.");
   }
 
+  const entryIds = new Set();
+  const normalizedEntries = payload.entries.map((entry, index) => {
+    const label = cleanField(entry?.label, `entries[${index}].label`);
+    const category = cleanField(entry?.category ?? targetCategory, `entries[${index}].category`);
+    const settlement = resolveSettlement(entry, index);
+    const amount = parseAmount(entry.amount, `entries[${index}].amount`, { allowNegative: true });
+    const adjustment = normalizeAdjustment(entry, index, amount);
+    let id;
+    if (entry.id !== undefined) {
+      id = cleanField(entry.id, `entries[${index}].id`);
+      if (entryIds.has(id)) throw new Error(`Duplicate entry id: ${id}`);
+      entryIds.add(id);
+    }
+    if (adjustment && !id) {
+      throw new Error(`entries[${index}].id is required for a negative adjustment.`);
+    }
+    return { id, label, category, settlement, amount, adjustment };
+  });
+
+  const entryById = new Map(normalizedEntries.filter((entry) => entry.id).map((entry) => [entry.id, entry]));
+  const refundTotalsBySource = new Map();
+  for (const entry of normalizedEntries) {
+    if (!entry.adjustment) continue;
+    const source = entryById.get(entry.adjustment.sourceTransactionId);
+    if (!source || source.id === entry.id) {
+      throw new Error(`Entry ${entry.id} adjustment must reference a different entry in the same input.`);
+    }
+    if (source.amount <= 0n) {
+      throw new Error(`Entry ${entry.id} adjustment source must have a positive amount.`);
+    }
+    if (source.category !== entry.category || source.settlement !== entry.settlement) {
+      throw new Error(`Entry ${entry.id} adjustment source must have the same category and settlement.`);
+    }
+    if (entry.adjustment.type === "refund") {
+      refundTotalsBySource.set(source.id, (refundTotalsBySource.get(source.id) ?? 0n) - entry.amount);
+    }
+  }
+  for (const [sourceId, refundTotal] of refundTotalsBySource) {
+    if (refundTotal > entryById.get(sourceId).amount) {
+      throw new Error(`Refunds referencing entry ${sourceId} exceed its positive amount.`);
+    }
+  }
+
   const groups = new Map();
   const groupsByCategory = new Map();
   const categoryTotals = new Map();
+  const settlementTotals = new Map();
   let feeTotal = 0n;
   let realTotal = 0n;
-  let targetHasNonReimbursable = false;
+  let targetHasCompanyPaid = false;
 
-  for (const [index, entry] of payload.entries.entries()) {
-    const label = cleanField(entry?.label, `entries[${index}].label`);
-    const category = cleanField(entry?.category ?? targetCategory, `entries[${index}].category`);
-    if (typeof entry?.reimbursable !== "boolean") {
-      throw new Error(`entries[${index}].reimbursable must be boolean.`);
-    }
-    const amount = parseAmount(entry.amount, `entries[${index}].amount`);
-    const groupKey = JSON.stringify([category, label]);
+  for (const entry of normalizedEntries) {
+    const groupKey = JSON.stringify([entry.category, entry.label, entry.settlement]);
     const existing = groups.get(groupKey);
-    if (existing && existing.reimbursable !== entry.reimbursable) {
-      throw new Error(`Category and label have conflicting reimbursable values: ${category} / ${label}`);
-    }
     if (existing) {
-      existing.amount += amount;
+      existing.amount += entry.amount;
     } else {
-      const group = { category, label, amount, reimbursable: entry.reimbursable };
+      const group = {
+        category: entry.category,
+        label: entry.label,
+        amount: entry.amount,
+        settlement: entry.settlement,
+      };
       groups.set(groupKey, group);
-      if (!groupsByCategory.has(category)) groupsByCategory.set(category, []);
-      groupsByCategory.get(category).push(group);
+      if (!groupsByCategory.has(entry.category)) groupsByCategory.set(entry.category, []);
+      groupsByCategory.get(entry.category).push(group);
     }
-    categoryTotals.set(category, (categoryTotals.get(category) ?? 0n) + amount);
-    if (category === targetCategory) {
-      feeTotal += amount;
-      if (entry.reimbursable) {
-        realTotal += amount;
+    categoryTotals.set(entry.category, (categoryTotals.get(entry.category) ?? 0n) + entry.amount);
+    settlementTotals.set(entry.settlement, (settlementTotals.get(entry.settlement) ?? 0n) + entry.amount);
+    if (entry.category === targetCategory) {
+      feeTotal += entry.amount;
+      if (entry.settlement === "employee_reimbursement") {
+        realTotal += entry.amount;
       } else {
-        targetHasNonReimbursable = true;
+        targetHasCompanyPaid = true;
       }
     }
   }
@@ -127,10 +357,16 @@ try {
     throw new Error("entries must contain at least one target-category record.");
   }
 
-  if (payload.expectedFeeTotal !== undefined && parseAmount(payload.expectedFeeTotal, "expectedFeeTotal") !== feeTotal) {
+  if (
+    payload.expectedFeeTotal !== undefined &&
+    parseAmount(payload.expectedFeeTotal, "expectedFeeTotal", { allowNegative: true }) !== feeTotal
+  ) {
     throw new Error("Calculated fee total does not match expectedFeeTotal.");
   }
-  if (payload.expectedRealTotal !== undefined && parseAmount(payload.expectedRealTotal, "expectedRealTotal") !== realTotal) {
+  if (
+    payload.expectedRealTotal !== undefined &&
+    parseAmount(payload.expectedRealTotal, "expectedRealTotal", { allowNegative: true }) !== realTotal
+  ) {
     throw new Error("Calculated real total does not match expectedRealTotal.");
   }
   if (payload.expectedCategoryTotals !== undefined) {
@@ -143,7 +379,10 @@ try {
     }
     for (const [rawCategory, amount] of expectedEntries) {
       const category = cleanField(rawCategory, "expectedCategoryTotals category");
-      if (!categoryTotals.has(category) || parseAmount(amount, `expectedCategoryTotals.${category}`) !== categoryTotals.get(category)) {
+      if (
+        !categoryTotals.has(category) ||
+        parseAmount(amount, `expectedCategoryTotals.${category}`, { allowNegative: true }) !== categoryTotals.get(category)
+      ) {
         throw new Error(`Calculated category total does not match expectedCategoryTotals.${category}.`);
       }
     }
@@ -164,7 +403,7 @@ try {
       lines.push(`${group.label}：${formatAmount(group.amount)}`);
     }
     if (category === targetCategory) {
-      if (targetHasNonReimbursable) lines.push(`费用合计：${formatAmount(feeTotal)}`);
+      if (targetHasCompanyPaid) lines.push(`费用合计：${formatAmount(feeTotal)}`);
       lines.push(`实报合计：${formatAmount(realTotal)}`);
     } else {
       lines.push(`合计：${formatAmount(categoryTotals.get(category))}`);
@@ -190,11 +429,23 @@ try {
     mode: options.preview ? "preview" : "write",
     targetCategory,
     groups: groups.size,
-    categoryTotals: Object.fromEntries([...categoryTotals].map(([category, amount]) => [category, formatAmount(amount)])),
+    categoryTotals: Object.fromEntries(
+      [...categoryTotals].map(([category, amount]) => [category, formatAmount(amount)]),
+    ),
+    settlementTotals: Object.fromEntries(
+      [...settlementTotals].map(([settlement, amount]) => [settlement, formatAmount(amount)]),
+    ),
     feeTotal: formatAmount(feeTotal),
     realTotal: formatAmount(realTotal),
     textSha256,
   };
+  if (manifestMetadata) {
+    result.factsDigest = manifestMetadata.factsDigest;
+    result.manifestFileSha256 = manifestMetadata.manifestFileSha256;
+    if (manifestMetadata.sourceCoverageDigest) {
+      result.sourceCoverageDigest = manifestMetadata.sourceCoverageDigest;
+    }
+  }
   if (options.preview) {
     result.summary = output;
   } else {
