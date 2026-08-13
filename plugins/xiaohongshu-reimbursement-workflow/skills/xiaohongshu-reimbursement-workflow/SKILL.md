@@ -1,6 +1,6 @@
 ---
 name: xiaohongshu-reimbursement-workflow
-description: "Run or resume a complete Xiaohongshu reimbursement batch: collect WeChat evidence once, verify locally with hash-based checkpoints, separate company and other non-target reimbursements, show and archive an image-embedded correspondence workbook, create current-batch detail and candidate ledger workbooks, audit after one exact business-approval gate, and publish the root ledger only after a second exact gate. Use when the user asks to process, archive, continue, verify, approve, or publish a Xiaohongshu reimbursement batch; if the user only asks to inspect or modify this skill, do not touch reimbursement files."
+description: "Run or resume a complete Xiaohongshu reimbursement batch, repair historical omissions or classifications, or stably reorder an explicit ledger range with zero business and amount change. Collect WeChat evidence once, verify source coverage and transaction facts locally, build and independently audit review workbooks, enforce two exact approval gates, and publish the root ledger safely. Use when the user asks to process, archive, continue, verify, approve, publish, sort, reorder, supplement, reclassify, or correct a Xiaohongshu reimbursement ledger; if the user only asks to inspect or modify this skill, do not touch reimbursement files."
 ---
 
 # 小红书报销归档工作流
@@ -10,7 +10,8 @@ description: "Run or resume a complete Xiaohongshu reimbursement batch: collect 
 这是用户唯一需要调用的总控 skill。一次调用后，在同一任务中持续完成收件、核对、归档、候选总表、终审和受控发布。
 
 - **skill-only**：用户只要求查看、审查或修改本 skill。只处理 skill 目录，不读取或改动任何报销材料。
-- **workflow**：用户要求处理、续办、核对、审批或发布具体批次。执行下述状态机。
+- **workflow**：用户要求处理、续办、核对、审批或发布包含新增交易或历史业务字段修正的具体批次。历史遗漏、人员/项目/金额/分类/结算方式修正仍走本模式，并额外执行历史账本业务修正 reference。
+- **ledger-reorder-correction**：用户明确要求只整理、重排或修正既有总表顺序，且不得新增、删除或改变业务记录及金额。执行第 7 节独立状态机，不进入微信取证或本次明细构建。
 - **不明确**：只问一句用户要改 skill 还是处理报销，不做报销文件操作。
 
 只完整读取当前阶段需要的 reference；同一任务中同一未变化 reference 不重复读取：
@@ -21,6 +22,8 @@ description: "Run or resume a complete Xiaohongshu reimbursement batch: collect 
 | 文字说明、明细、截图归档、对应截图表 | [批次归档与展示规则](references/batch-output-rules.md) |
 | 工作簿构建或验收 | [Excel 整理与验收规则](references/expense-workbook-rules.md) |
 | 候选总表、两道门禁、发布 | [候选总表与发布规则](references/ledger-publish-rules.md) |
+| 补齐历史遗漏、画布分类标注或修改既有业务字段 | [历史账本业务修正规则](references/ledger-business-correction.md) + [Excel 整理与验收规则](references/expense-workbook-rules.md) + [候选总表与发布规则](references/ledger-publish-rules.md) |
+| 既有总表零增量重排修正 | [Excel 整理与验收规则](references/expense-workbook-rules.md) + [候选总表与发布规则](references/ledger-publish-rules.md) + [批次归档与展示规则](references/batch-output-rules.md) |
 | 第一次调用工作簿工具、发布脚本或清理器前 | [运行可靠性约定](references/runtime-reliability.md) |
 
 处理 `.xlsx` 时同时使用可用的 spreadsheet 能力。reference 是本 skill 的内部规则，不要求用户另行调用。
@@ -30,7 +33,7 @@ description: "Run or resume a complete Xiaohongshu reimbursement batch: collect 
 1. 当前根目录总表只绑定一个“目标总表类目”，默认 `小红书报销`。除非用户明确说明，记录均属于目标类目。
 2. `公司报销` 等非目标类目进入文字说明、截图归档和对应截图表，但不得进入本次小红书明细、候选总表或根目录总表。新增类目是否进入目标总表不明确时再询问。
 3. 用户明确写出具体单子、项目或业务名称时，相关支出备注归入该名称，不得降级为 `日常报销`；具体规范见 Excel reference。
-4. 金额使用十进制定点值，最多三位小数；摘要默认去除无业务含义的尾随零但不改变数值，用户明确要求保留的展示精度必须保留。超过三位小数先确认，禁止二进制浮点汇总和静默舍入。
+4. 金额使用十进制定点值，最多三位小数；整数显示 0 位，非整数默认显示 2 位，用户原值明确为三位小数时该笔显示 3 位。费用组合计使用组内最大显示精度。超过三位小数先确认，禁止二进制浮点汇总和静默舍入。
 5. OCR 只辅助定位；原图和用户业务说明才是审计材料。不得覆盖用户原件、历史归档或已验收文件；修正使用 `_修正版N`。
 6. 无法从当前对话和磁盘可靠判断的业务事实才询问。一次合并同阶段疑点，并给每项独立编号；视觉疑点必须附对应图片。
 
@@ -41,15 +44,19 @@ description: "Run or resume a complete Xiaohongshu reimbursement batch: collect 
 1. `本次报销通过无误`
 2. `确认更新根目录支出总表`
 
-第一道门禁仅在完整业务核对包和候选快照已展示、路径与 SHA256 已报告后，由用户在一条新消息中发送才有效。它一次确认摘要、明细、图片对应关系和候选内容，不再增加“摘要自然语言确认”这一第三次等待。
+第一道门禁仅在适用模式的完整审阅包和候选快照已展示、路径与 SHA256 已报告后，由用户在一条新消息中发送才有效。普通批次一次确认摘要、明细、图片对应关系和候选内容；重排修正确认范围、排序不变量、全区预览和活动候选。不要增加“摘要自然语言确认”这一第三次等待。普通新任务用 `scripts/build_gate_binding.mjs` context v2 机械绑定 `mode + batchId + factsDigest + operationDigest + candidateRevision + 当前候选绝对路径/SHA256 + reviewPackageDigest + candidatePlanSha256 + sourceCoverageDigest`；context v1 只用于恢复已开始批次。重排修正调用 `scripts/build_ledger_reorder_gate_artifact.mjs --gate gate-1` 时，把 `--preview-index` 传成必须不存在的新输出路径；同一调用按“实时全量审计活动候选 → 从该候选受控分段渲染完整重排区 → 写绑定 `planFileSha256 + 候选规范路径/SHA256` 的严格 v2 索引 → 生成 Gate 1 工件”执行，禁止提供既有索引或外部 PNG。展示该工件返回的绑定预览和 `bindingDigest` 后，精确门禁只接受这个当前任务内的摘要；发布器还必须 fresh-rerender 并逐段比对图片 SHA256。
 
-第二道门禁仅在第一道门禁后的独立终审通过、当前候选绝对路径和 SHA256 已报告后，由用户在一条新消息中发送才有效。候选内容、候选哈希、批次身份或终审结果变化后，旧第二道门禁立即失效。
+第二道门禁仅在第一道门禁后的独立终审通过、当前候选绝对路径和 SHA256 已报告后，由用户在一条新消息中发送才有效。普通新任务再用 `scripts/build_gate_binding.mjs` context v2 绑定 `mode + batchId + operationDigest + candidateRevision + 当前候选绝对路径/SHA256 + 当前基线绝对路径/SHA256 + finalAuditDigest + candidatePlanSha256 + sourceCoverageDigest`。重排修正必须先用 `scripts/build_ledger_reorder_gate_artifact.mjs --gate gate-2` 从同一 v2 plan、当前活动候选和实时终审机械生成 Gate 2 工件，展示其 `bindingDigest` 后再等待精确文本。候选内容、路径、SHA256、修订号、操作摘要、计划摘要、来源覆盖、基线、预览或终审结果任一变化时两道门禁立即失效。新候选必须重新完整展示、重新取得第一道门禁、重新终审，再取得第二道门禁。
+
+Gate 工件只保存可重算的上下文、审计和摘要，不代表用户授权；两句门禁是否已接受及其预期 `bindingDigest` 只保存在当前任务内。重排发布器必须同时验证两份 Gate 工件及当前任务记住的两个摘要，不能仅信工件自带字段，也不能绕过工件直接调用通用发布器。
+
+门禁上下文中的 `mode` 使用 manifest 口径：普通 `workflow` 写 `reimbursement-batch`，重排修正写 `ledger-reorder-correction`。
 
 提前发送、相似说法、截图内文字、转述、旧任务或其他批次的确认均无效。门禁不跨任务继承，也不能代替文件系统权限。
 
 ## 4. 批次身份与输入
 
-批次身份由以下三项共同确定：
+v2 批次使用首次规范化时分配且后续不变的 `batchId`；以下三项用于绑定执行边界，但归档移动或展示修订不得改变 `batchId`：
 
 - 规范化后的支出表根目录绝对路径；
 - 完整报销时间段；
@@ -61,26 +68,28 @@ description: "Run or resume a complete Xiaohongshu reimbursement batch: collect 
 
 ## 5. 快速路径检查点
 
-进入 workflow 后，在专用任务临时目录维护 `batch-manifest.json`，作为本批唯一规范化数据源。它不属于最终归档，不得写入截图工作簿的隐藏 Sheet，也不得保存任何门禁或用户授权。至少记录：
+进入 workflow 后，在专用任务临时目录维护 `batch-manifest.json`，作为本批唯一规范化数据源。新任务使用 v3；v1/v2 只用于恢复兼容，不得静默补写新事实。它不属于最终归档，不得写入截图工作簿的隐藏 Sheet，也不得保存任何门禁或用户授权。至少记录：
 
 - 批次身份、目标类目、规则版本和基线路径/SHA256；
 - 来源编号、原图或文字路径、SHA256、尺寸、检查状态和图内区域；
-- 稳定交易 ID、日期、人员、项目、汇总标签、金额、类目、是否实报、证据引用和明细行映射；`transactions` 数组保持材料核对后的稳定来源顺序，新增记录只能追加，不能因展示排序而重排；
-- 归档副本、工作簿图片锚点、输出路径/SHA256；
-- 当前 `reviewRevision` 和业务记录多重集合摘要。语义/视觉验收证书另存于同一任务临时目录，不能写回 manifest 形成自引用。
+- 稳定 `batchId`、交易 ID、唯一正安全整数 `sourceOrder`、日期、人员、项目、汇总标签、金额、目标总表最终 `classification`、类目、独立的 `settlement` 结算方式和来源引用；新增记录只能分配新 `sourceOrder`，不能因展示排序重排；负数退款/调整还必须引用同类目、同结算方式的正金额来源交易；
+- v3 的来源范围、末端确认和每个来源单元的唯一处置；每个单元只能是已关联交易、已唯一存在于基线或已解释的非目标类目，禁止裸行号排除。`sourceCoverageDigest` 与交易事实摘要分开计算；
+- 当前 `reviewRevision` 和操作配置；候选的 `candidateRevision` 在 `artifact-index.json` 维护，普通批次首次候选为 1，每生成一个新字节版本单调递增。`ledger-reorder-correction` 的 manifest operation 还必须记录 `candidateRevision`、`planFileSha256`、精确重排范围/日期边界、`date:asc + baselineOrder:asc` 排序键、每条记录的基线顺序号、逻辑记录数与物理记录行数、`expectedAmountDelta: "0"`、基线与当前/被替代候选路径及 SHA256；首版使用 `supersedes: null`，后续修订必须指向唯一被替代候选。候选绑定由机械计划和构建结果写入，禁止手工补写。
 
-由同一 manifest 驱动摘要预览、本次明细、截图对应表、归档和候选校验，禁止各阶段重新解析同一材料。摘要脚本的输入 JSON 必须是 manifest 的机械投影，不得成为第二套可手工维护的业务事实。验收证书的缓存键必须包含：规则版本、manifest 摘要及其全部依赖文件 SHA256。
+由同一 manifest 驱动摘要预览、本次明细、截图对应表、归档和候选校验，禁止各阶段重新解析同一材料。摘要优先直接用 `--manifest` 机械投影，兼容旧批次时产生的输入 JSON 也不得成为第二套可手工维护的业务事实。输出路径/SHA256、行映射、图片锚点和验收证书放在同一临时目录的 `artifact-index.json`/sidecar，不把用户授权写回 manifest。验收证书只绑定它实际依赖的 `factsDigest`、`evidenceDigest`、操作/配置摘要和文件 SHA256，不能用整份 manifest 的无关展示状态造成全量失效。`reviewPackageDigest` 由摘要正文、明细语义、对应图顺序与图片哈希、缺图/排除清单及候选 SHA256 机械计算；`finalAuditDigest` 由终审不变量和当前基线/候选 SHA256 机械计算。
 
 ### 失效规则
 
 - 每次恢复任务都重新枚举精确材料目录并比较路径、大小和 SHA256；只重新打开新增或内容变化的材料，未变化文件复用既有完整视觉核验结果。
-- 用户纠正人员、项目、日期、金额、类目、是否实报或证据归属时，只失效受影响交易及全部下游输出；第一道门禁后发生任何业务修正时，两道门禁和终审全部失效。
+- 用户纠正人员、项目、日期、金额、类目、`settlement` 结算方式或证据归属时，只失效受影响交易及全部下游输出；第一道门禁后发生任何业务修正时，两道门禁和终审全部失效。
+- 画布标注先汇总为累积补丁集。每个新候选都从同一绑定根表基线 + 完整 manifest + 全部补丁重建，禁止在上一候选上继续打补丁；行号只定位，修改前完整业务指纹不匹配时阻塞。
 - 摘要、逐笔对应表、金额、缺图说明或其他用户可见审阅内容变化时递增 `reviewRevision`；第一道门禁只绑定用户最后完整看到的 revision。
+- 候选工作簿字节、SHA256、候选修订号、重排范围或排序策略发生任何变化时，两道门禁和终审全部失效；不得把旧确认迁移到新候选。
 - 根表 SHA256 变化只失效候选及其下游，不要求重看未变化的原始图片。
 - 已发布批次若只修订本次明细的分区、颜色、列宽或说明文字，且规范化交易多重集合、金额、证据、摘要、候选和根表哈希都未变化，走“纯展示修订”分支：创建新的 `_修正版N`，只重验明细语义/公式/视觉并递增 `reviewRevision`；该 revision 只标识新的展示产物，不改写已完成的账本发布状态，也不复用旧门禁；旧版移入可恢复的同级历史目录，不再次追加或发布根表，也不索取第二道门禁。任一业务字段变化都不得走此分支。
 - 任一依赖哈希、manifest 摘要或规则版本变化时，禁止复用对应验收证书；未变化时禁止无理由重复导入、解压、渲染或返回微信。
 
-## 6. 状态机
+## 6. 批次状态机与分流
 
 先只读检查精确路径、哈希、manifest 和工作簿可打开性，再从最早未完成状态继续：
 
@@ -94,10 +103,28 @@ description: "Run or resume a complete Xiaohongshu reimbursement batch: collect 
 | 终审通过 | 报告候选路径/SHA256，等待第二道门禁 |
 | 已收到第二道门禁 | 发布前重读、受控发布、发布后复核 |
 | 已发布且用户明确要求纯展示修订 | 生成明细修正版、独立验收、归档旧版；根表不变 |
+| 用户要求既有总表零增量重排 | 切换到 `ledger-reorder-correction` 独立状态机 |
 
 同事已完成且哈希未变化的产物只验证一次，不重做。归档保存数据检查点，但不保存授权。
 
-## 7. 阶段 A：一次收集、本地核对
+## 7. `ledger-reorder-correction` 独立状态机
+
+只在用户要求整理既有总表顺序，且预期交易增量和金额增量都为零时进入本模式。只要发现日期、项目、金额、支出人、备注/分类、报销属性或交易数量需要改变，就立即退出本模式，转入相应批次/业务修正流程并重新取得门禁。
+
+按下列状态顺序执行，不借用新增报销批次的“本次明细 + 增量”判定：
+
+| 状态 | 必须完成的动作 |
+|---|---|
+| R0 绑定 | 只读建立严格 request，绑定根目录、根表绝对路径/SHA256、系统临时目录 marker、暂存/活动候选/标准目标路径、候选修订号、工作表、精确物理范围和日期边界；调用 `scripts/generate_ledger_reorder_plan.mjs` 机械识别记录并生成不可手填的 v2 plan。根表保持字节不变。 |
+| R1 构建 | 只使用该 v2 plan 调用 `scripts/build_ledger_reorder_candidate.mjs` 在专用临时目录生成新的暂存 `_修正版N`；业务多重集合与基线完全相等，金额增量严格为 `0`，范围外内容/公式/样式/行高/合并关系不变，范围内按 `date:asc + baselineOrder:asc` 稳定排序。完整位于一个逻辑记录内的竖向/横向合并可作为连续多行记录整体迁移；跨记录、跨边界或无法无损迁移时报告 `unsupported` 并阻塞。 |
+| R2 验收与展示 | 严格执行“独立审计暂存候选 → 晋升为活动 `_修正版N` → Gate 1 同调用重审活动候选并受控渲染完整重排区 → 写绑定 plan/候选的全新 v2 预览索引 → 机械生成 Gate 1 工件 → 展示该工件返回的预览”顺序；晋升前不得展示为可确认版本，standalone 预览索引不得交给 Gate 1 复用。全部通过后报告活动候选绝对路径、修订号、SHA256、`planFileSha256`、Gate 1 `bindingDigest` 及“根表未修改”，再等待第一道门禁。 |
+| R3 独立终审 | 收到绑定当前 Gate 1 摘要的有效第一道门禁后，从磁盘独立重读基线和候选，重算记录多重集合、笔数、十进制定点金额、范围边界、稳定顺序、公式、样式、行高、合并及 OOXML 关系；通过后机械生成 Gate 2 工件，再报告当前候选路径/SHA256 和 Gate 2 `bindingDigest`，等待第二道门禁。 |
+| R4 发布前重读 | 收到有效第二道门禁后重新计算根表和候选 SHA256，并重验 R1 的全部不变量；任何变化都停止发布并使两道门禁失效。 |
+| R5 受控发布 | 仅按发布 reference 调用受控发布器，并传入 v2 plan、两个 Gate 工件及当前任务内已获批准的两个 `bindingDigest`；发布器实时重验 plan、候选、审计、预览和基线绑定。发布后重新打开根表并确认 SHA256 与候选一致，所有 R1 不变量仍成立。 |
+
+候选字节/路径、plan 字节/摘要、重排范围、排序策略或候选修订号变化时回到 R0/R1，生成新的 plan 和 `_修正版N` 后重新执行 R2 并重新取得两道门禁。活动归档版本晋升和活动候选独立审计必须在 R2 展示前成功；晋升失败或出现多个当前版本时阻塞，不得进入门禁或发布。
+
+## 8. 阶段 A：一次收集、本地核对
 
 1. 固定本批可审计边界；微信材料必须在同一次连续遍历中完成来源编号、业务文字登记、候选原图保存和末端确认。
 2. 离开微信前确认候选数、保存数和末端状态；之后的放大、金额识别、去重、归档、展示和制表只使用本地文件。只有缺失、不可读、关键上下文截断或用户新增材料时才返回微信。
@@ -108,7 +135,7 @@ description: "Run or resume a complete Xiaohongshu reimbursement batch: collect 
 
 只有业务文字均有处置、金额候选均已分类、每笔交易有凭证或已确认缺图，才进入阶段 B。
 
-## 8. 阶段 B：一次构建、一次验收
+## 9. 阶段 B：一次构建、一次验收
 
 按批次归档 reference 生成：摘要预览、按人员连续分区的本次明细、原图归档和带嵌入图片的对应截图表。人员分区只是明细展示结构，分区标题和空白分隔行不是交易，不得进入候选或根表。最终归档不得出现内部 manifest、验收证书、预览、日志或差异说明。
 
@@ -123,34 +150,38 @@ description: "Run or resume a complete Xiaohongshu reimbursement batch: collect 
 
 没有未决疑点时不要等待额外自然语言确认，直接进入阶段 C。用户主动纠正时按失效规则处理。
 
-## 9. 阶段 C：候选快照，根表不变
+## 10. 阶段 C：候选快照，根表不变
 
-按候选与发布 reference 绑定基线并生成候选。候选必须直接由“当前根表业务记录 + manifest 中尚未包含的目标类目交易”生成和校验，不得导入本次明细的人员标题、空白分隔行或其他展示结构。第二道门禁前不得直接编辑、创建或替换根目录标准总表。候选验收后把它保存为归档内 `小红书支出总表_截至<结束日期>.xlsx`，再次确认根表 SHA256 未变。
+按候选与发布 reference 绑定基线并生成候选。普通新增候选必须直接由“当前根表业务记录 + manifest 中尚未包含的目标类目交易”生成；历史业务修正必须由“绑定根表基线 + 完整 manifest + 累积补丁”重建，不能从被废止候选继续修改。两者都不得导入本次明细的人员标题、空白分隔行或其他展示结构。历史修正先调用 `scripts/derive_ledger_layout.mjs` 生成布局计划，保存候选后再从实际工作簿独立提取审计包并调用 `scripts/audit_ledger_layout.mjs`；构建器与审计器不得共享来源匹配、费用组或预期合并结果。第二道门禁前不得直接编辑、创建或替换根目录标准总表。候选验收后把它保存为归档内 `小红书支出总表_截至<结束日期>.xlsx`，再次确认根表 SHA256 未变。
 
 随后补齐业务核对包中的候选绝对路径、SHA256及“根目录总表未修改”。到此等待第一道门禁；不要主动索要第二道门禁。
 
-## 10. 第一道门禁后的终审
+## 11. 第一道门禁后的终审
+
+本节用于包含新增交易的 `workflow`；`ledger-reorder-correction` 按 R3 终审，不得要求不存在的本次明细或摘要。
 
 收到有效的 `本次报销通过无误` 后：
 
 1. 重新读取本次明细，排除人员标题、表头、说明和空白分隔行后，使用十进制定点金额独立重算目标类目的人员/分类汇总、费用合计和实报合计；独立重算非目标类目小计并确认其未进入目标明细或候选。
 2. 将摘要预览按同一输入写入最终 UTF-8 TXT，并核对正文 SHA256 与用户看到的预览一致。
 3. 重新计算根表和候选 SHA256。对 manifest、对应截图表和原图：哈希及规则版本未变化时验证既有验收证书，不重新打开或渲染；变化时只重验受影响部分。
-4. 核对候选业务多重集合、金额增量、公式、合并、已解释缺图和所有归档文件。
+4. 核对候选业务多重集合、金额增量、公式、合并、已解释缺图和所有归档文件；历史业务修正还要重新核对来源覆盖、累积补丁链、候选布局计划以及独立 `audit_ledger_layout.mjs` 结果。
 
 任一项失败只修正受影响部分并重新终审。全部通过后报告当前候选绝对路径和 SHA256，并明确询问用户是否发送第二道精确文本。
 
-## 11. 第二道门禁与发布
+## 12. 第二道门禁与发布
 
-收到有效的 `确认更新根目录支出总表` 后，必须从磁盘重新读取当前根表、本次明细和当前候选，重新验证：
+本节的新增交易等式用于 `workflow`；`ledger-reorder-correction` 按 R4 的零增量等式和范围不变量重验。
+
+收到有效的 `确认更新根目录支出总表` 后，必须从磁盘重新读取当前根表和当前候选；`workflow` 还要重新读取本次明细。随后重新验证：
 
 - 当前根表业务记录多重集合 + 本批目标类目明细 = 候选业务记录多重集合；
 - 当前根表 SHA256 与终审基线一致；
 - 候选 SHA256 与终审报告一致。
 
-任何不一致都使旧确认失效，按候选与发布 reference 的外部变化分支处理，不能用旧候选覆盖新根表。通过后仅调用 `scripts/safe_publish.ps1` 受控发布；不得直接编辑根表或强制关闭 Excel。发布后重新打开根表检查可读性、公式、结构和 SHA256，必须与候选完全一致。
+任何不一致都使两道门禁失效，按候选与发布 reference 的外部变化分支处理，不能用旧候选覆盖新根表。`workflow` 仅调用 `scripts/run_safe_publish.mjs`；`ledger-reorder-correction` 仅调用绑定 v2 plan、两份 Gate 工件及当前任务批准摘要的 `scripts/publish_ledger_reorder.mjs`。不得自行拼接 PowerShell 命令、直接调用 `safe_publish.ps1`、为 correction 绕过门禁调用通用发布器、编辑根表或强制关闭 Excel。发布后重新打开根表检查可读性、公式、结构和 SHA256，必须与候选完全一致。
 
-## 12. 最终报告与清理
+## 13. 最终报告与清理
 
 最终只报告用户需要判断的结果：批次和归档路径、费用/实报/不实报金额、非目标类目小计及隔离结果、明细行数、各类目截图数、对应表 Sheet 顺序与图片实例数、候选和根表路径、两道门禁状态、发布后 SHA256，以及临时内容是否清理。
 

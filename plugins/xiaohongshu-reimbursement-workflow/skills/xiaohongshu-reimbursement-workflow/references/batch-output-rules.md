@@ -6,20 +6,21 @@
 
 1. 唯一数据源与类目
 2. 最终归档结构
-3. 摘要预览与门禁绑定
-4. 本次报销明细
-5. 原图归档
-6. 对应截图表
-7. 一次展示与视觉验收
+3. 活动版本晋升
+4. 摘要预览与门禁绑定
+5. 本次报销明细
+6. 原图归档
+7. 对应截图表
+8. 一次展示与视觉验收
 
 ## 1. 唯一数据源与类目
 
-使用当前任务的 `batch-manifest.json` 中同一组规范化交易驱动全部产物；摘要、明细、截图表和候选校验不得分别重新解析材料。
+使用当前任务的 `batch-manifest.json` 中同一组规范化交易驱动全部产物；摘要、明细、截图表和候选校验不得分别重新解析材料。新任务中的明细 E、对应截图表“备注”和候选 F 必须投影同一个已冻结 `classification`，不允许在三个产物中分别归类。
 
 - 目标总表类目默认 `小红书报销`。除非用户明确指定其他类目，记录均归入目标类目。
 - `公司报销` 等非目标类目只进入文字说明、原图归档和对应截图表，不进入目标类目的本次明细、候选总表或根表。
 - 每笔记录只能有一个报销类目；一张凭证可以通过多对多证据关系覆盖多笔或多个类目。
-- 用户写出具体单子或项目名时，备注使用该稳定名称；不要改成泛化的 `日常报销`。
+- 用户写出具体单子或项目名时，`classification` 使用该稳定名称；不要改成泛化的 `日常报销`。分类变化必须先回写 manifest 交易并使所有下游摘要、候选和门禁失效。
 
 ## 2. 最终归档结构
 
@@ -37,20 +38,32 @@
    └─ <其他实际出现的报销类目>/
 ```
 
-活动归档中每类正式交付物只保留一个当前版本。不要留下 manifest、验收证书、自动生成的 `.inspect.ndjson`、截图与款项说明、截图对应关系 TXT、差异说明、聊天区间辅助目录、预览、日志、解析文件或构建脚本。已经交付或验收过的旧版不得删除；新修正版通过后，把被替代版本移到活动归档同级的 `<归档文件夹名>_历史版本/`，避免通配符同时选中两个当前文件。
+活动归档中每类正式交付物只保留一个当前版本；带不同 `_修正版N` 后缀的同类文件仍属于同一交付物类型，不能并列成为当前版本。不要留下 manifest、验收证书、自动生成的 `.inspect.ndjson`、截图与款项说明、截图对应关系 TXT、差异说明、聊天区间辅助目录、预览、日志、解析文件或构建脚本。已经交付或验收过的旧版不得删除；按第 3 节完成版本晋升，避免通配符同时选中两个当前文件。
 
-## 3. 摘要预览与门禁绑定
+## 3. 活动版本晋升
 
-从 `batch-manifest.json` 机械投影出结构化 JSON，使用 `scripts/build_reimbursement_summary.mjs`，禁止手工拼接或把该 JSON 维护成第二套业务事实：
+新修正版先在父级专用任务临时目录构建；完成语义、公式、格式、视觉和 SHA256 验收前，不得放入活动归档。验收通过后按以下顺序晋升：
+
+1. 精确枚举同一交付物类型的活动当前版本，确认来源恰好一个；首次生成时确认当前版本为零。确定单调递增且未占用的 `_修正版N`，不得覆盖任何现有文件。
+2. 在活动归档同级使用 `<归档文件夹名>_历史版本/`。先检查历史目标路径不存在；重名、归属不明或多个当前版本时阻塞，不自动改名或删除。
+3. 只用 `scripts/promote_active_revision.mjs` 执行晋升：候选和历史快照均先写入事务私有 staging、fsync 并验 SHA256，再以原子 hardlink/rename 安装；旧当前版本的可恢复 staging 必须使用预验哈希后的原子 rename。历史快照不得与活动文件共用硬链接，避免外部原地写同时破坏两份。
+4. 晋升器和审计器在整个文件族操作期间持有同一 Windows Local named Mutex；PowerShell helper 经 stdin 持锁，父进程 kill 后自动释放，超时或 helper 异常在写前阻塞。完整原子安装的 v4 owner/PID/start-identity lock、v2 recovery guard 和事务 marker 记录提交点；进程崩溃后以同一 plan 重试恢复。普通失败自动还原，检测到外部替换或任何无法证明归属时保留旧版快照、锁和恢复日志并停止，不进入展示、门禁、发布或交付。
+5. 晋升结束后用 `scripts/audit_active_revisions.mjs` 再次枚举：该交付物类型在活动归档必须恰好一个当前版本，其 SHA256 必须等于验收结果；旧版只在历史目录且哈希不变。该文件族存在任何 lock/recovery/marker 残留时审计也必须 fail-close，先用同一 promotion plan 完成恢复，否则阻塞。
+
+门禁只绑定成功晋升后的当前候选路径、候选修订号和 SHA256。晋升造成候选字节或哈希变化时，两道门禁失效并重新从完整展示开始。
+
+## 4. 摘要预览与门禁绑定
+
+新版直接让 `scripts/build_reimbursement_summary.mjs` 审计并机械投影 `batch-manifest.json`，禁止手工拼接第二套业务事实；`--input` 只用于兼容既有 v1 批次：
 
 ```text
-node scripts/build_reimbursement_summary.mjs --input <input.json> --preview
-node scripts/build_reimbursement_summary.mjs --input <input.json> --output <new-output.txt> --expect-sha256 <预览textSha256>
+"<bundled-node>" scripts/build_reimbursement_summary.mjs --manifest <batch-manifest.json> --preview
+"<bundled-node>" scripts/build_reimbursement_summary.mjs --manifest <batch-manifest.json> --output <new-output.txt> --expect-sha256 <预览textSha256>
 ```
 
 预览模式输出确定性的 `summary` 完整正文、`textSha256` 和金额摘要，不创建文件。阶段 B 直接把完整正文贴在对话中；不要等待单独的自然语言确认。第一道精确门禁同时确认该摘要和其余业务核对包。收到第一道门禁后才把预览哈希作为 `--expect-sha256` 写最终 TXT；输入变化或哈希不一致时必须在创建文件前失败。
 
-输入使用 `targetCategory` 指定目标类目；每个 `entry` 使用 `category`、字符串金额 `amount`、标签 `label` 和布尔值 `reimbursable`。可用 `expectedFeeTotal`、`expectedRealTotal` 和 `expectedCategoryTotals` 独立验算。
+输入使用 `targetCategory` 指定目标类目；每个新版 `entry` 使用 `category`、最多三位小数的有符号字符串金额 `amount`、标签 `label` 和独立结算枚举 `settlement`。`settlement` 只允许 `employee_reimbursement` 或 `company_paid_no_reimbursement`；旧版机械投影仍可用 `reimbursable`，两者同时出现时必须一致。负数必须附带引用同类目、同结算方式正金额来源的 `adjustment`。可用 `expectedFeeTotal`、`expectedRealTotal` 和 `expectedCategoryTotals` 独立验算。
 
 格式要求：
 
@@ -64,7 +77,7 @@ node scripts/build_reimbursement_summary.mjs --input <input.json> --output <new-
 - 时间段写完整中文日期并带年份；跨年时两端都写年份。
 - 原义、人员或分类不明确时先确认，不得为凑平总额改写。
 
-## 4. 本次报销明细
+## 5. 本次报销明细
 
 本次明细只包含当前时间段、目标总表类目的本批交易；不得包含历史记录或非目标类目。它是供人审阅的“人员分区视图”，不承担候选总表导入职责。默认 A-F 为：
 
@@ -79,9 +92,9 @@ node scripts/build_reimbursement_summary.mjs --input <input.json> --output <new-
 
 确定性分区和排序规则：
 
-1. 普通实报交易按正式支出人建立连续区块；人员区块按该人员在 manifest 交易数组中的首次出现顺序排列。
+1. `settlement: employee_reimbursement` 的普通实报交易按正式支出人建立连续区块；v2 人员区块按该人员最小 `sourceOrder` 排列，兼容读取 v1 时才使用 manifest 数组顺序。
 2. 每个区块内按合法 ISO 日期升序；同日保持 manifest 稳定来源顺序。人员分区后的全表日期可以回退，不能再要求全局日期升序。
-3. 所有 `对公已付不实报` 交易从普通人员区块移出，按对公主体/汇总标签建立独立区块并统一放在全部普通人员区块之后；这些区块也按首次出现顺序、区内日期升序排列。标题写为 `<主体>（对公已付不实报）｜<N>笔`。
+3. 所有 `settlement: company_paid_no_reimbursement` 交易从普通人员区块移出，按对公主体/汇总标签建立独立区块并统一放在全部普通人员区块之后；v2 这些区块也按最小 `sourceOrder`、区内日期升序排列，v1 兼容读取使用数组顺序。标题写为 `<主体>（对公已付不实报）｜<N>笔`。同一标签同时存在两种结算方式是合法业务，不得因标签相同而拒绝或混为一组。
 4. 普通标题写为 `<人员>｜<N>笔`。标题行和空白分隔行是展示行，不是交易；只允许标题行的小计公式引用本区 C 列，不得进入业务多重集合、明细笔数、候选或根表。
 5. 每笔目标交易恰好出现一次，非目标交易为零。业务匹配使用 `日期 + 项目/费用明细 + Decimal 金额 + 人员/报销属性 + 备注/分类` 的多重集合，不依赖明细行号。
 
@@ -89,7 +102,7 @@ node scripts/build_reimbursement_summary.mjs --input <input.json> --output <new-
 
 候选和根表继续沿用其自身 A-F 列语义、日期排序、合并与样式；不得把本节的人员标题、颜色、空白分隔行或列位变化传播过去。基线或业务字段不能可靠映射时按 Excel reference 询问。
 
-## 5. 原图归档
+## 6. 原图归档
 
 在 `报销截图` 下为每个实际出现的类目建立同名文件夹。`公司报销` 必须单独进入 `报销截图/公司报销`。
 
@@ -97,9 +110,9 @@ node scripts/build_reimbursement_summary.mjs --input <input.json> --output <new-
 - 一张图覆盖多个类目时，每个相关类目各保留一份原图副本，并在 manifest 标记共享来源。
 - 每个归档副本都与已登记的来源 SHA256 比较；来源本就在正确目标位置时不重复复制。
 
-## 6. 对应截图表
+## 7. 对应截图表
 
-对话版和本地 `.xlsx` 必须使用同一组逐笔记录、备注和图片顺序。
+对话版和本地 `.xlsx` 必须使用同一组逐笔记录、冻结 `classification` 和图片顺序；对应表不得在展示阶段重新猜测分类。
 
 - “页”只指可见 Sheet，不是打印页或 PDF 页。目标类目固定为 Sheet1；有 `公司报销` 时固定为 Sheet2；其他实际出现的非目标类目按首次出现顺序追加可见 Sheet。
 - 不得为 manifest、审计或调试增加隐藏 Sheet；内部检查点留在任务临时目录。
@@ -108,7 +121,7 @@ node scripts/build_reimbursement_summary.mjs --input <input.json> --output <new-
 - 图片必须嵌入，不得用外链、文件名或路径代替。保持宽高比和内边距，设置足够列宽/行高，确保图片、金额和备注无裁切、遮挡或跨行。
 - 同一凭证覆盖多笔时可在相关业务行放置独立锚点；图片哈希相同不能成为删除业务行的理由。实现支持时复用同一 OOXML media part，避免重复写入相同图片字节。
 
-## 7. 一次展示与视觉验收
+## 8. 一次展示与视觉验收
 
 阶段 A 只给疑点附图。对应截图表完成语义和视觉验收后，在对话中完整展示一次；所有分批合起来必须覆盖每笔记录和每张采用图片，不能只给路径或来源编号。后续哈希未变化时不再重复展示。
 

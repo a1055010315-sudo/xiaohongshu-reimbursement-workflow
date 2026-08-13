@@ -1,6 +1,6 @@
 interface:
   display_name: "小红书报销归档工作流"
-  short_description: "微信一次收集、本地增量核验，分类归档并安全更新总表"
-  default_prompt: "使用 $xiaohongshu-reimbursement-workflow 一次收集本批材料，在本地按哈希增量核验并分离公司报销，生成归档和候选总表，再通过两道门禁安全更新根目录总表。"
+  short_description: "微信证据核对、历史账本修正、报销归档与双门禁安全发布"
+  default_prompt: "使用 $xiaohongshu-reimbursement-workflow 处理本批报销、补齐或修正历史账本，并通过两道门禁安全发布。"
 policy:
   allow_implicit_invocation: false
