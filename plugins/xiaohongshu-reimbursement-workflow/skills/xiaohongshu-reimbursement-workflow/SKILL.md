@@ -44,7 +44,7 @@ description: "Run or resume a controlled reimbursement batch for Xiaohongshu, co
 - 一张证据可关联多个 profile，但每笔交易只属于一个 profile；共享证据只哈希、解码和识别一次；
 - 处理期间发现新 profile 时，先列入同阶段待确认；用户确认后扩展 `affectedProfiles`，使统一门禁失效并重建父批次索引。
 
-每个 profile 只能绑定配置白名单内唯一根表和唯一可编辑 Sheet。未知 Sheet 默认保护；公司辅助页、驻所收入和驻所工资不得改变。不得用修改时间、近似文件名或 Sheet 顺序猜测目标。
+每个 profile 只能绑定配置白名单内唯一根表和唯一可编辑 Sheet。未知 Sheet 默认保护；公司辅助页不得改变；`驻所收入.xlsx` 与 `驻所工资.xlsx` 是驻所外部分表，本工作流不得打开或修改。不得用修改时间、近似文件名或 Sheet 顺序猜测目标。
 
 ## 3. 两道统一门禁
 

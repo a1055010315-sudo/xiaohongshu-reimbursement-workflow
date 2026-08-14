@@ -437,21 +437,16 @@ test("a configured protected sheet deleted before the run is structural drift", 
   );
 });
 
-test("residence accepts either the 驻所 or 住所 protected-sheet alias pair", async (context) => {
+test("residence accepts either editable-sheet alias without embedding the external income and wage ledgers", async (context) => {
   const { profileConfig } = await loadContracts();
   const config = profileConfig.profiles.residence;
-  for (const [editableName, incomeName, wageName] of [
-    ["驻所支出", "驻所收入", "驻所工资"],
-    ["住所支出", "住所收入", "住所工资"],
-  ]) {
+  for (const editableName of ["驻所支出", "住所支出"]) {
     await context.test(editableName, async () => {
       const directory = path.join(tempRoot, editableName, config.profileDirectory);
       await fs.mkdir(directory, { recursive: true });
       const baselinePath = path.join(directory, config.rootWorkbookNames[0]);
       const workbook = Workbook.create();
       const sheet = workbook.worksheets.add(editableName);
-      workbook.worksheets.add(incomeName).getRange("A1").values = [["收入保护页"]];
-      workbook.worksheets.add(wageName).getRange("A1").values = [["工资保护页"]];
       sheet.getRange("A1").values = [["2026年驻所支出总表"]];
       sheet.getRange("A4:F4").values = [config.rootSheet.headerFingerprints[0]];
       const blob = await SpreadsheetFile.exportXlsx(workbook);
@@ -474,27 +469,37 @@ test("residence accepts either the 驻所 or 住所 protected-sheet alias pair",
   }
 });
 
-test("residence blocks when an entire protected-sheet role is absent", async () => {
+test("residence leaves external income and wage workbooks unopened and preserves unknown sheets in the expense workbook", async () => {
   const { profileConfig } = await loadContracts();
   const config = profileConfig.profiles.residence;
   const directory = path.join(tempRoot, config.profileDirectory);
   await fs.mkdir(directory, { recursive: true });
   const baselinePath = path.join(directory, config.rootWorkbookNames[0]);
+  const incomePath = path.join(directory, "驻所收入.xlsx");
+  const wagePath = path.join(directory, "驻所工资.xlsx");
+  await fs.writeFile(incomePath, "external-income-ledger-sentinel");
+  await fs.writeFile(wagePath, "external-wage-ledger-sentinel");
+  const incomeBefore = await fs.readFile(incomePath);
+  const wageBefore = await fs.readFile(wagePath);
   const workbook = Workbook.create();
   const sheet = workbook.worksheets.add("驻所支出");
-  workbook.worksheets.add("驻所收入").getRange("A1").values = [["只有收入保护页"]];
+  workbook.worksheets.add("自定义辅助页").getRange("A1").values = [["未知页必须保护"]];
   sheet.getRange("A1").values = [["2026年驻所支出总表"]];
   sheet.getRange("A4:F4").values = [config.rootSheet.headerFingerprints[0]];
   const blob = await SpreadsheetFile.exportXlsx(workbook); await blob.save(baselinePath);
   await fs.unlink(`${baselinePath}.inspect.ndjson`).catch((error) => { if (error?.code !== "ENOENT") throw error; });
-  await assert.rejects(
-    () => buildReimbursementCandidates({
-      version: 1,
-      affectedProfiles: ["residence"],
-      profiles: { residence: { baselinePath, candidatePath: path.join(directory, "missing-wage.xlsx"), titleYear: 2026, controlledSegment: { startDate: "2026-06-01" }, transactions: [{ id: "R1", date: "2026-08-01", project: "驻所项目", amount: "10", person: "匿名", classification: "运营开支" }] } },
-    }),
-    /MISSING_REQUIRED_PROTECTED_SHEET_GROUP/u,
-  );
+  const candidatePath = path.join(directory, "residence-candidate.xlsx");
+  const plan = {
+    version: 1,
+    affectedProfiles: ["residence"],
+    profiles: { residence: { baselinePath, candidatePath, titleYear: 2026, controlledSegment: { startDate: "2026-06-01" }, transactions: [{ id: "R1", date: "2026-08-01", project: "驻所项目", amount: "10", person: "匿名", classification: "运营开支" }] } },
+  };
+  await buildReimbursementCandidates(plan);
+  assert.equal((await auditReimbursementCandidates(plan)).ok, true);
+  assert.deepEqual(await fs.readFile(incomePath), incomeBefore);
+  assert.deepEqual(await fs.readFile(wagePath), wageBefore);
+  const candidate = await readWorkbookMetadata(candidatePath);
+  assert.equal(cellAt(candidate.sheets.find((item) => item.name === "自定义辅助页"), "A", 1).value, "未知页必须保护");
 });
 
 test("company header style and widths drift are repaired to the blue XHS-derived contract while protected sheets remain unchanged", async () => {

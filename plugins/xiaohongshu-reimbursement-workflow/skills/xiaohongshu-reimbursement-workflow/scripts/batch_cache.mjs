@@ -9,7 +9,7 @@ export const PROFILE_ORDER = Object.freeze(["xiaohongshu", "company", "residence
 export const PROFILE_TARGET_FILENAMES = Object.freeze({
   xiaohongshu: "小红书支出总表.xlsx",
   company: "公司支出总表.xlsx",
-  residence: "驻所收入支出总表.xlsx",
+  residence: "驻所支出.xlsx",
 });
 export const PROFILE_ROOT_DIRECTORY_NAMES = Object.freeze({
   xiaohongshu: "01_小红书专项",
