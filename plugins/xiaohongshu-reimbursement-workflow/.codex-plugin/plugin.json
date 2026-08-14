@@ -1,6 +1,6 @@
 {
   "name": "xiaohongshu-reimbursement-workflow",
-  "version": "0.3.0+codex.20260814031707",
+  "version": "0.3.0+codex.20260814032651",
   "description": "Unified Xiaohongshu, company, and residence reimbursement workflow with concurrent profile processing, workbook drift protection, two shared approval gates, and rollback-safe publishing.",
   "author": {
     "name": "a1055010315-sudo",

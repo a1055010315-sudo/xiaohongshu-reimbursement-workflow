@@ -16,7 +16,7 @@ import { digestObject, normalizeBatchPlan } from "../scripts/reimbursement_workb
 const PROFILE_NAMES = {
   xiaohongshu: "小红书支出总表.xlsx",
   company: "公司支出总表.xlsx",
-  residence: "驻所收入支出总表.xlsx",
+  residence: "驻所支出.xlsx",
 };
 const PROFILE_DIRECTORIES = {
   xiaohongshu: "01_小红书专项",

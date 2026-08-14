@@ -88,9 +88,9 @@
       "displayName": "驻所报销",
       "profileDirectory": "03_驻所专项",
       "rootWorkbookNames": [
-        "驻所收入支出总表.xlsx"
+        "驻所支出.xlsx"
       ],
-      "archiveStem": "驻所收入支出总表",
+      "archiveStem": "驻所支出",
       "rootSheet": {
         "titleCell": "A1",
         "canonicalTitleTemplate": "{year}年驻所支出总表",
@@ -115,10 +115,6 @@
         "住所支出"
       ],
       "protectedSheets": "all-except-editable",
-      "requiredProtectedSheetGroups": [
-        ["驻所收入", "住所收入"],
-        ["驻所工资", "住所工资"]
-      ],
       "themeOverride": "blue-role-override"
     }
   },

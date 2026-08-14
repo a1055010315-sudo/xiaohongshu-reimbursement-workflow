@@ -16,7 +16,7 @@ const REVIEW_ARTIFACT_SCRIPT = fileURLToPath(new URL("../scripts/build_reimburse
 const NAMES = {
   xiaohongshu: "小红书支出总表.xlsx",
   company: "公司支出总表.xlsx",
-  residence: "驻所收入支出总表.xlsx",
+  residence: "驻所支出.xlsx",
 };
 const DIRECTORIES = {
   xiaohongshu: "01_小红书专项",

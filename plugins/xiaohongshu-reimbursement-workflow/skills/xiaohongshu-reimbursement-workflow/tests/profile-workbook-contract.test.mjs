@@ -13,6 +13,7 @@ import {
   rowHeightFor,
 } from "../scripts/reimbursement_workbook_common.mjs";
 import { validateAuditCertificate } from "../scripts/audit_reimbursement_candidates.mjs";
+import { assertProfileTargetPath } from "../scripts/batch_cache.mjs";
 
 let tempRoot;
 
@@ -35,10 +36,9 @@ test("profile and style contracts agree on protected ledger-root semantics", asy
   assert.equal(styleContract.mergeContract.verifyNonAnchorOOXMLIsEmpty, true);
   assert.equal(styleContract.allowedProfileOverrides.company, "blue-role-override");
   assert.equal(profileConfig.profiles.residence.protectedSheets, "all-except-editable");
-  assert.deepEqual(profileConfig.profiles.residence.requiredProtectedSheetGroups, [
-    ["驻所收入", "住所收入"],
-    ["驻所工资", "住所工资"],
-  ]);
+  assert.deepEqual(profileConfig.profiles.residence.rootWorkbookNames, ["驻所支出.xlsx"]);
+  assert.equal(profileConfig.profiles.residence.archiveStem, "驻所支出");
+  assert.equal(Object.hasOwn(profileConfig.profiles.residence, "requiredProtectedSheetGroups"), false);
 });
 
 test("one, two, and three profiles normalize in fixed order and xhs is only an input alias", async () => {
@@ -111,6 +111,22 @@ test("the right ledger filename under the wrong parent directory is rejected", a
     },
   };
   await assert.rejects(normalizeBatchPlan(raw), /parent directory.*whitelist/u);
+});
+
+test("the publisher whitelist accepts only the split residence expense root", () => {
+  const directory = path.join(tempRoot, "03_驻所专项");
+  assert.equal(
+    assertProfileTargetPath("residence", path.join(directory, "驻所支出.xlsx")),
+    path.resolve(directory, "驻所支出.xlsx"),
+  );
+  assert.throws(
+    () => assertProfileTargetPath("residence", path.join(directory, "驻所收入支出总表.xlsx")),
+    /exact filename 驻所支出\.xlsx/u,
+  );
+  assert.throws(
+    () => assertProfileTargetPath("residence", path.join(directory, "驻所收入.xlsx")),
+    /exact filename 驻所支出\.xlsx/u,
+  );
 });
 
 test("audit certificate rejects forged canonical digest", () => {
