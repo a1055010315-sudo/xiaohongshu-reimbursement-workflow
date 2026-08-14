@@ -924,6 +924,24 @@ try {
       [...settlementTotals].map(([settlement, total]) => [settlement, formatAmount(total)]),
     );
   }
+  result.kind = normalizedOperation.mode === "reimbursement-batch"
+    ? "reimbursement-manifest-audit"
+    : "ledger-reorder-manifest-audit";
+  if (normalizedOperation.mode === "reimbursement-batch") {
+    const profileAliases = new Map([
+      ["小红书", "xiaohongshu"],
+      ["小红书报销", "xiaohongshu"],
+      ["公司", "company"],
+      ["公司报销", "company"],
+      ["驻所", "residence"],
+      ["驻所报销", "residence"],
+      ["住所", "residence"],
+      ["住所报销", "residence"],
+    ]);
+    const profileId = profileAliases.get(targetCategory);
+    if (profileId) result.profileId = profileId;
+  }
+  result.certificateDigest = digest(result);
   process.stdout.write(`${JSON.stringify(result)}\n`);
   process.exitCode = 0;
 } catch (error) {

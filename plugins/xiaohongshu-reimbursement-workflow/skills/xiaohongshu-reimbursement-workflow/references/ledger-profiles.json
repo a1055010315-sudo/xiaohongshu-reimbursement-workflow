@@ -1,0 +1,158 @@
+{
+  "schemaVersion": 1,
+  "profileOrder": [
+    "xiaohongshu",
+    "company",
+    "residence"
+  ],
+  "aliases": {
+    "小红书": "xiaohongshu",
+    "小红书报销": "xiaohongshu",
+    "公司": "company",
+    "公司报销": "company",
+    "驻所": "residence",
+    "驻所报销": "residence",
+    "住所": "residence",
+    "住所报销": "residence"
+  },
+  "profiles": {
+    "xiaohongshu": {
+      "displayName": "小红书报销",
+      "profileDirectory": "01_小红书专项",
+      "rootWorkbookNames": [
+        "小红书支出总表.xlsx"
+      ],
+      "archiveStem": "小红书支出总表",
+      "rootSheet": {
+        "titleCell": null,
+        "canonicalTitleTemplate": null,
+        "headerRowCandidates": [1],
+        "names": [
+          "Sheet1",
+          "支出总表",
+          "小红书支出"
+        ],
+        "headerFingerprints": [
+          [
+            "日期",
+            "支出明细",
+            "支出金额",
+            "合计",
+            "支出人",
+            "备注"
+          ]
+        ]
+      },
+      "editableSheets": [
+        "@rootSheet"
+      ],
+      "protectedSheets": "all-except-editable",
+      "themeOverride": "green-base"
+    },
+    "company": {
+      "displayName": "公司报销",
+      "profileDirectory": "02_公司专项",
+      "rootWorkbookNames": [
+        "公司支出总表.xlsx"
+      ],
+      "archiveStem": "公司支出总表",
+      "rootSheet": {
+        "titleCell": "A1",
+        "canonicalTitleTemplate": "{year}年公司支出总表",
+        "headerRowCandidates": [4],
+        "names": [
+          "公司支出"
+        ],
+        "headerFingerprints": [
+          [
+            "日期",
+            "支出明细",
+            "支出金额",
+            "费用组合计",
+            "支出人",
+            "备注"
+          ]
+        ]
+      },
+      "editableSheets": [
+        "公司支出"
+      ],
+      "protectedSheets": "all-except-editable",
+      "requiredProtectedSheetGroups": [
+        ["来源结算摘要"],
+        ["核对说明"]
+      ],
+      "themeOverride": "blue-role-override"
+    },
+    "residence": {
+      "displayName": "驻所报销",
+      "profileDirectory": "03_驻所专项",
+      "rootWorkbookNames": [
+        "驻所收入支出总表.xlsx"
+      ],
+      "archiveStem": "驻所收入支出总表",
+      "rootSheet": {
+        "titleCell": "A1",
+        "canonicalTitleTemplate": "{year}年驻所支出总表",
+        "headerRowCandidates": [4],
+        "names": [
+          "驻所支出",
+          "住所支出"
+        ],
+        "headerFingerprints": [
+          [
+            "日期",
+            "支出明细",
+            "支出金额",
+            "费用组合计",
+            "支出人",
+            "备注"
+          ]
+        ]
+      },
+      "editableSheets": [
+        "驻所支出",
+        "住所支出"
+      ],
+      "protectedSheets": "all-except-editable",
+      "requiredProtectedSheetGroups": [
+        ["驻所收入", "住所收入"],
+        ["驻所工资", "住所工资"]
+      ],
+      "themeOverride": "blue-role-override"
+    }
+  },
+  "profileDirectories": {
+    "xiaohongshu": "01_小红书专项",
+    "company": "02_公司专项",
+    "residence": "03_驻所专项"
+  },
+  "semanticColumns": {
+    "ledgerRoot": {
+      "A": "date",
+      "B": "project",
+      "C": "amount",
+      "D": "groupTotal",
+      "E": "personOrSubject",
+      "F": "classification"
+    },
+    "currentDetail": {
+      "A": "date",
+      "B": "project",
+      "C": "amount",
+      "D": "groupTotal",
+      "E": "classification",
+      "F": "settlementDisplay"
+    }
+  },
+  "resolutionPolicy": {
+    "requireSingleRootWorkbookMatch": true,
+    "requireSingleEditableSheetMatch": true,
+    "sheetResolution": "require-allowed-name-and-fixed-header-fingerprint",
+    "requiredProtectedSheetGroupsSemantics": "at-least-one-name-per-group",
+    "unknownSheetsAreProtected": true,
+    "allowArbitraryRootPath": false,
+    "allowArbitrarySheetName": false,
+    "blockOnAmbiguousAlias": true
+  }
+}

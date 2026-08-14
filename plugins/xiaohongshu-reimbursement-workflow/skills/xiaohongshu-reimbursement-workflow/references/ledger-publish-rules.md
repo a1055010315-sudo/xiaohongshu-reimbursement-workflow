@@ -1,124 +1,139 @@
-# 候选总表与发布规则
+# 候选总表、统一门禁与发布规则
 
-阶段 C、两道门禁和最终发布时完整读取本页。执行方式与临时目录见 `runtime-reliability.md`；通用表格语义见 `expense-workbook-rules.md`。
+普通批次的候选、两道统一门禁和协调发布使用本页。执行、缓存和临时目录见 `runtime-reliability.md`；工作簿语义见 `expense-workbook-rules.md`；根表和目标 Sheet 白名单见 `ledger-profiles.json`。
 
-## 1. 绑定基线
+## 1. 父批次绑定
 
-记录基准总表规范化绝对路径、SHA256，以及标准目标 `小红书支出总表.xlsx` 是否原本存在。第二道门禁前根表必须保持字节不变；所有整理只发生在专用临时副本。
+从 manifest v3 交易机械得出 `affectedProfiles`，规范名只允许 `xiaohongshu`、`company`、`residence`，并按配置固定排序。为每个 profile 绑定：
 
-只对目标总表类目的业务记录判断是否已经包含本批。业务比较使用稳定记录：规范化日期、项目、Decimal 金额、支出人、备注、批次/来源标识。截图 SHA256 用于证据完整性，不作为交易身份字段；同一凭证重新导出不应制造新交易。工作簿字节相等不能替代业务记录核对。
+- 唯一根表规范绝对路径和 SHA256；
+- 唯一可编辑 Sheet 及 A–F 表头指纹；
+- 候选路径、候选修订号和计划路径；
+- 所有保护 Sheet 及未授权 OOXML parts 摘要。
 
-## 2. 已包含与增量分支
+第二道门禁前所有根表必须保持字节不变；所有构建只发生在任务临时副本。一个 profile 时目标数组长度为 1，不等待或创建其他 profile。
 
-- **完全未包含**：追加全部本批目标类目交易。
-- **存在可唯一追溯的精确子集**：保留已存在记录，只追加缺失记录。只有稳定来源/凭证、全部业务字段和数量都能唯一匹配且没有重复歧义时才走此快速分支；在业务核对包中列明已存在和新增数量。
-- **完整包含**：停止追加，核查是否由其他流程发布，并让用户决定核对既有发布还是建立修正批次。
-- **部分相似但不能唯一追溯，或字段冲突**：列出差异并阻塞，不得猜测。
+## 2. 运行前防漂移
 
-同额同项目但有独立凭证或用户已确认是独立交易时可以并存。禁止同一批次、相同来源交易或全部业务字段相同的重复导入。
+候选前执行 Excel reference 的结构与格式预检：
 
-## 3. 零增量重排修正分支
+- `STRUCTURE_DRIFT`：缺列、插列、D 列缺失、表头错位、目标 Sheet 缺失/歧义；停止该 profile，禁止猜测。
+- `LAYOUT_DRIFT`：列宽、行高、对齐、合并、打印设置异常；停止发布并生成修复候选。
+- `STYLE_DRIFT`：字体、填充、边框或角色颜色异常；根表不动，按样式契约生成修复候选。
 
-用户只要求整理既有总表顺序，且不允许新增、删除或改变业务记录时，选择父级 `ledger-reorder-correction` 独立状态机。不得把重排伪装成新增报销批次，也不得从本次明细导入记录。
+修复候选与报销候选合并成该 profile 的同一当前修订，并进入统一门禁；不要先在根表上修格式再做报销。
 
-先建立绑定根目录、专用临时目录 marker、基线、暂存候选、活动候选、标准目标、修订号、工作表、范围和日期边界的严格 request，再调用 `scripts/generate_ledger_reorder_plan.mjs --request <request.json> --out <new-plan.json>` 从只读基线机械生成 v2 plan；plan 禁止手填或事后改写。随后调用 `scripts/build_ledger_reorder_candidate.mjs --plan <plan.json>` 构建暂存 `_修正版N`，并由 `scripts/audit_ledger_reorder.mjs --plan <plan.json> --candidate <candidate.xlsx>` 独立验收。工具返回 `unsupported` 时必须阻塞，不能降级为只移动值。候选必须同时满足：
+## 3. 已包含与增量
 
-1. 候选业务多重集合 = 基线业务多重集合，记录数完全相等；新增、缺失、重复记录均为零。
-2. 候选相对基线的 Decimal 金额增量严格等于 `0`；各月/区段和全表金额在相同口径下分别相等。
-3. 重排范围外的值、公式、逐格 computed style、行高、列宽、合并和工作表结构差异为零。
-4. 重排范围内按“规范化日期键 + 基线顺序号”稳定排序；同一日期键保持基线顺序。
-5. 每条记录的值/公式、逐格 computed style、逐个物理行高和合并元数据随记录正确迁移；完整位于同一逻辑记录内的竖向或横向合并以 `contiguous-row-block` 整体移动，合并非锚点无隐藏内容，完整要求见 Excel reference。
+每个 profile 独立比较稳定业务多重集合：规范化日期、项目、Decimal 金额、人员/主体、classification、settlement、稳定来源标识。
 
-顺序固定为“暂存候选全量机器验收 → 覆盖整个重排区的分段视觉预览 → 活动版本晋升 → 活动路径再次机器验收 → 展示活动候选”。记录活动候选绝对路径、修订号、SHA256 和 `planFileSha256`。候选或 plan 的字节/SHA256、候选路径/修订号、重排范围或排序策略发生任何变化时，两道门禁和终审全部失效；生成新 plan 和新修正版、重新完成验收/晋升/展示并从第一道门禁开始。
+- **完全未包含**：追加本 profile 全部交易。
+- **唯一可追溯精确子集**：只追加缺失交易，并在统一审阅包列明已存在/新增数量。
+- **完整包含**：停止该 profile 的追加，核验既有发布并报告。
+- **相似但不能唯一追溯或字段冲突**：阻塞统一 Gate 1，不得猜测。
 
-## 4. 新增报销与历史业务修正候选验证
+同额交易只有在证据和全部业务字段能证明独立时并存。截图 SHA256 证明证据内容，不单独充当交易身份。
 
-从基线临时副本和 manifest 的目标类目交易直接生成候选并重新打开；不得读取或导入本次明细中的人员标题、空白分隔行、展示颜色或列位置。必须同时满足：
+## 4. 候选构建与独立审计
 
-1. 候选业务多重集合 = 基线业务多重集合 + 本批尚未包含的目标类目交易多重集合。
-2. 候选相对基线的金额增量 = 尚未包含交易的费用合计；非目标类目增量为零。
-3. `对公已付不实报` 进入明细和候选，但从实报合计排除。
-4. 没有新增、缺失或重复的非本批记录；公式、合并、排序和样式通过 Excel reference 验收。
-
-历史遗漏或既有业务字段修正额外执行 [历史账本业务修正规则](ledger-business-correction.md)：每一版都从绑定基线、manifest v3 和累积补丁重建，不从上一候选继续修改；每个参考来源单元必须有唯一处置。调用 `derive_ledger_layout.mjs` 机械生成候选布局计划，保存候选后再由不同只读进程从实际工作簿生成审计包并调用 `audit_ledger_layout.mjs`。候选计划和独立审计分别证明：
-
-1. 行顺序只由 `date:asc + sourceOrder:asc` 决定；
-2. A 日期运行段与 D/E/F 费用组运行段独立，F 合并不能遗漏；
-3. 补丁只改变用户授权字段，分类修正不改变日期、项目、金额、人员、类型或 `settlement`；
-4. 整数、普通非整数和明确三位小数分别显示 0、2、3 位；
-5. 来源覆盖、交易多重集合、Decimal 金额和候选文件 SHA256 全部绑定同一候选修订。
-
-保存为归档内 `小红书支出总表_截至<结束日期>.xlsx`，记录候选 SHA256。候选生成后重新计算根表 SHA256；与绑定值不同就停止，禁止继续使用旧候选。
-
-## 5. 第一道门禁与终审
-
-只有适用模式的完整审阅包和活动候选路径/修订号/SHA256 已给出后，新消息中的精确文本 `本次报销通过无误` 才有效。普通新增及历史业务修正的新任务用 `scripts/build_gate_binding.mjs` 的 context v2，除原有 `mode + batchId + factsDigest + operationDigest + candidateRevision + 当前候选绝对路径/SHA256 + reviewPackageDigest` 外，同时绑定 `candidatePlanSha256 + sourceCoverageDigest`；context v1 只兼容恢复已开始批次。重排修正调用 `scripts/build_ledger_reorder_gate_artifact.mjs --gate gate-1` 时，`--preview-index` 必须指向 staging 中不存在的新输出；Gate 1 同调用重新审计活动候选、直接渲染覆盖完整 `physicalRange` 的连续分段、写绑定 `planFileSha256 + 候选规范路径/SHA256 + 每段范围/图片SHA256` 的严格 v2 索引，再把 `factsDigest + operationDigest + plan/candidate/preview + 审计结果` 机械写成临时工件。不得提供既有索引或外部 PNG；用户看到并确认的是该工件返回的预览及 `bindingDigest`。工件不等于授权，接受状态和批准摘要只留在当前任务。
-
-终审必须独立重算财务金额，但不得无条件重复全部重型核验：
-
-- 从磁盘重新读取本次明细，排除人员标题、表头、说明和空白分隔行后，用十进制定点金额重算人员/分类汇总、费用合计和实报合计；与摘要预览及 manifest 交易集合一致。
-- 独立重算每个非目标类目小计，确认其只存在于文字说明、截图归档和对应截图表。
-- 把摘要写入最终 TXT，并验证正文 SHA256 等于业务核对包中的预览 SHA256。
-- 重新计算根表和候选 SHA256。
-- 原图、归档副本和对应截图表的依赖哈希、manifest 摘要、规则版本均未变化时，只验证既有验收证书；任一变化才重验受影响部分。
-- 明确列出 `无截图（用户确认）`，并确认孤立截图、未解释缺图、未解释差异和未映射图片均为零。
-- 历史业务修正还要从当前候选重新提取审计包，复核 `candidatePlanSha256`、`sourceCoverageDigest`、累积补丁链及 `audit_ledger_layout.mjs` 结果；不能复用 Gate 1 前的内存分组。
-
-`ledger-reorder-correction` 不要求虚构本次明细或摘要；改为从磁盘独立重读基线和候选，重算第 3 节五项不变量，并复核重排区全量样式、行高、日期显示、公式及合并子格。终审通过后报告当前候选绝对路径和 SHA256；第二道门禁只绑定这个候选版本。候选在第一道门禁后发生任何字节变化时，第一道门禁也同时失效。
-
-## 6. 第二道门禁前的磁盘重读
-
-终审报告之后的新消息精确等于 `确认更新根目录支出总表` 才允许进入发布临界区。普通新增及历史业务修正的新任务再次用 `scripts/build_gate_binding.mjs` context v2，绑定 `mode + batchId + operationDigest + candidateRevision + 当前候选绝对路径/SHA256 + 当前基线绝对路径/SHA256 + finalAuditDigest + candidatePlanSha256 + sourceCoverageDigest`。重排修正必须先用 `scripts/build_ledger_reorder_gate_artifact.mjs --gate gate-2` 从当前磁盘 plan、基线、活动候选及全量终审机械生成 Gate 2 工件，展示其 `bindingDigest` 后再等第二句；不能依赖 manifest 中的旧内存值。随后核对：
-
-1. 新增报销分支：当前根表业务多重集合 + 本批尚未包含明细 = 候选业务多重集合；重排修正分支：当前根表业务多重集合 = 候选业务多重集合，金额增量为 `0`，范围外不变量和范围内稳定排序仍全部成立；
-2. 当前根表 SHA256 仍等于终审基线；
-3. 候选 SHA256 仍等于终审报告；
-4. 当前候选可打开，关键公式和结构仍有效。
-
-候选、候选 SHA256、候选修订号、重排范围或排序策略变化立即使两道门禁失效；从当前已验证根表和对应规范输入生成新的 `_修正版N` 候选，重新展示、重新取得第一道门禁、重新终审并重新取得第二道门禁。
-
-## 7. 等待期间根表变化
-
-根表 SHA256 变化时禁止用旧候选覆盖。重新核对最新根表：
-
-- 完全未包含本批：以最新根表生成新的候选修正版；
-- 已精确包含可追溯子集：只追加缺失记录并生成候选修正版；
-- 已完整包含本批：停止追加，核验外部发布后的记录、公式和结构，报告“根目录已由其他流程包含本批次”，不得声称本流程再次发布成功；
-- 部分相似、歧义或冲突：列出差异并阻塞。
-
-`ledger-reorder-correction` 遇到根表变化时，不套用上述增量判断；从最新根表重新绑定范围、顺序号和 SHA256，重新生成零增量候选并重验全部不变量。
-
-新候选不得覆盖旧候选；候选变化后两道门禁全部失效，重新完整展示、终审并取得绑定新哈希的两道门禁。
-
-## 8. 受控发布与发布后复核
-
-最终发布仅支持 Windows 10/11 和 Windows PowerShell 5.1+。标准总表被 Excel 锁定时让用户关闭文件，不强制结束 Excel。
-
-新增报销分支只调用 `scripts/run_safe_publish.mjs`，把基线、候选、目标绝对路径及预期 SHA256 作为参数传入。重排修正分支只调用下列绑定入口（命令必须是一行，使用 bundled Node）：
+父编排器一次接收所有受影响 profile；各 profile 可并行构建/审计，但不得复制业务事实：
 
 ```text
-"<bundled-node>" scripts/publish_ledger_reorder.mjs --plan <plan.json> --expected-plan-sha256 <planFileSha256> --expected-baseline-sha256 <当前hash> --expected-candidate-sha256 <当前活动候选hash> --expected-batch-id <batchId> --expected-operation-digest <operationDigest> --gate-1-artifact <gate-1.json> --expected-gate-1-binding-digest <已批准Gate1摘要> --gate-2-artifact <gate-2.json> --expected-gate-2-binding-digest <已批准Gate2摘要>
+"<bundled-node>" scripts/run_reimbursement_batch.mjs --input <batch-run-plan.json>
 ```
 
-包装器重载两份工件、当前 preview 字节、plan 和活动候选，任何摘要/路径/修订号/SHA256 不一致都阻塞；还必须在任何恢复或发布动作前从当前活动候选 fresh-rerender 完整 `physicalRange`，逐段比对 Sheet/range/PNG SHA256，不能只相信可手写重算的 Gate 工件。随后以同一组受绑定参数运行 recovery-only 探测，存在 stale journal 时必须在重读旧基线审计之前完成恢复，避免目标已替换后旧基线哈希使恢复入口不可达。无遗留事务才重新执行全量审计并开始新发布；无 journal 但标准目标已等于候选时按 `already_current` 幂等收口。禁止绕过 plan/Gate 工件传自由路径或直接调用 correction 的 `run_safe_publish.mjs`。启动器固定以 `shell: false` 和 `-ExecutionPolicy Bypass` 调用 `safe_publish.ps1`；保留脚本内部的锁、phase journal、崩溃恢复、回滚、临界窗口哈希、备份哈希核验和可恢复原子替换。不直接调用 PowerShell、不编辑根表、不临时拼接含中文绝对路径的 `.ps1`。
+对每个 profile：
 
-脚本返回非零时停止并完整报告恢复信息，不因目标存在或有部分输出声称成功；目标或备份在临界区被外部改变时不得强制覆盖或删除，保留 `preserved_target`/`preserved_backup` 供人工处理。脚本成功后仍须重新打开目标，检查可读性、公式和结构；目标 SHA256 必须与归档候选完全一致。候选快照继续保留为本批提交时的总表快照。
+1. 从绑定基线 + 本 profile 的 manifest v3 机械投影直接构建，不导入明细中的人员标题、空白行或展示结构。
+2. 候选多重集合必须等于基线 + 尚未包含交易；金额增量等于尚未包含费用合计，其他 profile 增量为零。
+3. `company_paid_no_reimbursement` 进入候选和费用合计，但从实报合计排除。
+4. 按 `date:asc + sourceOrder:asc` 稳定排序；D/E/F 同组同范围合并，D 公式、样式、显示和非锚点 OOXML 满足契约。
+5. 独立审计器从实际候选 XLSX/OOXML 自行提取事实、公式、合并、样式和保护页摘要；不得相信构建器传入的 `actualRows`、费用组或 `actualMerges`。
+6. 根表 SHA256 在构建前后必须不变；保护 Sheet 的值、公式、样式、合并、行列尺寸、关系和 OOXML 摘要差异为零。
 
-## 9. 已发布后的纯展示修订
+历史业务修正额外执行 `ledger-business-correction.md`，每一版都从绑定基线 + manifest v3 + 累积补丁重建，不从废止候选继续修改。
 
-根表已经发布后，如果用户明确要求的变化只涉及本次明细的人员分区、颜色、列宽或说明文字，先固定并比较以下不变量：规范化交易多重集合、费用/实报/不实报金额、证据映射、摘要正文、候选 SHA256、根表 SHA256。全部不变时：
+## 5. 统一 Gate 1
 
-1. 新建本次明细 `_修正版N`，不得覆盖旧版；按 `current-detail-person-grouped` profile 重新做语义、公式和视觉验收。
-2. 新版通过后，把旧版移动到活动归档同级的 `<归档文件夹名>_历史版本/`；活动归档只留当前版，历史版不得删除。
-3. 记录根表为 `UNCHANGED`、发布动作为 `SKIP_ALREADY_PUBLISHED`；不调用发布启动器，不重新追加，不索取第二道门禁。
+只有所有 profile 都完成候选、金额/来源/工作簿审计和必要视觉预览后，先从 `ready-for-unified-gate-1` 状态及明确列出的每 profile 渲染路径生成统一复核工件：
 
-只要日期、项目、金额、人员、备注/分类、报销属性、证据归属或交易数量有任一变化，就不是纯展示修订，必须回到父级失效规则并重新执行受影响的业务核对和门禁。
+```text
+"<bundled-node>" scripts/build_reimbursement_review_artifacts.mjs --input <review-artifact-request.json>
+```
 
-## 10. 活动版本晋升
+请求严格包含 `version + batchStatePath + profiles + outputs`；`profiles.<profile>.renders` 是非空规范绝对路径数组，`outputs.previewIndexPath/reviewPackagePath` 是批次任务根的两个全新直接子级 JSON。脚本重新哈希 ready state、facts、候选审计、基线、候选、明细和全部 render，生成结构化 `reimbursement-batch-preview-index` 与 `reimbursement-batch-review-package`，写入使用独占创建语义，拒绝覆盖。preview index 按固定 profile 顺序绑定候选、可选明细及全部 render 的路径/SHA256；review package 绑定 `factsDigest`、逐 profile `candidateAuditDigests` 和 `previewIndexDigest`。
 
-候选总表或本次明细的新修正版必须先在专用任务临时目录构建并完成全部验收，再按批次归档 reference 晋升为活动归档唯一当前版本。门禁只绑定晋升完成后的绝对路径、候选修订号和 SHA256。
+随后把同一对输出路径/SHA256填入 Gate 1 的每个 profile，再调用：
 
-- 不覆盖或删除旧版；把被替代版本移到同级历史目录，并保持原文件名可追溯。
-- 使用 `scripts/promote_active_revision.mjs` 执行晋升，并用 `scripts/audit_active_revisions.mjs` 独立审计；晋升前后枚举同一交付物类型，活动归档必须恰好有一个当前版本。历史目标重名、来源不唯一或出现两个当前版本都必须阻塞。晋升器使用完整写入后原子发布的 owner/PID 锁、phase marker、候选私有 staging 和独立旧版历史快照；进程崩溃后同一 plan 重试恢复。
-- 任一步移动、校验或失败恢复不完整时，停止门禁和发布；保留锁、事务日志、旧版恢复快照和所有可证明/无法证明归属的精确路径，不得删除旧版或把部分晋升声称为成功。
-- 晋升成功后重新计算活动当前版本 SHA256；与已验收候选不一致时按候选变化处理，使两道门禁失效。
+```text
+"<bundled-node>" scripts/build_batch_gate_artifact.mjs --input <gate-1-request.json> --output <new-gate-1.json>
+```
+
+Gate 1 工件按固定 profile 顺序绑定：父 `batchId`、`affectedProfiles`、事实/来源/操作/样式摘要、每个 profile 的基线、候选和本次明细规范路径/SHA256、候选修订号、候选计划、独立明细/候选审计和预览，以及统一 `reviewPackageDigest`。明细必须带由实际工作簿独立计算的 `detailAuditDigest`；脚本从磁盘重新哈希实际依赖，不接受调用方声称 `verified`。
+
+完整展示：每个 profile 的人员/分类汇总、费用/实报/不实报金额、缺图/排除清单、候选路径/SHA256、关键预览及父 `bindingDigest`。随后只等待一次精确文本 `本次报销通过无误`。
+
+任何 profile 尚未 ready、存在未决问题或基线发生漂移时，不开放门禁。已完整写出的父 `facts/build/audit/ready` 阶段可在计划与磁盘哈希完全一致时续跑；半成品候选不得视为缓存。
+
+## 6. 独立终审与统一 Gate 2
+
+收到绑定当前 Gate 1 的有效第一句后，各 profile 并行从磁盘独立终审：
+
+- 用 Decimal 重算人员/分类、费用、实报、不实报及本批增量；
+- 重读候选事实、公式、合并、样式、保护 Sheet 和未授权 OOXML；
+- 重算根表和候选 SHA256；
+- 未变化证据、截图表及视觉证书只验证缓存绑定，不重复 OCR、解码或渲染。
+
+全部通过后，先把本次独立终审写成新的、只读重开所得的 Gate 2 终审证书：
+
+```text
+"<bundled-node>" scripts/build_reimbursement_final_audit.mjs --input <final-audit-request.json> --output <new-final-audit.json>
+```
+
+终审请求必须绑定 Gate 1 已展示的同一 `batchId/affectedProfiles/facts`，并逐 profile 绑定当前基线、候选、候选审计和可选明细的路径与 SHA256。输出必须为 `kind: reimbursement-batch-final-audit`、`phase: gate-2-final-audit`，且不得与 Gate 1 的候选审计复用路径、SHA256 或摘要。
+
+随后调用：
+
+```text
+"<bundled-node>" scripts/build_batch_gate_artifact.mjs --input <gate-2-request.json> --output <new-gate-2.json>
+```
+
+Gate 2 请求还必须提供 `gate1ArtifactPath/gate1ArtifactSha256/gate1BindingDigest`、`finalAuditPath/finalAuditSha256/finalAuditDigest`，并继续绑定 Gate 1 已展示的当前 `previewIndex`。Gate 2 绑定同一父批次和全部 profile 当前基线/候选，并增加统一 `finalAuditDigest`；它不能跳过 Gate 1，也不能把 Gate 1 的 review package 当成发布授权。展示所有路径、SHA256 和父 `bindingDigest` 后，只等待一次精确文本 `确认更新根目录支出总表`。
+
+事实、profile 集合、基线、候选、计划、样式契约、审计或预览任一变化，使父批次两道门禁全部失效。未变化证据/OCR可以按内容哈希复用；工作簿按当前父计划和完整阶段证书决定是否重建，统一工件必须重建、重展示和重新确认。
+
+## 7. 多目标协调发布
+
+收到绑定当前 Gate 2 的有效第二句后，从磁盘重读所有根表、候选和 Gate 依赖，再调用：
+
+```text
+"<bundled-node>" scripts/publish_reimbursement_batch.mjs --input <publish-or-recover-plan.json>
+```
+
+发布器必须：
+
+1. 按规范目标路径固定排序并锁定全部目标；单 profile 使用同一逻辑，目标数组长度为 1。
+2. 重新验证 Gate 1/2 摘要、根表/候选 SHA256、结构预检、最终审计和 `affectedProfiles`。
+3. 建立一个父事务 journal；所有旧根表恢复副本保留到最后一个目标完成发布后审计。
+4. 任一目标失败时，按反向顺序恢复本事务已经替换的所有根表；外部并发改变导致无法证明时保留精确现场并 fail-closed。
+5. 崩溃恢复时：全部等于候选则收口；部分发布则恢复全部基线；无法唯一判断则保留 journal、目标和备份并阻塞。
+6. 所有目标重新打开并通过 SHA256、事实、公式、结构、样式和保护 Sheet 审计后，才标记整批成功并清理恢复材料。
+
+这实现“全成或全回滚”的协调事务，不宣称跨目录有操作系统层面的瞬时原子替换。不得连续手工调用旧单表发布器冒充多目标事务，不得直接编辑根表、拼接 PowerShell、强制关闭 Excel 或绕过 Gate 工件。
+
+## 8. 等待期间外部变化
+
+任一根表 SHA256 改变时禁止用旧候选覆盖：
+
+- 未包含本批：从最新根表重建该 profile 候选；
+- 唯一包含精确子集：只追加缺失记录并重建；
+- 已完整包含：核验外部发布并停止该 profile 的重复追加；
+- 相似、歧义或冲突：列出差异并阻塞。
+
+新候选不得覆盖旧候选；其 revision 单调递增。变更使整个父批次 Gate 失效，但未受影响 profile 的事实和证据缓存可以复用。
+
+## 9. 最小留档
+
+新普通任务默认 `minimal-current-only`：候选、journal、回滚副本、Gate 工件、预览和内部证书只在任务临时区存在。成功后每个专项既有归档只保留该 profile 的当前明细、截图表、凭证、当前总表快照及一份精简 `发布审计.json`；父 `batch-run`、Gate、缓存和回滚材料不进入专项归档。不创建公共父归档，也不创建长期 `_历史版本` 或 `待确认_历史版本`。用户要求延续旧周期时修改已绑定 `archivePath`，不另建新周期目录。
+
+失败、外部替换或无法证明归属时保留精确恢复材料并报告。旧任务、零增量重排或恢复任务继续使用 `legacy-history` 和既有单账本 plan/审计/晋升/发布工具，不静默迁移或删除历史文件。

@@ -1,10 +1,20 @@
 import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
 
-const PREFIX = "codex-xhs-reimburse-";
-const MARKER_NAME = ".codex-xhs-owner.json";
-const MARKER_KIND = "xiaohongshu-reimbursement-temp";
+import {
+  MARKER_NAME,
+  assertInventoryMatches,
+  assertRealDirectory,
+  compareSnapshots,
+  readMarker,
+  resolveTaskRoot,
+  sameIdentity,
+  samePath,
+  sha256File,
+  snapshotTree,
+} from "./task_temp_inventory_common.mjs";
+
+const ACTIVE_NAMES = new Set(["journal.json", "recovery.json", "recovery-required.json"]);
 
 function emit(result, isError = false) {
   const line = `${JSON.stringify(result)}\n`;
@@ -12,116 +22,111 @@ function emit(result, isError = false) {
   process.exitCode = isError ? 1 : 0;
 }
 
-function samePath(left, right) {
-  const a = path.resolve(left);
-  const b = path.resolve(right);
-  return process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b;
+function isActiveRecoveryPath(relativePath, kind) {
+  const name = path.posix.basename(relativePath).toLowerCase();
+  if (kind === "dir" && name.startsWith(".codex-batch-publish-")) return true;
+  if (name.endsWith(".lock") || name.includes("recovery-required")) return true;
+  if (ACTIVE_NAMES.has(name) && relativePath.includes(".codex-batch-publish-")) return true;
+  return false;
 }
 
-function sameIdentity(left, right) {
-  return left.dev === right.dev && left.ino === right.ino && left.birthtimeMs === right.birthtimeMs;
-}
-
-function entryType(stat) {
-  if (stat.isSymbolicLink()) return "link";
-  if (stat.isFile()) return "file";
-  return "unsupported";
-}
-
-function validateMarker(marker, token) {
-  return marker?.kind === MARKER_KIND && marker?.version === 1 && marker?.token === token;
+async function verifyEntryUnchanged(entry) {
+  const stat = await fs.lstat(entry.absolutePath);
+  if (
+    !sameIdentity(entry.stat, stat) ||
+    stat.isSymbolicLink() ||
+    (entry.kind === "file" && !stat.isFile()) ||
+    (entry.kind === "dir" && !stat.isDirectory()) ||
+    (entry.kind === "file" && stat.size !== entry.stat.size) ||
+    (entry.kind === "file" && stat.mtimeMs !== entry.stat.mtimeMs)
+  ) {
+    throw new Error(`Task entry changed before removal: ${entry.absolutePath}`);
+  }
+  if (entry.kind === "file" && await sha256File(entry.absolutePath) !== entry.sha256) {
+    throw new Error(`Task file SHA256 changed before removal: ${entry.absolutePath}`);
+  }
 }
 
 const rawTarget = process.argv[2];
 const token = process.argv[3];
 
 try {
-  if (!rawTarget || !token) {
+  if (!rawTarget || !token || process.argv.length !== 4) {
     throw new Error("A temporary directory path and ownership token are required.");
   }
-  if (!/^[A-Za-z0-9_-]{16,128}$/.test(token)) {
-    throw new Error("Ownership token must contain 16-128 safe characters.");
-  }
+  const { target } = resolveTaskRoot(rawTarget, token);
 
-  const target = path.resolve(rawTarget);
-  const tempRoot = path.resolve(os.tmpdir());
-  if (!samePath(path.dirname(target), tempRoot)) {
-    throw new Error("Refusing cleanup outside a direct child of the system temp directory.");
-  }
-  if (path.basename(target) !== `${PREFIX}${token}`) {
-    throw new Error("Temporary directory name does not match the ownership token.");
-  }
-
-  let targetStat;
+  let targetExists = true;
   try {
-    targetStat = await fs.lstat(target);
+    await fs.lstat(target);
   } catch (error) {
-    if (error?.code === "ENOENT") {
-      emit({ ok: true, status: "already_absent", target });
-      process.exitCode = 0;
-    } else {
-      throw error;
-    }
+    if (error?.code === "ENOENT") targetExists = false;
+    else throw error;
   }
-
-  if (!targetStat) {
-    // The idempotent success result was already emitted.
+  if (!targetExists) {
+    emit({ ok: true, status: "already_absent", target });
   } else {
-    if (!targetStat.isDirectory() || targetStat.isSymbolicLink()) {
-      throw new Error("The cleanup target must be a real directory, not a link.");
-    }
+    const initialRoot = await assertRealDirectory(target);
+    const initialMarker = await readMarker(target, token);
+    const initialSnapshot = await snapshotTree(target, initialRoot.realPath);
 
-    const initialRealPath = await fs.realpath(target);
-    const markerPath = path.join(target, MARKER_NAME);
-    const markerStat = await fs.lstat(markerPath);
-    if (!markerStat.isFile() || markerStat.isSymbolicLink()) {
-      throw new Error("Ownership marker must be a regular file.");
-    }
-    const marker = JSON.parse(await fs.readFile(markerPath, "utf8"));
-    if (!validateMarker(marker, token)) {
-      throw new Error("Ownership marker does not match the supplied token.");
-    }
+    const activeEntry = initialSnapshot.find((entry) => isActiveRecoveryPath(entry.path, entry.kind));
+    if (activeEntry) throw new Error(`Active publish/recovery state prevents cleanup: ${activeEntry.absolutePath}`);
 
-    const names = await fs.readdir(target);
-    const approved = [];
-    for (const name of names) {
-      const entryPath = path.join(target, name);
-      const stat = await fs.lstat(entryPath);
-      const type = entryType(stat);
-      if (type === "unsupported") {
-        throw new Error(`Refusing non-flat cleanup; unsupported entry: ${entryPath}`);
-      }
-      approved.push({ name, path: entryPath, type, stat });
-    }
+    assertInventoryMatches(initialMarker.marker.inventory, initialSnapshot);
 
-    const currentTargetStat = await fs.lstat(target);
+    const currentRootStat = await fs.lstat(target);
     const currentRealPath = await fs.realpath(target);
-    if (!sameIdentity(targetStat, currentTargetStat) || !samePath(initialRealPath, currentRealPath)) {
-      throw new Error("Cleanup target identity changed during preflight.");
+    const currentMarkerStat = await fs.lstat(initialMarker.markerPath);
+    const currentMarkerRaw = await fs.readFile(initialMarker.markerPath, "utf8");
+    if (
+      !sameIdentity(initialRoot.stat, currentRootStat) ||
+      !samePath(initialRoot.realPath, currentRealPath) ||
+      !sameIdentity(initialMarker.stat, currentMarkerStat) ||
+      currentMarkerRaw !== initialMarker.raw
+    ) {
+      throw new Error("Task root or ownership marker changed during cleanup preflight.");
     }
 
-    const currentNames = await fs.readdir(target);
-    const initialNames = new Set(names);
-    if (currentNames.length !== names.length || currentNames.some((name) => !initialNames.has(name))) {
-      throw new Error("Cleanup target contents changed during preflight.");
+    const currentSnapshot = await snapshotTree(target, currentRealPath);
+    compareSnapshots(initialSnapshot, currentSnapshot);
+    assertInventoryMatches(initialMarker.marker.inventory, currentSnapshot);
+    const markerAgain = await readMarker(target, token);
+    if (markerAgain.raw !== initialMarker.raw || !sameIdentity(markerAgain.stat, initialMarker.stat)) {
+      throw new Error("Ownership marker changed during cleanup preflight.");
     }
-    for (const entry of approved) {
-      const current = await fs.lstat(entry.path);
-      if (!sameIdentity(entry.stat, current) || entryType(current) !== entry.type) {
-        throw new Error(`Cleanup entry identity changed during preflight: ${entry.path}`);
+
+    const files = currentSnapshot.filter((entry) => entry.kind === "file");
+    const directories = currentSnapshot
+      .filter((entry) => entry.kind === "dir")
+      .sort((left, right) => right.path.split("/").length - left.path.split("/").length || right.path.localeCompare(left.path, "en"));
+
+    for (const entry of files) {
+      await verifyEntryUnchanged(entry);
+      await fs.unlink(entry.absolutePath);
+    }
+    const markerStat = await fs.lstat(initialMarker.markerPath);
+    const markerRaw = await fs.readFile(initialMarker.markerPath, "utf8");
+    if (!sameIdentity(initialMarker.stat, markerStat) || markerRaw !== initialMarker.raw) {
+      throw new Error("Ownership marker changed before removal.");
+    }
+    await fs.unlink(path.join(target, MARKER_NAME));
+    for (const entry of directories) {
+      await verifyEntryUnchanged(entry);
+      if ((await fs.readdir(entry.absolutePath)).length !== 0) {
+        throw new Error(`Task directory gained an unknown entry before removal: ${entry.absolutePath}`);
       }
-    }
-    const markerAgain = JSON.parse(await fs.readFile(markerPath, "utf8"));
-    if (!validateMarker(markerAgain, token)) {
-      throw new Error("Ownership marker changed during preflight.");
-    }
-
-    approved.sort((left, right) => Number(left.name === MARKER_NAME) - Number(right.name === MARKER_NAME));
-    for (const entry of approved) {
-      await fs.unlink(entry.path);
+      await fs.rmdir(entry.absolutePath);
     }
     await fs.rmdir(target);
-    emit({ ok: true, status: "removed", target, entries: approved.length });
+    emit({
+      ok: true,
+      status: "removed",
+      target,
+      files: files.length + 1,
+      directories: directories.length,
+      inventoryEntries: currentSnapshot.length,
+    });
   }
 } catch (error) {
   emit({ ok: false, error: error instanceof Error ? error.message : String(error) }, true);
