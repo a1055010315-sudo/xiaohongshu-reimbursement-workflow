@@ -1,13 +1,13 @@
 ---
 name: xiaohongshu-reimbursement-workflow
-description: "Run or resume a complete Xiaohongshu reimbursement batch, repair historical omissions or classifications, or stably reorder an explicit ledger range with zero business and amount change. Collect WeChat evidence once, verify source coverage and transaction facts locally, build and independently audit review workbooks, enforce two exact approval gates, and publish the root ledger safely. Use when the user asks to process, archive, continue, verify, approve, publish, sort, reorder, supplement, reclassify, or correct a Xiaohongshu reimbursement ledger; if the user only asks to inspect or modify this skill, do not touch reimbursement files."
+description: "Run or resume the shared Xiaohongshu, company, and residence ordinary reimbursement workflow, or use the isolated legacy correction/reorder path. Collect evidence once, bind full source coverage, generate only affected-profile root/detail/screenshot workbooks, independently audit real OOXML, enforce two exact approval gates, and publish or recover safely. Use for 小红书报销、公司报销、驻所/住所报销, batch continuation, approval, publication, rollback, historical correction, or zero-change ledger reorder; if the user only asks to inspect or modify this skill, do not touch reimbursement files."
 ---
 
-# 小红书报销归档工作流
+# 三类报销共享归档工作流
 
 ## 1. 模式与引用路由
 
-这是用户唯一需要调用的总控 skill。一次调用后，在同一任务中持续完成收件、核对、归档、候选总表、终审和受控发布。
+这是用户唯一需要调用的总控 skill。普通路径由同一套 profile 驱动代码处理 `xiaohongshu`、`company`、`residence`；一次调用后，在同一任务中持续完成收件、核对、归档、候选总表、终审和受控发布。
 
 - **skill-only**：用户只要求查看、审查或修改本 skill。只处理 skill 目录，不读取或改动任何报销材料。
 - **workflow**：用户要求处理、续办、核对、审批或发布包含新增交易或历史业务字段修正的具体批次。历史遗漏、人员/项目/金额/分类/结算方式修正仍走本模式，并额外执行历史账本业务修正 reference。
@@ -30,10 +30,10 @@ description: "Run or resume a complete Xiaohongshu reimbursement batch, repair h
 
 ## 2. 业务边界
 
-1. 当前根目录总表只绑定一个“目标总表类目”，默认 `小红书报销`。除非用户明确说明，记录均属于目标类目。
-2. `公司报销` 等非目标类目进入文字说明、截图归档和对应截图表，但不得进入本次小红书明细、候选总表或根目录总表。新增类目是否进入目标总表不明确时再询问。
+1. manifest v3 按固定 registry 把交易路由到 `小红书报销`、`公司报销`、`驻所报销`。只为本批实际有交易的 profile 生成并发布三类文件；无交易 profile 不创建空文件、不修改根表。
+2. 三个 canonical 根表/Sheet 分别是 `小红书支出总表.xlsx`/`Sheet1`、`公司支出总表.xlsx`/`公司支出`、`驻所支出.xlsx`/`驻所支出`。`住所` 和 `住所支出.xlsx` 只作 residence 输入别名，输出身份始终 canonical；公司所有未受管 Sheet 必须逐 Part 保持。
 3. 用户明确写出具体单子、项目或业务名称时，相关支出备注归入该名称，不得降级为 `日常报销`；具体规范见 Excel reference。
-4. 金额使用十进制定点值，最多三位小数；整数显示 0 位，非整数默认显示 2 位，用户原值明确为三位小数时该笔显示 3 位。费用组合计使用组内最大显示精度。超过三位小数先确认，禁止二进制浮点汇总和静默舍入。
+4. 金额只用 BigInt milliunits，最多三位小数，工作簿金额与合计统一使用批准的 `0.000`；超过三位小数先确认，禁止 Number 汇总、二进制浮点和静默舍入。
 5. OCR 只辅助定位；原图和用户业务说明才是审计材料。不得覆盖用户原件、历史归档或已验收文件；修正使用 `_修正版N`。
 6. 无法从当前对话和磁盘可靠判断的业务事实才询问。一次合并同阶段疑点，并给每项独立编号；视觉疑点必须附对应图片。
 
@@ -62,7 +62,17 @@ v2 批次使用首次规范化时分配且后续不变的 `batchId`；以下三�
 - 完整报销时间段；
 - 归档文件夹绝对路径。
 
-解析用户已给出的文字说明、截图、报销类目、目标类目、根目录和基准总表，不重复询问。标准根表名为 `小红书支出总表.xlsx`；不得用修改时间或“看起来最新”猜测。根目录只有一个且用户已说明它就是总表时直接绑定；有多个候选才让用户选择。
+解析用户已给出的文字说明、截图、报销类目、目标类目、根目录和基准总表，不重复询问。标准根表名只从 `references/ledger-profiles.json` 取得；不得用修改时间或“看起来最新”猜测。根目录只有一个且用户已说明它就是总表时直接绑定；有多个候选才让用户选择。
+
+### 普通批次生产入口
+
+普通新增只调用 `scripts/run_reimbursement_workflow.mjs`，不手工串接 builder/auditor/publisher：
+
+1. `--prepare <request.json>`：稳定审计 manifest，同时构建所有受影响 profile 的根表候选、本次明细和截图对应表；内部只启动一个 root audit worker 处理 1/2/3 profile。返回 Gate 1 `bindingDigest`，根表仍未修改。
+2. 用户在新消息精确发送 `本次报销通过无误` 后，调用 `--finalize <request.json>`；从磁盘 fresh 重读并用一个批量 worker 终审，返回 Gate 2 `bindingDigest`。
+3. 用户在新消息精确发送 `确认更新根目录支出总表` 后，调用 `--publish <request.json>`；同时传入当前任务记住的两份 binding digest 和两句精确文本。发布器 fresh 重验、exclusive 写入、发布后重审；任一 profile 失败时逆序恢复整批。
+
+三个 request 都使用 strict JSON 文件。状态文件只保存可重算证书和上下文，不得写入 `approved`、`authorized`、门禁接受状态或任何用户授权字段。
 
 标准总表尚不存在时，只能使用用户明确指定且位于已绑定根目录内的旧总表作为基线；第二道门禁前不得创建标准名文件。根目录外的旧表必须先由用户明确纳入该根目录，不能绕过 manifest 的路径边界。
 
@@ -70,10 +80,10 @@ v2 批次使用首次规范化时分配且后续不变的 `batchId`；以下三�
 
 进入 workflow 后，在专用任务临时目录维护 `batch-manifest.json`，作为本批唯一规范化数据源。新任务使用 v3；v1/v2 只用于恢复兼容，不得静默补写新事实。它不属于最终归档，不得写入截图工作簿的隐藏 Sheet，也不得保存任何门禁或用户授权。至少记录：
 
-- 批次身份、目标类目、规则版本和基线路径/SHA256；
+- 批次身份、registry/profile 配置摘要、规则版本和每个受影响 profile 的基线路径/SHA256；
 - 来源编号、原图或文字路径、SHA256、尺寸、检查状态和图内区域；
-- 稳定 `batchId`、交易 ID、唯一正安全整数 `sourceOrder`、日期、人员、项目、汇总标签、金额、目标总表最终 `classification`、类目、独立的 `settlement` 结算方式和来源引用；新增记录只能分配新 `sourceOrder`，不能因展示排序重排；负数退款/调整还必须引用同类目、同结算方式的正金额来源交易；
-- v3 的来源范围、末端确认和每个来源单元的唯一处置；每个单元只能是已关联交易、已唯一存在于基线或已解释的非目标类目，禁止裸行号排除。`sourceCoverageDigest` 与交易事实摘要分开计算；
+- 稳定 `batchId`、交易 ID、唯一正安全整数 `sourceOrder`、日期、人员、项目、汇总标签、金额、canonical profile/category、最终 `classification`、独立的 `settlement` 结算方式和来源引用；新增记录只能分配新 `sourceOrder`，不能因展示排序重排；负数退款/调整还必须引用同 profile、同类目、同结算方式的正金额来源交易；
+- v3 的来源范围、末端确认和每个来源单元的唯一处置；每个单元只能是已关联交易、已唯一存在于对应 profile 基线或有明确排除原因，禁止把其他受支持 profile 当作“非目标”排除，也禁止裸行号排除。`sourceCoverageDigest` 与交易事实摘要分开计算；
 - 当前 `reviewRevision` 和操作配置；候选的 `candidateRevision` 在 `artifact-index.json` 维护，普通批次首次候选为 1，每生成一个新字节版本单调递增。`ledger-reorder-correction` 的 manifest operation 还必须记录 `candidateRevision`、`planFileSha256`、精确重排范围/日期边界、`date:asc + baselineOrder:asc` 排序键、每条记录的基线顺序号、逻辑记录数与物理记录行数、`expectedAmountDelta: "0"`、基线与当前/被替代候选路径及 SHA256；首版使用 `supersedes: null`，后续修订必须指向唯一被替代候选。候选绑定由机械计划和构建结果写入，禁止手工补写。
 
 由同一 manifest 驱动摘要预览、本次明细、截图对应表、归档和候选校验，禁止各阶段重新解析同一材料。摘要优先直接用 `--manifest` 机械投影，兼容旧批次时产生的输入 JSON 也不得成为第二套可手工维护的业务事实。输出路径/SHA256、行映射、图片锚点和验收证书放在同一临时目录的 `artifact-index.json`/sidecar，不把用户授权写回 manifest。验收证书只绑定它实际依赖的 `factsDigest`、`evidenceDigest`、操作/配置摘要和文件 SHA256，不能用整份 manifest 的无关展示状态造成全量失效。`reviewPackageDigest` 由摘要正文、明细语义、对应图顺序与图片哈希、缺图/排除清单及候选 SHA256 机械计算；`finalAuditDigest` 由终审不变量和当前基线/候选 SHA256 机械计算。
@@ -137,7 +147,7 @@ v2 批次使用首次规范化时分配且后续不变的 `batchId`；以下三�
 
 ## 9. 阶段 B：一次构建、一次验收
 
-按批次归档 reference 生成：摘要预览、按人员连续分区的本次明细、原图归档和带嵌入图片的对应截图表。人员分区只是明细展示结构，分区标题和空白分隔行不是交易，不得进入候选或根表。最终归档不得出现内部 manifest、验收证书、预览、日志或差异说明。
+按批次归档 reference 生成：摘要预览、每个受影响 profile 的按人员连续分区本次明细、原图归档和带嵌入图片的对应截图表。人员分区只是明细展示结构，分区标题和空白分隔行不是交易，不得进入候选或根表。最终归档不得出现内部 manifest、验收证书、预览、日志或差异说明。
 
 同一构建进程可批量生成所有阶段 B 工作簿；同一语义验证进程各打开一次；同一视觉进程只渲染有界实际数据区。同一阶段、同一工作簿字节版本内，每张来源图只读取、解码和登记一次；独立重开验证仍可读取已打包媒体，业务行不得因图片 SHA256 相同而删除。
 
@@ -152,7 +162,7 @@ v2 批次使用首次规范化时分配且后续不变的 `batchId`；以下三�
 
 ## 10. 阶段 C：候选快照，根表不变
 
-按候选与发布 reference 绑定基线并生成候选。普通新增候选必须直接由“当前根表业务记录 + manifest 中尚未包含的目标类目交易”生成；历史业务修正必须由“绑定根表基线 + 完整 manifest + 累积补丁”重建，不能从被废止候选继续修改。两者都不得导入本次明细的人员标题、空白分隔行或其他展示结构。历史修正先调用 `scripts/derive_ledger_layout.mjs` 生成布局计划，保存候选后再从实际工作簿独立提取审计包并调用 `scripts/audit_ledger_layout.mjs`；构建器与审计器不得共享来源匹配、费用组或预期合并结果。第二道门禁前不得直接编辑、创建或替换根目录标准总表。候选验收后把它保存为归档内 `小红书支出总表_截至<结束日期>.xlsx`，再次确认根表 SHA256 未变。
+按候选与发布 reference 绑定每个受影响 profile 的正式基线并生成候选。普通新增只使用 `build_root_workbook_candidate.mjs` 的 profile 驱动 patch 和独立 auditor；不得导入本次明细的人员标题、空白分隔行或展示结构。历史业务修正仍使用原隔离流程，不能混入普通入口。第二道门禁前不得编辑、创建或替换任何 canonical 根表。
 
 随后补齐业务核对包中的候选绝对路径、SHA256及“根目录总表未修改”。到此等待第一道门禁；不要主动索要第二道门禁。
 
@@ -162,7 +172,7 @@ v2 批次使用首次规范化时分配且后续不变的 `batchId`；以下三�
 
 收到有效的 `本次报销通过无误` 后：
 
-1. 重新读取本次明细，排除人员标题、表头、说明和空白分隔行后，使用十进制定点金额独立重算目标类目的人员/分类汇总、费用合计和实报合计；独立重算非目标类目小计并确认其未进入目标明细或候选。
+1. 按 profile 重新读取每份本次明细，排除人员标题、表头、说明和空白分隔行后，使用 BigInt milliunits 独立重算人员/分类汇总、费用合计和实报合计；确认其他 profile 的交易未进入当前明细或候选。
 2. 将摘要预览按同一输入写入最终 UTF-8 TXT，并核对正文 SHA256 与用户看到的预览一致。
 3. 重新计算根表和候选 SHA256。对 manifest、对应截图表和原图：哈希及规则版本未变化时验证既有验收证书，不重新打开或渲染；变化时只重验受影响部分。
 4. 核对候选业务多重集合、金额增量、公式、合并、已解释缺图和所有归档文件；历史业务修正还要重新核对来源覆盖、累积补丁链、候选布局计划以及独立 `audit_ledger_layout.mjs` 结果。
@@ -175,14 +185,14 @@ v2 批次使用首次规范化时分配且后续不变的 `batchId`；以下三�
 
 收到有效的 `确认更新根目录支出总表` 后，必须从磁盘重新读取当前根表和当前候选；`workflow` 还要重新读取本次明细。随后重新验证：
 
-- 当前根表业务记录多重集合 + 本批目标类目明细 = 候选业务记录多重集合；
+- 每个受影响 profile 的当前根表业务记录多重集合 + 本批该 profile 明细 = 该 profile 候选业务记录多重集合；
 - 当前根表 SHA256 与终审基线一致；
 - 候选 SHA256 与终审报告一致。
 
-任何不一致都使两道门禁失效，按候选与发布 reference 的外部变化分支处理，不能用旧候选覆盖新根表。`workflow` 仅调用 `scripts/run_safe_publish.mjs`；`ledger-reorder-correction` 仅调用绑定 v2 plan、两份 Gate 工件及当前任务批准摘要的 `scripts/publish_ledger_reorder.mjs`。不得自行拼接 PowerShell 命令、直接调用 `safe_publish.ps1`、为 correction 绕过门禁调用通用发布器、编辑根表或强制关闭 Excel。发布后重新打开根表检查可读性、公式、结构和 SHA256，必须与候选完全一致。
+任何不一致都使两道门禁失效，不能用旧候选覆盖新根表。普通 `workflow` 仅调用 `scripts/run_reimbursement_workflow.mjs --publish`；`ledger-reorder-correction` 仅调用绑定 v2 plan、两份 Gate 工件及当前任务批准摘要的 `scripts/publish_ledger_reorder.mjs`。不得绕过总控入口直接调用 PowerShell 或通用 publisher。发布后从真实 OOXML 重新打开每个根表，SHA256 必须与候选一致。
 
 ## 13. 最终报告与清理
 
-最终只报告用户需要判断的结果：批次和归档路径、费用/实报/不实报金额、非目标类目小计及隔离结果、明细行数、各类目截图数、对应表 Sheet 顺序与图片实例数、候选和根表路径、两道门禁状态、发布后 SHA256，以及临时内容是否清理。
+最终只报告用户需要判断的结果：批次和各 profile 归档路径、费用/实报/不实报金额、profile 隔离结果、明细行数、截图数、对应表 Sheet 与图片实例数、候选和根表路径、两道门禁状态、发布后 SHA256，以及临时内容是否清理。
 
 只清理由本任务创建且确认无用的专用临时内容。不得删除用户原件、归档交付物、历史文件、依赖 skill 或归属不明内容。按运行可靠性 reference 调用 `scripts/cleanup_task_temp.mjs`；清理器拒绝时保留现场并报告精确路径和原因。

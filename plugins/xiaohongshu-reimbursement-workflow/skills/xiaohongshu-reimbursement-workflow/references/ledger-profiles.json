@@ -1,0 +1,86 @@
+{
+  "schemaVersion": 1,
+  "profileOrder": [
+    "xiaohongshu",
+    "company",
+    "residence"
+  ],
+  "profiles": {
+    "xiaohongshu": {
+      "targetCategory": "小红书报销",
+      "categoryAliases": [
+        "小红书",
+        "小红书报销"
+      ],
+      "canonicalRootWorkbookName": "小红书支出总表.xlsx",
+      "rootWorkbookInputNames": [
+        "小红书支出总表.xlsx"
+      ],
+      "managedRootSheetName": "Sheet1",
+      "managedRootSheetInputNames": [
+        "Sheet1"
+      ],
+      "detailSheetName": "本次报销明细",
+      "screenshotMapSheetName": "小红书报销",
+      "detailTemplateFile": "xiaohongshu-detail.xlsx",
+      "detailTemplateSha256": "d46ab0538a37d7e1f4682338658d74b3faee257fde1a6639d0f5063175e19ab7",
+      "screenshotTemplateFile": "xiaohongshu-screenshot.xlsx",
+      "screenshotTemplateSha256": "996c175b83772ee5160933bc36ce87d6d70457d5716e54ec7a48edfdf047d495",
+      "archiveDirectoryName": "01_小红书专项",
+      "archiveStem": "小红书支出总表",
+      "preserveUnmanagedSheets": true
+    },
+    "company": {
+      "targetCategory": "公司报销",
+      "categoryAliases": [
+        "公司",
+        "公司报销"
+      ],
+      "canonicalRootWorkbookName": "公司支出总表.xlsx",
+      "rootWorkbookInputNames": [
+        "公司支出总表.xlsx"
+      ],
+      "managedRootSheetName": "公司支出",
+      "managedRootSheetInputNames": [
+        "公司支出"
+      ],
+      "detailSheetName": "本次报销明细",
+      "screenshotMapSheetName": "公司报销",
+      "detailTemplateFile": "company-detail.xlsx",
+      "detailTemplateSha256": "55bc140c7c8183e5db5f244d37942232dc092691135ca019cc5204bf4ebf8216",
+      "screenshotTemplateFile": "company-screenshot.xlsx",
+      "screenshotTemplateSha256": "cbe29b185f67b63c9dd16784e160aae1d50cde6747ef82624498d0ce142001ff",
+      "archiveDirectoryName": "02_公司专项",
+      "archiveStem": "公司支出总表",
+      "preserveUnmanagedSheets": true
+    },
+    "residence": {
+      "targetCategory": "驻所报销",
+      "categoryAliases": [
+        "驻所",
+        "驻所报销",
+        "住所",
+        "住所报销"
+      ],
+      "canonicalRootWorkbookName": "驻所支出.xlsx",
+      "rootWorkbookInputNames": [
+        "驻所支出.xlsx",
+        "住所支出.xlsx"
+      ],
+      "managedRootSheetName": "驻所支出",
+      "managedRootSheetInputNames": [
+        "驻所支出",
+        "住所支出"
+      ],
+      "detailSheetName": "本次报销明细",
+      "screenshotMapSheetName": "住所报销",
+      "detailTemplateFile": "residence-detail.xlsx",
+      "detailTemplateSha256": "5eb8ee46af176c1e50198aa57e9f69a47eb2eff586b3fa19dd2fd71deb1fc788",
+      "screenshotTemplateFile": "residence-screenshot.xlsx",
+      "screenshotTemplateSha256": "ec9c417a06c262c12b54097ad223f8e2159ff263027a558edd2cad1875fc6b0c",
+      "archiveDirectoryName": "03_住所专项",
+      "archiveStem": "驻所支出",
+      "preserveUnmanagedSheets": true
+    }
+  }
+}

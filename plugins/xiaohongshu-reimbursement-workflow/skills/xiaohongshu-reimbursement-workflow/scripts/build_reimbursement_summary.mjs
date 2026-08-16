@@ -4,7 +4,12 @@ import crypto from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-const SCALE = 1000n;
+import {
+  formatMilliunits as formatAmount,
+  loadProfileRegistry,
+  parseMilliunits as parseAmount,
+} from "./finance_domain.mjs";
+
 const SHA256_RE = /^[0-9a-f]{64}$/;
 const SETTLEMENTS = new Set(["employee_reimbursement", "company_paid_no_reimbursement"]);
 const ADJUSTMENT_TYPES = new Set(["refund", "adjustment"]);
@@ -19,31 +24,6 @@ function requireObject(value, field) {
     throw new Error(`${field} must be an object.`);
   }
   return value;
-}
-
-function parseAmount(value, field, { allowNegative = false } = {}) {
-  const expression = allowNegative ? /^-?(0|[1-9]\d*)(\.\d{1,3})?$/ : /^(0|[1-9]\d*)(\.\d{1,3})?$/;
-  if (typeof value !== "string" || !expression.test(value)) {
-    const signRule = allowNegative ? "signed" : "non-negative";
-    throw new Error(`${field} must be a ${signRule} decimal string with at most three decimal places.`);
-  }
-  const negative = value.startsWith("-");
-  const unsigned = negative ? value.slice(1) : value;
-  const [whole, fraction = ""] = unsigned.split(".");
-  const parsed = BigInt(whole) * SCALE + BigInt((fraction + "000").slice(0, 3));
-  if (negative && parsed === 0n) throw new Error(`${field} must not use a negative zero representation.`);
-  return negative ? -parsed : parsed;
-}
-
-function formatAmount(amount) {
-  const negative = amount < 0n;
-  const absolute = negative ? -amount : amount;
-  const whole = absolute / SCALE;
-  const fraction = absolute % SCALE;
-  const rendered = fraction === 0n
-    ? whole.toString()
-    : `${whole}.${fraction.toString().padStart(3, "0").replace(/0+$/, "")}`;
-  return negative ? `-${rendered}` : rendered;
 }
 
 function cleanField(value, field) {
@@ -162,6 +142,38 @@ async function projectAuditedManifest(manifestPath) {
   const manifest = JSON.parse(rawManifest.toString("utf8"));
   if (![2, 3].includes(manifest?.version)) throw new Error("--manifest requires manifest.version 2 or 3.");
   const batch = requireObject(audited.batch, "manifest audit batch");
+  const profileMetadata = {};
+  if (manifest.version === 3) {
+    if (!SHA256_RE.test(audited.profileConfigDigest ?? "")) {
+      throw new Error("Manifest audit result must contain profileConfigDigest for version 3.");
+    }
+    const currentProfileRegistry = await loadProfileRegistry();
+    if (currentProfileRegistry.profileConfigDigest !== audited.profileConfigDigest) {
+      throw new Error("Profile registry changed after manifest audit.");
+    }
+    if (!Array.isArray(audited.affectedProfileIds) || audited.affectedProfileIds.length === 0) {
+      throw new Error("Manifest audit result must contain non-empty affectedProfileIds for version 3.");
+    }
+    if (new Set(audited.affectedProfileIds).size !== audited.affectedProfileIds.length) {
+      throw new Error("Manifest audit affectedProfileIds must be unique.");
+    }
+    if (!Array.isArray(audited.profileSummaries) || audited.profileSummaries.length !== audited.affectedProfileIds.length) {
+      throw new Error("Manifest audit profileSummaries must match affectedProfileIds.");
+    }
+    for (let index = 0; index < audited.affectedProfileIds.length; index += 1) {
+      const profileId = cleanField(audited.affectedProfileIds[index], `manifest audit affectedProfileIds[${index}]`);
+      const summary = requireObject(audited.profileSummaries[index], `manifest audit profileSummaries[${index}]`);
+      if (summary.profileId !== profileId) {
+        throw new Error("Manifest audit profileSummaries order must match affectedProfileIds.");
+      }
+    }
+    if (!audited.affectedProfileIds.includes(batch.targetProfileId)) {
+      throw new Error("Manifest audit targetProfileId must be one of affectedProfileIds.");
+    }
+    profileMetadata.profileConfigDigest = audited.profileConfigDigest;
+    profileMetadata.affectedProfileIds = audited.affectedProfileIds;
+    profileMetadata.profileSummaries = audited.profileSummaries;
+  }
   const targetCategory = cleanField(batch.targetCategory, "manifest audit batch.targetCategory");
   const categoryTotals = requireObject(audited.categoryTotals, "manifest audit categoryTotals");
   const categoryRealTotals = requireObject(audited.categoryRealTotals, "manifest audit categoryRealTotals");
@@ -201,6 +213,7 @@ async function projectAuditedManifest(manifestPath) {
       factsDigest: audited.factsDigest,
       manifestFileSha256: audited.manifestFileSha256,
       ...(audited.sourceCoverageDigest ? { sourceCoverageDigest: audited.sourceCoverageDigest } : {}),
+      ...profileMetadata,
     },
   };
 }
@@ -444,6 +457,11 @@ try {
     result.manifestFileSha256 = manifestMetadata.manifestFileSha256;
     if (manifestMetadata.sourceCoverageDigest) {
       result.sourceCoverageDigest = manifestMetadata.sourceCoverageDigest;
+    }
+    if (manifestMetadata.profileConfigDigest) {
+      result.profileConfigDigest = manifestMetadata.profileConfigDigest;
+      result.affectedProfileIds = manifestMetadata.affectedProfileIds;
+      result.profileSummaries = manifestMetadata.profileSummaries;
     }
   }
   if (options.preview) {

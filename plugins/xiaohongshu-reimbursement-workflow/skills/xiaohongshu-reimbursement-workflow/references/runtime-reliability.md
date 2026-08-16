@@ -148,7 +148,7 @@ sourceId → sourcePath → SHA256 → width/height → archiveCopies[] → work
 
 开始批次时检查 Windows PowerShell 5.1+，并通过工作区依赖加载器取得捆绑 Node.js 的绝对路径；运行本 skill 的 `.mjs` 时使用该路径，不依赖系统 `PATH` 中碰巧存在的 `node`。缺少发布环境时仍可制作归档和候选，但必须在第二道门禁后的发布前停止。
 
-Windows PowerShell 5.1 可能错误解析无 BOM UTF-8 `.ps1` 中的中文路径字面量。脚本源保持 ASCII，中文路径只通过参数传入。工作流不得自行拼接或直接运行 PowerShell；统一调用固定启动器：
+Windows PowerShell 5.1 可能错误解析无 BOM UTF-8 `.ps1` 中的中文路径字面量。脚本源保持 ASCII，中文路径只通过参数传入。普通流程只调用 `run_reimbursement_workflow.mjs` 总控；下列固定启动器仅由总控或绑定的 legacy 包装器内部调用，不得手工绕过门禁：
 
 ```text
 "<bundled-node>" scripts/run_safe_publish.mjs --baseline-path <path> --candidate-path <path> --target-path <path> --expected-baseline-sha256 <hash> --expected-candidate-sha256 <hash>
@@ -224,7 +224,7 @@ v2 直接由脚本审计并机械投影 `batch-manifest.json`；`--input` 机械
 "<bundled-node>" scripts/publish_ledger_reorder.mjs --plan <plan.json> --expected-plan-sha256 <planFileSha256> --expected-baseline-sha256 <当前重读hash> --expected-candidate-sha256 <当前活动候选hash> --expected-batch-id <batchId> --expected-operation-digest <operationDigest> --gate-1-artifact <gate-1.json> --expected-gate-1-binding-digest <当前任务已批准摘要> --gate-2-artifact <gate-2.json> --expected-gate-2-binding-digest <当前任务已批准摘要>
 ```
 
-该包装器只接受 v2 plan；重新加载并验证两份 Gate 工件，逐项比对当前任务批准摘要、batch/operation/plan/candidate/baseline，复核预览文件仍为批准字节，并再次执行全量审计后才把 plan 绑定的三条路径交给通用发布器。通用 `run_safe_publish.mjs` 仅用于普通新增报销分支。发布失败时保留并报告 journal、`rollback_error`、`preserved_backup`、`preserved_target` 和 `cleanup_errors`；不得在目标被外部改变后强行回滚或删除现场。
+该包装器只接受 v2 plan；重新加载并验证两份 Gate 工件，逐项比对当前任务批准摘要、batch/operation/plan/candidate/baseline，复核预览文件仍为批准字节，并再次执行全量审计后才把 plan 绑定的三条路径交给通用发布器。`run_safe_publish.mjs` 只是普通总控和绑定 legacy 包装器的内部发布原语，不是用户或 agent 可直接调用的普通入口。发布失败时保留并报告 journal、`rollback_error`、`preserved_backup`、`preserved_target` 和 `cleanup_errors`；不得在目标被外部改变后强行回滚或删除现场。
 
 ## 8. 临时目录与清理
 

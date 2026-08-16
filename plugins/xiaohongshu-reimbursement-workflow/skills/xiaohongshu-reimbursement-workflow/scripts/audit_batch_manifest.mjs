@@ -2,10 +2,20 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
 import crypto from "node:crypto";
-import { TextDecoder } from "node:util";
+
+import {
+  canonicalDigest as digest,
+  formatMilliunits as formatAmount,
+  loadProfileRegistry,
+  parseMilliunits as parseAmount,
+  resolveProfile,
+} from "./finance_domain.mjs";
+import {
+  DEFAULT_STABLE_JSON_MAX_BYTES,
+  readStableUtf8JsonFile,
+} from "./workflow_primitives.mjs";
 
 const VALIDATOR_VERSION = "4";
-const AMOUNT_SCALE = 1000n;
 const SHA256_RE = /^[0-9a-f]{64}$/;
 const SETTLEMENTS = new Set(["employee_reimbursement", "company_paid_no_reimbursement"]);
 const ADJUSTMENT_TYPES = new Set(["refund", "adjustment"]);
@@ -21,6 +31,13 @@ function requireObject(value, field) {
     throw new Error(`${field} must be an object.`);
   }
   return value;
+}
+
+function deepFreeze(value, seen = new Set()) {
+  if (!value || typeof value !== "object" || seen.has(value)) return value;
+  seen.add(value);
+  for (const child of Object.values(value)) deepFreeze(child, seen);
+  return Object.freeze(value);
 }
 
 function cleanString(value, field) {
@@ -45,47 +62,6 @@ function cleanIsoDate(value, field) {
     throw new Error(`${field} must be a valid ISO date in YYYY-MM-DD form.`);
   }
   return result;
-}
-
-function parseAmount(value, field, { allowNegative = false } = {}) {
-  const expression = allowNegative ? /^-?(0|[1-9]\d*)(\.\d{1,3})?$/ : /^(0|[1-9]\d*)(\.\d{1,3})?$/;
-  if (typeof value !== "string" || !expression.test(value)) {
-    const signRule = allowNegative ? "signed" : "non-negative";
-    throw new Error(`${field} must be a ${signRule} decimal string with at most three decimal places.`);
-  }
-  const negative = value.startsWith("-");
-  const unsigned = negative ? value.slice(1) : value;
-  const [whole, fraction = ""] = unsigned.split(".");
-  const parsed = BigInt(whole) * AMOUNT_SCALE + BigInt((fraction + "000").slice(0, 3));
-  if (negative && parsed === 0n) throw new Error(`${field} must not use a negative zero representation.`);
-  return negative ? -parsed : parsed;
-}
-
-function formatAmount(value) {
-  const negative = value < 0n;
-  const absolute = negative ? -value : value;
-  const whole = absolute / AMOUNT_SCALE;
-  const fraction = absolute % AMOUNT_SCALE;
-  const rendered = fraction === 0n
-    ? whole.toString()
-    : `${whole}.${fraction.toString().padStart(3, "0").replace(/0+$/, "")}`;
-  return negative ? `-${rendered}` : rendered;
-}
-
-function canonicalize(value) {
-  if (Array.isArray(value)) return value.map(canonicalize);
-  if (value && typeof value === "object") {
-    return Object.fromEntries(
-      Object.keys(value)
-        .sort()
-        .map((key) => [key, canonicalize(value[key])]),
-    );
-  }
-  return value;
-}
-
-function digest(value) {
-  return crypto.createHash("sha256").update(JSON.stringify(canonicalize(value)), "utf8").digest("hex");
 }
 
 function isStrictDescendant(parentPath, childPath) {
@@ -436,9 +412,10 @@ try {
     throw new Error("Use audit_batch_manifest.mjs <manifest.json>.");
   }
   const absoluteManifestPath = path.resolve(manifestPath);
-  const rawBytes = await fsp.readFile(absoluteManifestPath);
-  const raw = new TextDecoder("utf-8", { fatal: true }).decode(rawBytes);
-  const manifest = JSON.parse(raw);
+  const manifestSnapshot = await readStableUtf8JsonFile(absoluteManifestPath, {
+    maxBytes: DEFAULT_STABLE_JSON_MAX_BYTES,
+  });
+  const manifest = manifestSnapshot.value;
   requireObject(manifest, "manifest");
   rejectAuthorizationState(manifest);
   if (manifest.audits !== undefined || manifest.auditCertificates !== undefined || manifest.certificates !== undefined) {
@@ -447,11 +424,16 @@ try {
 
   const normalizedOperation = normalizeOperation(manifest);
   const rulesVersion = cleanString(manifest.rulesVersion, "manifest.rulesVersion");
+  const profileRegistry = manifest.version === 3 && normalizedOperation.mode === "reimbursement-batch"
+    ? await loadProfileRegistry()
+    : undefined;
   const batch = requireObject(manifest.batch, "manifest.batch");
   const rootPath = cleanString(batch.rootPath, "manifest.batch.rootPath");
   const archivePath = cleanString(batch.archivePath, "manifest.batch.archivePath");
   const period = cleanString(batch.period, "manifest.batch.period");
-  const targetCategory = cleanString(batch.targetCategory, "manifest.batch.targetCategory");
+  const rawTargetCategory = cleanString(batch.targetCategory, "manifest.batch.targetCategory");
+  const targetProfile = profileRegistry ? resolveProfile(rawTargetCategory, profileRegistry) : undefined;
+  const targetCategory = targetProfile?.targetCategory ?? rawTargetCategory;
   const batchId = manifest.version >= 2 ? cleanString(batch.batchId, "manifest.batch.batchId") : undefined;
   if (!Number.isSafeInteger(batch.reviewRevision) || batch.reviewRevision < 1) {
     throw new Error("manifest.batch.reviewRevision must be a positive safe integer.");
@@ -471,6 +453,7 @@ try {
     reviewRevision,
   };
   if (batchId !== undefined) normalizedBatch.batchId = batchId;
+  if (targetProfile) normalizedBatch.targetProfileId = targetProfile.profileId;
 
   if (!Array.isArray(manifest.files) || manifest.files.length === 0) {
     throw new Error("manifest.files must be a non-empty array.");
@@ -577,7 +560,10 @@ try {
   let transactionSourceRefCount = 0;
   let normalizedTransactions = [];
   let normalizedExpectedTotals;
+  let normalizedExpectedCategoryInputs;
   let sourceCoverageCounts;
+  let affectedProfileIds;
+  let profileSummaries;
   if (normalizedOperation.mode === "reimbursement-batch") {
     if (!Array.isArray(manifest.transactions) || manifest.transactions.length === 0) {
       throw new Error("manifest.transactions must be a non-empty array for reimbursement-batch.");
@@ -604,7 +590,9 @@ try {
       const person = cleanString(transaction.person, `manifest.transactions[${index}].person`);
       const project = cleanString(transaction.project, `manifest.transactions[${index}].project`);
       const label = cleanString(transaction.label, `manifest.transactions[${index}].label`);
-      const category = cleanString(transaction.category, `manifest.transactions[${index}].category`);
+      const rawCategory = cleanString(transaction.category, `manifest.transactions[${index}].category`);
+      const profile = profileRegistry ? resolveProfile(rawCategory, profileRegistry) : undefined;
+      const category = profile?.targetCategory ?? rawCategory;
       const classification = manifest.version === 3
         ? cleanString(transaction.classification, `manifest.transactions[${index}].classification`)
         : undefined;
@@ -685,6 +673,7 @@ try {
         amount: formatAmount(amount),
         category,
       };
+      if (profile) normalized.profileId = profile.profileId;
       if (classification !== undefined) normalized.classification = classification;
       if (manifest.version === 1) {
         normalized.reimbursable = transaction.reimbursable;
@@ -773,8 +762,15 @@ try {
     if (Object.keys(expectedCategoryTotals).length !== categoryTotals.size) {
       throw new Error("manifest.expectedCategoryTotals categories do not match calculated categories.");
     }
+    normalizedExpectedCategoryInputs = {};
     for (const [rawCategory, rawAmount] of Object.entries(expectedCategoryTotals)) {
-      const category = cleanString(rawCategory, "manifest.expectedCategoryTotals category");
+      const cleanedCategory = cleanString(rawCategory, "manifest.expectedCategoryTotals category");
+      const profile = profileRegistry ? resolveProfile(cleanedCategory, profileRegistry) : undefined;
+      const category = profile?.targetCategory ?? cleanedCategory;
+      if (Object.hasOwn(normalizedExpectedCategoryInputs, category)) {
+        throw new Error(`manifest.expectedCategoryTotals contains duplicate canonical category ${category}.`);
+      }
+      normalizedExpectedCategoryInputs[category] = rawAmount;
       if (
         !categoryTotals.has(category) ||
         parseAmount(rawAmount, `manifest.expectedCategoryTotals.${category}`, { allowNegative }) !== categoryTotals.get(category)
@@ -791,6 +787,30 @@ try {
           .map(([category, total]) => [category, formatAmount(total)]),
       ),
     };
+    if (profileRegistry) {
+      const transactionCounts = new Map();
+      for (const transaction of normalizedTransactions) {
+        transactionCounts.set(transaction.profileId, (transactionCounts.get(transaction.profileId) ?? 0) + 1);
+      }
+      affectedProfileIds = profileRegistry.profileOrder.filter((profileId) => transactionCounts.has(profileId));
+      profileSummaries = affectedProfileIds.map((profileId) => {
+        const profile = profileRegistry.profiles[profileId];
+        return {
+          profileId,
+          targetCategory: profile.targetCategory,
+          transactionCount: transactionCounts.get(profileId),
+          feeTotal: formatAmount(categoryTotals.get(profile.targetCategory)),
+          realTotal: formatAmount(categoryRealTotals.get(profile.targetCategory) ?? 0n),
+          canonicalRootWorkbookName: profile.canonicalRootWorkbookName,
+          managedRootSheetName: profile.managedRootSheetName,
+          detailSheetName: profile.detailSheetName,
+          screenshotMapSheetName: profile.screenshotMapSheetName,
+          archiveDirectoryName: profile.archiveDirectoryName,
+          archiveStem: profile.archiveStem,
+          preserveUnmanagedSheets: profile.preserveUnmanagedSheets,
+        };
+      });
+    }
   } else if (
     manifest.transactions !== undefined ||
     manifest.expectedFeeTotal !== undefined ||
@@ -808,12 +828,24 @@ try {
     })
     .sort((a, b) => a.id.localeCompare(b.id));
   const transactionsForDigest = [...normalizedTransactions].sort((a, b) => a.id.localeCompare(b.id));
-  const manifestDigest = digest(manifest);
+  let manifestForDigest = manifest;
+  if (profileRegistry) {
+    manifestForDigest = structuredClone(manifest);
+    manifestForDigest.batch.targetCategory = targetCategory;
+    manifestForDigest.transactions = manifestForDigest.transactions.map((transaction, index) => ({
+      ...transaction,
+      category: normalizedTransactions[index].category,
+    }));
+    manifestForDigest.expectedCategoryTotals = normalizedExpectedCategoryInputs;
+  }
+  const manifestDigest = digest(manifestForDigest);
   const filesDigest = digest(filesForDigest);
   const transactionsDigest = digest(transactionsForDigest);
   let factsDigest;
   let evidenceDigest;
   let sourceCoverageDigest;
+  let factsPreimage;
+  let sourceCoveragePreimage;
   if (manifest.version >= 2) {
     const factTransactions = transactionsForDigest.map(({
       evidence,
@@ -821,12 +853,19 @@ try {
       sourceRefs,
       ...transaction
     }) => transaction);
-    factsDigest = digest({
+    factsPreimage = deepFreeze(structuredClone({
       batchId,
       targetCategory,
       transactions: factTransactions,
       expectedTotals: normalizedExpectedTotals ?? null,
-    });
+      ...(profileRegistry
+        ? {
+          affectedProfileIds,
+          profileConfigDigest: profileRegistry.profileConfigDigest,
+        }
+        : {}),
+    }));
+    factsDigest = digest(factsPreimage);
     const usedMaterials = verifiedFiles
       .filter((file) => file.role === "material" && file.disposition === "used")
       .map(({ id, sha256, kind, disposition }) => ({ id, sha256, kind, disposition }))
@@ -857,11 +896,12 @@ try {
       transactionId: id,
       sourceRefs: [...sourceRefs].sort((left, right) => left.localeCompare(right)),
     }));
-    sourceCoverageDigest = digest({
+    sourceCoveragePreimage = deepFreeze(structuredClone({
       sourceScopes: sourceScopesForDigest,
       sourceUnits: sourceUnitsForDigest,
       transactionSourceRefs,
-    });
+    }));
+    sourceCoverageDigest = digest(sourceCoveragePreimage);
   }
   const operationForDigest = correctionBindings
     ? { ...normalizedOperation, bindings: correctionBindings }
@@ -872,6 +912,7 @@ try {
     rulesVersion,
     batch: normalizedBatch,
     operation: operationForDigest,
+    ...(profileRegistry ? { profileConfigDigest: profileRegistry.profileConfigDigest } : {}),
   });
   const cacheKey = manifest.version === 1
     ? digest({ rulesVersion, validatorVersion: VALIDATOR_VERSION, manifestDigest, filesDigest, transactionsDigest })
@@ -888,11 +929,32 @@ try {
       ...(sourceCoverageDigest ? { sourceCoverageDigest } : {}),
     });
 
+  const manifestFileSha256 = manifestSnapshot.sha256;
+  let reimbursementFactsCertificate;
+  if (manifest.version === 3 && normalizedOperation.mode === "reimbursement-batch") {
+    const certificateBody = deepFreeze({
+      kind: "reimbursement-manifest-facts-v1",
+      operationMode: "reimbursement-batch",
+      manifestFileSha256,
+      manifestDigest,
+      configDigest,
+      profileConfigDigest: profileRegistry.profileConfigDigest,
+      factsDigest,
+      factsPreimage,
+      sourceCoverageDigest,
+      sourceCoveragePreimage,
+    });
+    reimbursementFactsCertificate = deepFreeze({
+      ...certificateBody,
+      certificateDigest: digest(certificateBody),
+    });
+  }
+
   const result = {
     ok: true,
     validatorVersion: VALIDATOR_VERSION,
     manifest: absoluteManifestPath,
-    manifestFileSha256: crypto.createHash("sha256").update(rawBytes).digest("hex"),
+    manifestFileSha256,
     manifestDigest,
     filesDigest,
     transactionsDigest,
@@ -912,6 +974,10 @@ try {
   if (manifest.version === 3) {
     result.sourceCoverageDigest = sourceCoverageDigest;
     result.sourceCoverageCounts = sourceCoverageCounts;
+    result.profileConfigDigest = profileRegistry.profileConfigDigest;
+    result.affectedProfileIds = affectedProfileIds;
+    result.profileSummaries = profileSummaries;
+    result.reimbursementFactsCertificate = reimbursementFactsCertificate;
   }
   if (normalizedOperation.mode === "reimbursement-batch") {
     result.categoryTotals = Object.fromEntries(

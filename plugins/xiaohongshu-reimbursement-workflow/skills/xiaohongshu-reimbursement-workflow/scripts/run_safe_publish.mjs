@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -9,7 +9,11 @@ const safePublishScript = path.join(scriptDirectory, "safe_publish.ps1");
 const sha256Pattern = /^[0-9a-f]{64}$/i;
 const acceptedStatuses = new Set(["created", "replaced", "already_current"]);
 const acceptedFailureStatuses = new Set(["publish_failed", "published_cleanup_failed"]);
-const standardTargetName = "小红书支出总表.xlsx";
+const standardTargetNames = new Set([
+  "小红书支出总表.xlsx",
+  "公司支出总表.xlsx",
+  "驻所支出.xlsx",
+].map((value) => value.toLowerCase()));
 const flagToKey = new Map([
   ["--baseline-path", "baselinePath"],
   ["--candidate-path", "candidatePath"],
@@ -18,6 +22,8 @@ const flagToKey = new Map([
   ["--expected-candidate-sha256", "expectedCandidateSha256"],
 ]);
 const requiredKeys = [...flagToKey.values()];
+const maxAsyncOutputBytes = 1024 * 1024;
+const maxAsyncTimeoutMs = 120_000;
 
 function fail(message) {
   throw new Error(message);
@@ -60,8 +66,8 @@ function validateOptions(options) {
       fail(`${key} must use the .xlsx extension.`);
     }
   }
-  if (path.basename(normalized.targetPath).toLowerCase() !== standardTargetName.toLowerCase()) {
-    fail(`targetPath must use the exact standard filename ${standardTargetName}.`);
+  if (!standardTargetNames.has(path.basename(normalized.targetPath).toLowerCase())) {
+    fail("targetPath must use one fixed canonical reimbursement root workbook filename.");
   }
   if (!samePath(path.dirname(normalized.baselinePath), path.dirname(normalized.targetPath))) {
     fail("baselinePath and targetPath must be in the same bound root directory.");
@@ -244,6 +250,84 @@ export function runSafePublish(options, { spawnImpl = spawnSync } = {}) {
     encoding: "utf8",
     shell: false,
     windowsHide: true,
+  });
+  return validatePowerShellResult(result, values.expectedCandidateSha256, values.targetPath);
+}
+
+async function killProcessTree(child) {
+  if (!child?.pid) return;
+  if (process.platform === "win32") {
+    await new Promise((resolve) => {
+      const killer = spawn("taskkill.exe", ["/PID", String(child.pid), "/T", "/F"], { shell: false, windowsHide: true, stdio: "ignore" });
+      killer.once("close", resolve);
+      killer.once("error", resolve);
+    });
+    return;
+  }
+  try { process.kill(-child.pid, "SIGKILL"); } catch {}
+  try { child.kill("SIGKILL"); } catch {}
+}
+
+export async function runSafePublishAsync(options, { spawnImpl = spawn, timeoutMs = maxAsyncTimeoutMs } = {}) {
+  const values = validateOptions(options);
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > maxAsyncTimeoutMs) fail("publish timeout exceeds its fixed limit.");
+  const powerShellArguments = [
+    "-NoProfile",
+    "-NonInteractive",
+    "-ExecutionPolicy",
+    "Bypass",
+    "-File",
+    safePublishScript,
+    "-BaselinePath",
+    values.baselinePath,
+    "-CandidatePath",
+    values.candidatePath,
+    "-TargetPath",
+    values.targetPath,
+    "-ExpectedBaselineSha256",
+    values.expectedBaselineSha256,
+    "-ExpectedCandidateSha256",
+    values.expectedCandidateSha256,
+  ];
+  const child = spawnImpl("powershell.exe", powerShellArguments, {
+    shell: false,
+    windowsHide: true,
+    detached: process.platform !== "win32",
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  const result = await new Promise((resolve, reject) => {
+    const stdout = [];
+    const stderr = [];
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
+    let stopReason = null;
+    let done = false;
+    const terminate = (reason) => {
+      if (!stopReason) stopReason = reason;
+      void killProcessTree(child);
+    };
+    const timer = setTimeout(() => terminate(new Error("safe_publish.ps1 timed out")), timeoutMs);
+    child.stdout.on("data", (chunk) => {
+      stdoutBytes += chunk.length;
+      if (stdoutBytes > maxAsyncOutputBytes) terminate(new Error("safe_publish.ps1 stdout exceeded its bounded limit"));
+      else stdout.push(chunk);
+    });
+    child.stderr.on("data", (chunk) => {
+      stderrBytes += chunk.length;
+      if (stderrBytes > maxAsyncOutputBytes) terminate(new Error("safe_publish.ps1 stderr exceeded its bounded limit"));
+      else stderr.push(chunk);
+    });
+    child.once("error", (error) => {
+      clearTimeout(timer);
+      if (!done) { done = true; reject(error); }
+    });
+    child.once("close", (code, signal) => {
+      clearTimeout(timer);
+      if (done) return;
+      done = true;
+      if (stopReason) return reject(stopReason);
+      resolve({ status: code, signal, stdout: Buffer.concat(stdout).toString("utf8"), stderr: Buffer.concat(stderr).toString("utf8") });
+    });
   });
   return validatePowerShellResult(result, values.expectedCandidateSha256, values.targetPath);
 }

@@ -1,90 +1,75 @@
-# 小红书报销归档工作流
+# 三类报销共享归档工作流
 
-这是一个面向 Codex 的 skills-only 插件，用一次显式调用完成小红书报销的材料核对、本次明细制作、归档、候选总表快照、终审和受控发布。
+这是面向 Codex 的 skills-only 插件。它用一条 profile 驱动的普通报销流程处理小红书、公司和驻所报销，并保留独立的历史纠错/零增量重排路径。
 
-仓库只包含插件说明、skills、内部 references 和参数化脚本，不包含报销截图、财务数据、账号凭证或本机路径。
+普通流程只为本批实际有交易的 profile 生成和发布成品；无交易 profile 不创建空文件，也不修改根表。`住所` 可作为驻所输入别名，但正式文件和 Sheet 始终使用 canonical `驻所` 身份。
 
-## 快速路径、输出与可靠性
+## 普通流程产物
 
-- 插件只暴露一个总工作流 skill；Excel 整理与验收规则已内嵌为内部 reference，`/` 或 `$` 选择器不再出现第二个 expense skill。
-- 微信材料只连续收集一次，之后全部在本地按 SHA256 差分核验；未变化图片不重复打开、导入或渲染。
-- 完整逐笔截图只在本地对应截图表验收后展示一次；目标类目固定在 Sheet1，存在公司报销时固定在 Sheet2，每张图片独占一个 `图N` 列。
-- 公司报销等非目标类目进入文字说明、独立截图归档和对应截图表，但不会进入小红书明细、候选总表或根目录总表。
-- 报销文字说明只写时间段、每人/分类汇总、费用合计和实报合计，不写逐笔明细。
-- 文字说明不引用截图文件名、目录、路径、SHA256、序号或位置；逐笔对应关系由带嵌入图片的归档工作簿和对话中的一次完整展示承担。
-- 汇总金额使用三位小数定点整数精确计算；摘要先零落盘预览并绑定 SHA256，第一道门禁后才写最终 TXT。
-- 工作簿按“一次批量构建、一次语义验证、一次有界视觉验证”执行；内部 manifest 和验收证书只在任务临时目录，不进入最终归档。
-- 发布前使用同目录锁和 SHA256 复核；临时目录必须具有随机 token 与 ownership marker，清理器不做递归删除。
-- 最终更新根目录总表仅支持 Windows 10/11；其他系统可以完成归档和候选总表，但必须在最终发布前停止。
+每个受影响 profile 独立生成：
 
-## 给同事：只需把链接交给 Codex
+- 更新后的正式根表候选；
+- 当期报销明细；
+- 报销明细对应截图表；
+- 截至结束日期的总表快照；
+- 报销文字说明、截图归档和精简发布审计。
 
-同事不需要手动复制下面的安装命令。只需在 Codex 桌面端或 Codex CLI 中发送：
+三份正式根表分别为 `小红书支出总表.xlsx`、`公司支出总表.xlsx` 和 `驻所支出.xlsx`。金额使用 BigInt milliunits 计算，工作簿统一显示三位小数。候选关闭后由独立进程重读真实 XLSX/OOXML 审计；发布前后均 fresh 读取并核对 SHA256。
+
+## 安装
+
+当前未合并成品以 `dist/xiaohongshu-reimbursement-workflow-0.5.0+codex.20260816-r2.zip` 为准。先核对同目录 `.sha256`，再解压到一个新的本地目录，并把该解压目录作为 marketplace 根：
+
+```bash
+codex plugin marketplace add <解压目录绝对路径> --json
+codex plugin add xiaohongshu-reimbursement-workflow@xiaohongshu-finance --json
+codex plugin list --json
+```
+
+OpenAI 官方文档支持将本地 marketplace 根目录传给 `codex plugin marketplace add`。安装后必须确认列表中的版本是 `0.5.0+codex.20260816`，然后新建 Codex 任务加载 Skill。当前环境只完成了隔离 marketplace/cache 安装与回滚模拟；由于 WindowsApps `codex.exe` 对自动化进程返回 Access Denied，没有声称已执行正式 CLI 安装。
+
+该版本正式合并到 GitHub `main` 后，同事也可把仓库链接和明确安装要求交给 Codex：
 
 ```text
-请读取下面的 GitHub 项目，并自动为我安装、配置和验证这个 Codex 插件；除非权限或当前产品不支持，否则不要让我手动执行安装命令：
+请读取并安装、配置和验证这个 Codex 插件：
 https://github.com/a1055010315-sudo/xiaohongshu-reimbursement-workflow
 ```
 
-Codex 应读取本仓库根目录的 `AGENTS.md` 和本说明，自动完成 marketplace 添加、插件安装及结果验证。安装完成后，同事只需要按 Codex 提示重新打开 Codex 或新建任务。
-
-仅发送裸链接只授权读取，不足以授权安装；加上“请安装并配置”这句话即可，其余步骤交给 Codex。
-
-## Codex 自动执行的安装步骤
-
-以下命令供 Codex 自动执行，也可用于故障排查。插件需要支持插件功能的 Codex 桌面端或 Codex CLI：
+届时 Codex 自动执行的远程安装命令为：
 
 ```bash
-codex plugin marketplace add a1055010315-sudo/xiaohongshu-reimbursement-workflow --ref main
-codex plugin add xiaohongshu-reimbursement-workflow@xiaohongshu-finance
+codex plugin marketplace add a1055010315-sudo/xiaohongshu-reimbursement-workflow --ref main --json
+codex plugin add xiaohongshu-reimbursement-workflow@xiaohongshu-finance --json
+codex plugin list --json
 ```
 
-安装后请新建一个 Codex 任务，让新安装的 skills 被加载。
+更新已有远程安装时，先运行 `codex plugin marketplace upgrade xiaohongshu-finance --json`，再运行 `codex plugin add ... --json` 刷新。回滚时使用先前已核验的解压包重新注册本地 marketplace、重新安装并核对版本；确认恢复成功后再移除失败版本的本地 marketplace/cache。不得用回滚操作改动报销文件或根表。
 
-## 一次调用
+裸链接只授权读取，不授权安装。正式安装、发布或修改财务文件仍需用户明确授权。
 
-在新任务中调用总控 skill 一次：
+## 使用
 
 ```text
-使用 $xiaohongshu-reimbursement-workflow:xiaohongshu-reimbursement-workflow 处理 2026.7.14-2026.7.25 的小红书报销。
+使用 $xiaohongshu-reimbursement-workflow:xiaohongshu-reimbursement-workflow 处理本批小红书、公司和驻所报销。
 材料在：<材料路径或本消息附件>
 支出表根目录：<根目录绝对路径>
 ```
 
-之后继续在同一任务中回复即可，不需要再调用内部的 Excel skill。
+普通新增只由 `scripts/run_reimbursement_workflow.mjs` 编排：
 
-## 两道确认门禁
+1. `--prepare` 构建所有受影响 profile 的三类工作簿、独立审计并生成 Gate 1 审阅包，根表不变。
+2. 用户在新消息精确回复 `本次报销通过无误` 后，`--finalize` fresh 重读并生成 Gate 2 绑定。
+3. 用户再精确回复 `确认更新根目录支出总表` 后，`--publish` 才可 exclusive 发布、复核并在批次失败时恢复。
 
-1. Codex 先归档本次材料、制作本次明细和候选总表快照；根目录总表保持不变。
-2. 核对报销业务无误后，单独回复：`本次报销通过无误`
-3. Codex 完成终审并报告当前有效候选文件及 SHA256。
-4. 确认终审结果后，单独回复：`确认更新根目录支出总表`
-5. Codex 重新读取磁盘并验证无并发变化后，才更新根目录 `小红书支出总表.xlsx`。
+任何候选、基线、来源覆盖、预览或摘要变化都会使旧门禁失效。公司根表的未受管 Sheet 必须保持；驻所输入别名不会改变正式输出身份。
 
-相似说法、提前发送的确认、旧任务中的确认以及候选文件发生变化后的旧确认都无效。
+## 仓库内容
 
-## 同事已经完成前半段
+- `SKILL.md`：唯一公开工作流入口和阶段路由；
+- `references/ledger-profiles.json`：三 profile 的 canonical 配置；
+- `scripts/run_reimbursement_workflow.mjs`：普通报销 prepare/finalize/publish 总控；
+- `scripts/`：manifest、XLSX 构建、OOXML facts、transition、业务审计和安全发布实现；
+- `assets/templates/`：已批准的明细和截图表版式模板；
+- `tests/`：单元、真实 XLSX、安全、恢复和性能测试。
 
-如果同事已经做好文字说明、报销截图和本次明细，不需要重做。新任务仍只调用一次总控 skill，并给出已有时间段文件夹和支出表根目录。Codex 会按文件哈希复用未变化成果并从检查点继续；两道用户确认需要在当前任务中重新取得。
-
-## 更新
-
-刷新 GitHub marketplace：
-
-```bash
-codex plugin marketplace upgrade xiaohongshu-finance
-codex plugin add xiaohongshu-reimbursement-workflow@xiaohongshu-finance
-```
-
-第二条命令会依据插件 manifest 的 cachebuster 刷新已安装版本，无需先卸载。更新后请重新打开 Codex，并在新任务中使用插件。
-
-## 插件内容
-
-- `xiaohongshu-reimbursement-workflow`：唯一可调用的总控工作流，内部包含 Excel 整理与验收规则。
-- `references/`：按阶段加载微信取证、批次产物、Excel、候选发布和运行可靠性规则，不会显示为额外 skill 入口。
-- `audit_batch_manifest.mjs`：核验批次清单、定点金额、引用关系和文件哈希，支持安全复用验收结果。
-- `build_reimbursement_summary.mjs`：零落盘预览并按预览 SHA256 确定性写入汇总文字说明。
-- `safe_publish.ps1`：在 Windows 上执行受控总表发布。
-- `cleanup_task_temp.mjs`：依据 ownership token 安全清理本任务扁平临时目录。
-
-`对公已付不实报` 会计入费用合计和支出总表，但不计入实报合计。
+仓库不包含真实报销截图、财务数据、账号凭证或本机财务路径。

@@ -123,6 +123,17 @@ test("runner fixes the PowerShell executable, flags, script, and shell:false", (
   ]);
 });
 
+test("runner accepts only the three fixed canonical profile target filenames", () => {
+  for (const filename of ["小红书支出总表.xlsx", "公司支出总表.xlsx", "驻所支出.xlsx"]) {
+    const options = { ...validOptions, targetPath: path.join(optionRoot, filename) };
+    assert.doesNotThrow(() => parseCliArguments(toCliArguments(options)));
+  }
+  for (const filename of ["住所支出.xlsx", "custom.xlsx", "公司支出总表_副本.xlsx"]) {
+    const options = { ...validOptions, targetPath: path.join(optionRoot, filename) };
+    assert.throws(() => parseCliArguments(toCliArguments(options)), /fixed canonical|targetPath/iu);
+  }
+});
+
 test("exit-zero output is rejected when JSON is absent, blocked, noisy, or accompanied by stderr", async (context) => {
   const successJson = JSON.stringify({
     ok: true,
