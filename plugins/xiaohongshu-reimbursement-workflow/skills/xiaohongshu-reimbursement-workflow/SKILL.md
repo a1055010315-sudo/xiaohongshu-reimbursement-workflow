@@ -55,7 +55,7 @@ description: "Run or resume a controlled reimbursement batch for Xiaohongshu, co
 
 无论涉及一个还是三个 profile，每个父批次都只有一次 Gate 1 和一次 Gate 2：
 
-- **Gate 1**：所有受影响 profile 的明细、截图关系、候选、金额/来源/工作簿审计及必要预览均就绪后，按 `profileOrder` 生成一个绑定工件并完整展示；先完成的 profile 只标记 ready，不单独索取确认。
+- **Gate 1**：所有受影响 profile 的明细、截图关系、候选、金额/来源/工作簿审计及必要预览均就绪后，按 `profileOrder` 生成一个绑定工件并完整展示；先完成的 profile 只标记 ready，不单独索取确认。对每个受影响 profile，确认提示前必须实际展示：文字说明原文、SHA256、笔数和三类金额合计；根表候选图片、绝对路径、SHA256、修订号及“正式根表尚未更新”；本次明细图片及 SHA256；截图对应表图片、逐笔 `图N` 关系、来源覆盖/缺图或排除项及 SHA256。只给路径、状态 JSON 或“预览已生成”不构成展示；任一项遗漏时不得接受第一句确认，必须先补齐完整审阅包。
 - **Gate 2**：收到有效 Gate 1 后，所有受影响 profile 并行独立终审；先用 `build_reimbursement_final_audit.mjs` 生成不可复用 Gate 1 审计的终审证书，再生成一个同时绑定 Gate 1、当前预览、final audit、全部当前基线和候选的工件并展示，最后等待第二句。
 - 父工件必须绑定 `batchId + affectedProfiles + factsDigest + sourceCoverageDigest + operationDigest + styleContractDigest + 每个 profile 的基线/候选/本次明细规范路径、SHA256、candidateRevision、计划摘要、独立明细与候选审计摘要 + reviewPackageDigest/finalAuditDigest`。
 - 工件只保存可重算上下文，不保存授权。用户是否已批准及预期 `bindingDigest` 只存在当前任务内。
