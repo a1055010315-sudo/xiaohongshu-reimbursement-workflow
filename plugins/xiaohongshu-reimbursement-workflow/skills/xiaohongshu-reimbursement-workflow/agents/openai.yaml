@@ -1,6 +1,6 @@
 interface:
   display_name: "三类报销共享归档工作流"
-  short_description: "小红书、公司、驻所报销的共享构建、独立审计与双门禁发布"
-  default_prompt: "使用 $xiaohongshu-reimbursement-workflow 处理本批小红书、公司或驻所报销，只生成实际发生的 profile 成品，并通过两道门禁安全发布。"
+  short_description: "三类普通报销与补报的构建、预览、审计和双门禁发布"
+  default_prompt: "使用 $xiaohongshu-reimbursement-workflow 处理本批小红书、公司或驻所的普通报销或补报，只生成实际发生 profile 的五类交付物，并在 Gate 2 展示预览后安全发布。"
 policy:
   allow_implicit_invocation: false

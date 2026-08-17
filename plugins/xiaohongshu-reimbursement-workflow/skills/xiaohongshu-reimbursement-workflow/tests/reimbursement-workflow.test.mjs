@@ -4,6 +4,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 import {
   finalizeReimbursementWorkflow,
@@ -21,6 +22,7 @@ const PROFILES = [
 ];
 const PNG = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", "base64");
 const PREVIEW_PNG = Buffer.concat([PNG, Buffer.alloc(1024)]);
+const SKILL_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 let tempRoot;
 let approvedAvailable = true;
@@ -53,12 +55,12 @@ async function renderTestPreviews({ request, requestFileSha256 }) {
 
 const TEST_HOOKS = { runPreviewRenderer: renderTestPreviews };
 
-async function scenario(profileCount, { separateProfileRoots = false } = {}) {
+async function scenario(profileCount, { separateProfileRoots = false, supplement = false, createArchive = true } = {}) {
   const token = crypto.randomBytes(32).toString("hex");
   const root = path.join(tempRoot, `scenario-${profileCount}-${token.slice(0, 8)}`);
   const archive = path.join(root, "archive");
   await fs.mkdir(root);
-  await fs.mkdir(archive);
+  if (createArchive) await fs.mkdir(archive);
   const selected = PROFILES.slice(0, profileCount);
   const baselines = [];
   for (const profile of selected) {
@@ -74,9 +76,9 @@ async function scenario(profileCount, { separateProfileRoots = false } = {}) {
   const transactions = selected.map((profile, index) => ({
     id: `TX-${profile.id}`,
     sourceOrder: index + 1,
-    date: `2026-08-${String(20 + index).padStart(2, "0")}`,
+    date: supplement ? `2026-07-${String(3 + index).padStart(2, "0")}` : `2026-08-${String(20 + index).padStart(2, "0")}`,
     person: `脱敏人员${index + 1}`,
-    project: `完整链路项目${index + 1}`,
+    project: `${supplement ? "补报" : "完整链路"}项目${index + 1}`,
     label: `脱敏人员${index + 1}`,
     classification: `完整链路分类${index + 1}`,
     amount: `${index + 1}.125`,
@@ -139,7 +141,21 @@ test("approved roots complete the ordinary 1/2/3-profile workflow with one prepa
       assert.equal(prepared.review.length, profileCount);
       assert.equal(prepared.review.every((item) => item.previews.length === 3), true);
       assert.match(prepared.review[0].summary, /费用合计：/u);
-      const finalized = await finalizeReimbursementWorkflow({ statePath: prepared.statePath, expectedGate1BindingDigest: prepared.gate1BindingDigest, approvalText: "本次报销通过无误" });
+      const finalized = await finalizeReimbursementWorkflow(
+        { statePath: prepared.statePath, expectedGate1BindingDigest: prepared.gate1BindingDigest, approvalText: "本次报销通过无误" },
+        { testHooks: TEST_HOOKS },
+      );
+      assert.equal(finalized.review.length, profileCount);
+      for (const review of finalized.review) {
+        assert.equal(review.previews.length, 3);
+        for (const preview of review.previews) {
+          const stable = await readStableBinaryFile(preview.path);
+          assert.equal(stable.sha256, preview.sha256);
+          assert.equal(preview.sourceSha256, preview.role === "root"
+            ? prepared.review.find((item) => item.profileId === review.profileId).previews.find((item) => item.role === "root").sourceSha256
+            : review[preview.role].sha256);
+        }
+      }
       const published = await publishReimbursementWorkflow({
         statePath: finalized.statePath,
         expectedGate1BindingDigest: prepared.gate1BindingDigest,
@@ -156,15 +172,19 @@ test("approved roots complete the ordinary 1/2/3-profile workflow with one prepa
         assert.equal((await readStableBinaryFile(output.screenshot.path)).sha256, output.screenshot.sha256);
         assert.equal((await readStableBinaryFile(output.summary.path)).sha256, output.summary.sha256);
         assert.equal((await readStableBinaryFile(output.snapshot.path)).sha256, output.root.sha256);
+        assert.match(path.basename(output.detail.path), /^\d{4}-\d{2}-\d{2}.*_本次报销明细\.xlsx$/u);
+        assert.match(path.basename(output.screenshot.path), /^\d{4}-\d{2}-\d{2}.*_报销明细对应截图表\.xlsx$/u);
+        assert.match(path.basename(output.summary.path), /^\d{4}-\d{2}-\d{2}.*_报销文字说明\.odt$/u);
+        assert.match(path.basename(output.snapshot.path), /^\d{4}-\d{2}-\d{2}.*快照\.xlsx$/u);
+        assert.match(path.basename(path.dirname(output.evidenceArchive[0].path)), /^\d{4}-\d{2}-\d{2}.*_报销截图$/u);
         assert.equal(output.evidenceArchive.length, 1);
         assert.equal((await readStableBinaryFile(output.evidenceArchive[0].path)).sha256, sha256(PNG));
-        const publishAudit = JSON.parse(await fs.readFile(output.publishAudit.path, "utf8"));
-        assert.equal(publishAudit.kind, "ordinary-reimbursement-publish-audit-v1");
-        assert.equal(publishAudit.profileId, output.profileId);
-        assert.equal(publishAudit.root.sha256, output.root.sha256);
-        assert.match(publishAudit.businessAuditDigest, /^[0-9a-f]{64}$/u);
-        assert.match(publishAudit.transitionDigest, /^[0-9a-f]{64}$/u);
+        assert.match(output.publishAuditDigest, /^[0-9a-f]{64}$/u);
       }
+      const archivedFiles = (await fs.readdir(input.archive, { recursive: true }))
+        .filter((entry) => typeof entry === "string")
+        .map((entry) => path.join(input.archive, entry));
+      assert.equal(archivedFiles.some((filePath) => filePath.endsWith(".json")), false);
       for (const profile of PROFILES.slice(profileCount)) {
         await assert.rejects(() => fs.stat(path.join(input.archive, profile.id)), { code: "ENOENT" });
       }
@@ -173,6 +193,34 @@ test("approved roots complete the ordinary 1/2/3-profile workflow with one prepa
       await assert.rejects(() => fs.stat(path.join(os.tmpdir(), `codex-xhs-workflow-${input.token}`)), { code: "ENOENT" });
     });
   }
+});
+
+test("publication creates the bound batch archive directory when it is absent", async () => {
+  if (!approvedAvailable) return;
+  const input = await scenario(1, { createArchive: false });
+  const prepared = await prepareReimbursementWorkflow({
+    kind: WORKFLOW_PREPARE_KIND,
+    stagingToken: input.token,
+    manifestPath: input.manifestPath,
+    manifestSha256: input.manifestSha256,
+    baselines: input.baselines,
+  }, { testHooks: TEST_HOOKS });
+  const finalized = await finalizeReimbursementWorkflow({
+    statePath: prepared.statePath,
+    expectedGate1BindingDigest: prepared.gate1BindingDigest,
+    approvalText: "本次报销通过无误",
+  }, { testHooks: TEST_HOOKS });
+  const published = await publishReimbursementWorkflow({
+    statePath: finalized.statePath,
+    expectedGate1BindingDigest: prepared.gate1BindingDigest,
+    gate1ApprovalText: "本次报销通过无误",
+    expectedGate2BindingDigest: finalized.gate2BindingDigest,
+    gate2ApprovalText: "确认更新根目录支出总表",
+  });
+  assert.equal((await fs.stat(input.archive)).isDirectory(), true);
+  assert.equal((await fs.stat(path.join(input.archive, "01_小红书专项"))).isDirectory(), true);
+  assert.equal(published.cleanup.preserved.length, 0);
+  assert.equal(published.cleanup.failures.length, 0);
 });
 
 test("production workflow batches all Gate 1 previews through the real spreadsheet renderer", {
@@ -202,6 +250,15 @@ test("production workflow batches all Gate 1 previews through the real spreadshe
     }
   }
   const finalized = await finalizeReimbursementWorkflow({ statePath: prepared.statePath, expectedGate1BindingDigest: prepared.gate1BindingDigest, approvalText: "本次报销通过无误" });
+  assert.equal(finalized.review.length, profileCount);
+  for (const review of finalized.review) {
+    assert.equal(review.previews.length, 3);
+    for (const preview of review.previews) {
+      const stable = await readStableBinaryFile(preview.path);
+      assert.equal(stable.sha256, preview.sha256);
+      assert.ok(preview.width > 1 && preview.height > 1 && stable.size > 1_000);
+    }
+  }
   const gate2At = performance.now();
   await publishReimbursementWorkflow({
     statePath: finalized.statePath,
@@ -214,6 +271,60 @@ test("production workflow batches all Gate 1 previews through the real spreadshe
   if (process.env.CODEX_PERF_TRACE === "1") {
     console.log(JSON.stringify({ kind: "workflow-stage-trace", profileCount, inputPreparationMs: preparedInputAt - started, prepareToGate1Ms: gate1At - preparedInputAt, gate1ToGate2Ms: gate2At - gate1At, gate2PublishVerifyMs: publishedAt - gate2At, totalMs: publishedAt - started, maxRssKilobytes: process.resourceUsage().maxRSS }));
   }
+});
+
+test("Gate 2 preview mutation rejects publication before roots change", async (t) => {
+  if (!approvedAvailable) return t.skip("approved root fixtures are unavailable");
+  const input = await scenario(1);
+  const baseline = await readStableBinaryFile(input.baselines[0].path);
+  const prepared = await prepareReimbursementWorkflow({
+    kind: WORKFLOW_PREPARE_KIND,
+    stagingToken: input.token,
+    manifestPath: input.manifestPath,
+    manifestSha256: input.manifestSha256,
+    baselines: input.baselines,
+  }, { testHooks: TEST_HOOKS });
+  const finalized = await finalizeReimbursementWorkflow(
+    { statePath: prepared.statePath, expectedGate1BindingDigest: prepared.gate1BindingDigest, approvalText: "本次报销通过无误" },
+    { testHooks: TEST_HOOKS },
+  );
+  await fs.appendFile(finalized.review[0].previews[0].path, Buffer.from("preview mutation"));
+  await assert.rejects(() => publishReimbursementWorkflow({
+    statePath: finalized.statePath,
+    expectedGate1BindingDigest: prepared.gate1BindingDigest,
+    gate1ApprovalText: "本次报销通过无误",
+    expectedGate2BindingDigest: finalized.gate2BindingDigest,
+    gate2ApprovalText: "确认更新根目录支出总表",
+  }), /preview|changed|bound/iu);
+  assert.equal((await readStableBinaryFile(input.baselines[0].path)).sha256, baseline.sha256);
+});
+
+test("historical-date supplement completes the ordinary audited workflow", async (t) => {
+  if (!approvedAvailable) return t.skip("approved root fixtures are unavailable");
+  const supplementTemplate = path.join(SKILL_ROOT, "assets", "templates", "补报明细模板.xlsx");
+  await fs.access(supplementTemplate);
+  const input = await scenario(1, { supplement: true });
+  const prepared = await prepareReimbursementWorkflow({
+    kind: WORKFLOW_PREPARE_KIND,
+    stagingToken: input.token,
+    manifestPath: input.manifestPath,
+    manifestSha256: input.manifestSha256,
+    baselines: input.baselines,
+  }, { testHooks: TEST_HOOKS });
+  assert.match(prepared.review[0].detail.path, /2026-08-20.*本次报销明细/u);
+  const finalized = await finalizeReimbursementWorkflow(
+    { statePath: prepared.statePath, expectedGate1BindingDigest: prepared.gate1BindingDigest, approvalText: "本次报销通过无误" },
+    { testHooks: TEST_HOOKS },
+  );
+  const published = await publishReimbursementWorkflow({
+    statePath: finalized.statePath,
+    expectedGate1BindingDigest: prepared.gate1BindingDigest,
+    gate1ApprovalText: "本次报销通过无误",
+    expectedGate2BindingDigest: finalized.gate2BindingDigest,
+    gate2ApprovalText: "确认更新根目录支出总表",
+  });
+  assert.equal(published.outputs.length, 1);
+  assert.match(path.basename(published.outputs[0].snapshot.path), /^2026-08-20.*快照\.xlsx$/u);
 });
 
 test("Gate texts and binding digests are fail-closed before publication", async (t) => {
@@ -235,7 +346,10 @@ test("multi-profile publication failure restores earlier roots and removes only 
     manifestSha256: input.manifestSha256,
     baselines: input.baselines,
   }, { testHooks: TEST_HOOKS });
-  const finalized = await finalizeReimbursementWorkflow({ statePath: prepared.statePath, expectedGate1BindingDigest: prepared.gate1BindingDigest, approvalText: "本次报销通过无误" });
+  const finalized = await finalizeReimbursementWorkflow(
+    { statePath: prepared.statePath, expectedGate1BindingDigest: prepared.gate1BindingDigest, approvalText: "本次报销通过无误" },
+    { testHooks: TEST_HOOKS },
+  );
   const collisionDirectory = path.join(input.archive, "02_公司专项");
   await fs.mkdir(collisionDirectory);
   const collisionPath = path.join(collisionDirectory, path.basename(prepared.review[1].detail.path));

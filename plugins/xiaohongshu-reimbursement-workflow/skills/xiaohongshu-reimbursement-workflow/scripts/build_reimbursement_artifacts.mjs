@@ -29,6 +29,7 @@ const TEMPLATE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)),
 const JSZipModule = loadBundledDependency("jszip");
 const JSZip = JSZipModule.default ?? JSZipModule;
 const templateCache = new Map();
+const ODT_MIMETYPE = "application/vnd.oasis.opendocument.text";
 
 function fail(message) {
   throw new Error(`Reimbursement Artifact Builder ${message}`);
@@ -65,6 +66,15 @@ function xml(value) {
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&apos;");
+}
+
+function odtContentXml(summaryText) {
+  const paragraphs = summaryText.split("\n").map((line) => `<text:p text:style-name="P1">${xml(line)}</text:p>`).join("");
+  return `<?xml version="1.0" encoding="UTF-8"?><office:document-content office:version="1.3" xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0"><office:body><office:text>${paragraphs}</office:text></office:body></office:document-content>`;
+}
+
+function odtManifestXml() {
+  return `<?xml version="1.0" encoding="UTF-8"?><manifest:manifest manifest:version="1.3" xmlns:manifest="urn:oasis:names:tc:opendocument:xmlns:manifest:1.0"><manifest:file-entry manifest:full-path="/" manifest:media-type="${ODT_MIMETYPE}"/><manifest:file-entry manifest:full-path="content.xml" manifest:media-type="text/xml"/><manifest:file-entry manifest:full-path="styles.xml" manifest:media-type="text/xml"/><manifest:file-entry manifest:full-path="meta.xml" manifest:media-type="text/xml"/><manifest:file-entry manifest:full-path="settings.xml" manifest:media-type="text/xml"/></manifest:manifest>`;
 }
 
 function deepFreeze(value, seen = new Set()) {
@@ -465,6 +475,24 @@ async function writeBoundBytes(filePath, bytes) {
   return { sha256: stable.sha256, size: stable.size };
 }
 
+async function writeOdtSummary(filePath, summaryText) {
+  const zip = new JSZip();
+  const contentXml = odtContentXml(summaryText);
+  zip.file("mimetype", ODT_MIMETYPE, { compression: "STORE" });
+  zip.file("content.xml", contentXml);
+  zip.file("styles.xml", '<?xml version="1.0" encoding="UTF-8"?><office:document-styles office:version="1.3" xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0"><office:styles><style:style style:name="P1" style:family="paragraph"/></office:styles></office:document-styles>');
+  zip.file("meta.xml", '<?xml version="1.0" encoding="UTF-8"?><office:document-meta office:version="1.3" xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"><office:meta/></office:document-meta>');
+  zip.file("settings.xml", '<?xml version="1.0" encoding="UTF-8"?><office:document-settings office:version="1.3" xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"><office:settings/></office:document-settings>');
+  zip.file("META-INF/manifest.xml", odtManifestXml());
+  const bytes = await zip.generateAsync({ type: "nodebuffer", compression: "DEFLATE", compressionOptions: { level: 6 }, platform: "DOS" });
+  const state = await writeBoundBytes(filePath, bytes);
+  const reopened = await JSZip.loadAsync(copyStableBinaryBytes(await readStableBinaryFile(filePath)), { createFolders: false });
+  const mimetype = await reopened.file("mimetype")?.async("string");
+  const reopenedContent = await reopened.file("content.xml")?.async("string");
+  if (mimetype !== ODT_MIMETYPE || reopenedContent !== contentXml) fail(`${path.basename(filePath)} is not a stable OpenDocument text summary.`);
+  return { ...state, text: summaryText, textSha256: sha256Bytes(Buffer.from(summaryText, "utf8")) };
+}
+
 function validateCertificate(certificate, registry) {
   const required = new Set(["kind", "operationMode", "manifestFileSha256", "manifestDigest", "configDigest", "profileConfigDigest", "factsDigest", "factsPreimage", "sourceCoverageDigest", "sourceCoveragePreimage", "certificateDigest"]);
   exactKeys(certificate, required, "reimbursementFactsCertificate");
@@ -578,12 +606,12 @@ export async function buildReimbursementArtifacts(rawRequest) {
       const safePeriod = period.replace(/[<>:"/\\|?*]/gu, "-");
       const detailPath = path.join(stagingRoot, `${safePeriod}_${profile.targetCategory}_本次报销明细.xlsx`);
       const screenshotPath = path.join(stagingRoot, `${safePeriod}_${profile.targetCategory}_报销明细对应截图表.xlsx`);
-      const summaryPath = path.join(stagingRoot, `${safePeriod}_${profile.targetCategory}_报销文字说明.txt`);
+      const summaryPath = path.join(stagingRoot, `${safePeriod}_${profile.targetCategory}_报销文字说明.odt`);
       const detailState = await writeWorkbook(detailPath, profile.detailSheetName, detail, detailTemplate);
       owned.push({ path: detailPath, ...detailState });
       const screenshotState = await writeWorkbook(screenshotPath, profile.screenshotMapSheetName, screenshot, screenshotTemplate);
       owned.push({ path: screenshotPath, ...screenshotState });
-      const summaryState = await writeBoundBytes(summaryPath, Buffer.from(summary.text, "utf8"));
+      const summaryState = await writeOdtSummary(summaryPath, summary.text);
       owned.push({ path: summaryPath, ...summaryState });
       const evidenceIds = [...new Set(selected.flatMap((item) => item.evidence))]
         .filter((id) => evidence.get(id)?.kind === "image");

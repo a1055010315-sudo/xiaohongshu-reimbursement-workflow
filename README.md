@@ -12,13 +12,13 @@
 - 当期报销明细；
 - 报销明细对应截图表；
 - 截至结束日期的总表快照；
-- 报销文字说明、截图归档和精简发布审计。
+- 报销文字说明和截图归档；发布审计只在任务临时目录生成并在发布完成后清理。
 
 三份正式根表分别为 `小红书支出总表.xlsx`、`公司支出总表.xlsx` 和 `驻所支出.xlsx`。金额使用 BigInt milliunits 计算，工作簿统一显示三位小数。候选关闭后由独立进程重读真实 XLSX/OOXML 审计；发布前后均 fresh 读取并核对 SHA256。
 
 ## 安装
 
-当前未合并成品以 `dist/xiaohongshu-reimbursement-workflow-0.5.0+codex.20260816-r2.zip` 为准。先核对同目录 `.sha256`，再解压到一个新的本地目录，并把该解压目录作为 marketplace 根：
+当前可安装成品以 `dist/xiaohongshu-reimbursement-workflow-0.5.0+codex.20260817004258.zip` 为准。先核对同目录 `.sha256`，再解压到一个新的本地目录，并把该解压目录作为 marketplace 根：
 
 ```bash
 codex plugin marketplace add <解压目录绝对路径> --json
@@ -26,7 +26,7 @@ codex plugin add xiaohongshu-reimbursement-workflow@xiaohongshu-finance --json
 codex plugin list --json
 ```
 
-OpenAI 官方文档支持将本地 marketplace 根目录传给 `codex plugin marketplace add`。安装后必须确认列表中的版本是 `0.5.0+codex.20260816`，然后新建 Codex 任务加载 Skill。当前环境只完成了隔离 marketplace/cache 安装与回滚模拟；由于 WindowsApps `codex.exe` 对自动化进程返回 Access Denied，没有声称已执行正式 CLI 安装。
+OpenAI 官方文档支持将本地 marketplace 根目录传给 `codex plugin marketplace add`。安装后必须确认列表中的版本是 `0.5.0+codex.20260817004258`，然后新建 Codex 任务加载 Skill。当前环境只完成了隔离 marketplace/cache 安装与回滚模拟；由于 WindowsApps `codex.exe` 对自动化进程返回 Access Denied，没有声称已执行正式 CLI 安装。
 
 该版本正式合并到 GitHub `main` 后，同事也可把仓库链接和明确安装要求交给 Codex：
 

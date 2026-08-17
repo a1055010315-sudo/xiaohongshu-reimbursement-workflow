@@ -112,6 +112,17 @@ test.after(async () => {
   if (tempRoot) await fs.rm(tempRoot, { recursive: true, force: true });
 });
 
+test("supplement detail template preserves the approved detail presentation and requires its three supplement fields", async () => {
+  const templatePath = path.join(skillRoot, "assets", "templates", "补报明细模板.xlsx");
+  const template = await JSZip.loadAsync(await fs.readFile(templatePath));
+  const workbook = await template.file("xl/workbook.xml").async("string");
+  const worksheet = await template.file("xl/worksheets/sheet1.xml").async("string");
+  const styles = await template.file("xl/styles.xml").async("string");
+  assert.match(workbook, /name="补报明细模板"/u);
+  assert.match(worksheet, /原始发生日期.*补报原因.*关联原始凭证/u);
+  assert.match(styles, /formatCode="0\.000"/u);
+});
+
 test("one shared writer emits only affected profile detail and screenshot workbooks", async (t) => {
   for (const profileCount of [1, 2, 3]) {
     await t.test(`${profileCount} profile(s)`, async () => {
@@ -126,11 +137,14 @@ test("one shared writer emits only affected profile detail and screenshot workbo
         assert.match(artifact.summary.sha256, /^[0-9a-f]{64}$/u);
         assert.match(artifact.summary.text, /费用合计：/u);
         assert.match(artifact.summary.text, /实报合计：/u);
+        assert.match(path.basename(artifact.summary.path), /_报销文字说明\.odt$/u);
+        assert.match(artifact.summary.textSha256, /^[0-9a-f]{64}$/u);
         assert.equal(artifact.evidenceArchive.length, 1);
         assert.equal((await fs.readFile(artifact.evidenceArchive[0].path)).equals(PNG), true);
         assert.match(artifact.periodEndDate, /^2026-08-03$/u);
         const detail = await JSZip.loadAsync(await fs.readFile(artifact.detail.path));
         const screenshot = await JSZip.loadAsync(await fs.readFile(artifact.screenshot.path));
+        const summary = await JSZip.loadAsync(await fs.readFile(artifact.summary.path));
         const detailSheet = await detail.file("xl/worksheets/sheet1.xml").async("string");
         const screenshotSheet = await screenshot.file("xl/worksheets/sheet1.xml").async("string");
         const detailStyles = await detail.file("xl/styles.xml").async("string");
@@ -144,6 +158,8 @@ test("one shared writer emits only affected profile detail and screenshot workbo
         assert.match(screenshotSheet, /<col min="6" max="8" width="42"/u);
         assert.match(screenshotSheet, /<drawing [^>]*r:id="rId1"/u);
         assert.ok(screenshot.file("xl/media/image1.png"));
+        assert.equal(await summary.file("mimetype").async("string"), "application/vnd.oasis.opendocument.text");
+        assert.match(await summary.file("content.xml").async("string"), /费用合计：/u);
       }
       await fs.rm(result.stagingRoot, { recursive: true, force: true });
     });
