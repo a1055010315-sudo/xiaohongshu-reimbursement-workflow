@@ -112,6 +112,8 @@ rulesVersion + 按产物选择的factsDigest/evidenceDigest + operationDigest + 
 
 普通新增或历史业务修正批次在每次收到门禁精确文本时，用临时 JSON 上下文调用 `"<bundled-node>" scripts/build_gate_binding.mjs --input <gate-context.json>`，不要手工串接字段。新任务使用 Gate context v2：两道门都绑定 `candidatePlanSha256` 和 `sourceCoverageDigest`；第一门另绑定 `mode`、`batchId`、`factsDigest`、`operationDigest`、`candidateRevision`、候选绝对路径/SHA256 和 `reviewPackageDigest`，第二门另绑定同一操作/候选字段、基线绝对路径/SHA256 和 `finalAuditDigest`。旧 context v1 只用于恢复已开始批次。
 
+Gate v2 的 `previewScopes` 也属于绑定输入：每个 affected profile 必须有 `root`、`detail`、`screenshot`，root 可拆成多个非连续矩形范围（每 profile 最多 10 段、请求最多 36 个 scope），但同一候选工作表的范围不能重叠或越界。scope 的 `batchId`、`candidateRevision`、`candidateSha256`、`candidatePlanSha256`、`sourceCoverageDigest`（直接字段或 `previewBinding` 封套）必须和父 context 完全相等；显式字段须五项成组，完全省略才从父 context 继承。root 的源 SHA 必须等于候选 SHA，只能覆盖本批增量行。提供覆盖范围时，root 范围必须连续覆盖该范围，不得有缺口；没有声明 coverage 时只代表列出的非连续段，不推断未声明行。渲染器还要在渲染前后核对源文件和 PNG SHA，防止旧候选绑定新预览。Gate builder 输出的 scope 顺序是 canonical order；接入 renderer 时必须按 `profileId + role + sheetName + rangeAddress` 身份配对 jobs，而不是假设数组位置。当前普通 workflow 的预渲染请求为兼容旧调用可省略五字段和尚未生成的 `previewSha256`；该 legacy 路径不能单独证明旧候选失效，直接调用 renderer 时应传完整 binding。所有 SHA 字段在跨进程传递前统一序列化为 64 位小写十六进制、无外围空白。
+
 历史业务修正候选还要按以下顺序执行，两个输出都用全新路径和 `wx` 语义写入：
 
 ```text

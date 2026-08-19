@@ -11,6 +11,11 @@ import {
   buildReimbursementArtifacts,
   REIMBURSEMENT_ARTIFACT_BUILD_KIND,
 } from "../scripts/build_reimbursement_artifacts.mjs";
+import {
+  getDetailContract,
+  getScreenshotContract,
+  getSupplementContract,
+} from "../scripts/builtin_visual_contracts.mjs";
 import { loadBundledDependency } from "../scripts/workflow_primitives.mjs";
 
 const skillRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -31,11 +36,11 @@ async function fixture(name, bytes) {
   return { path: filePath, sha256: sha256(bytes) };
 }
 
-function transaction(profileId, category, sourceOrder, unitId) {
-  return {
+function transaction(profileId, category, sourceOrder, unitId, { supplement = false, supplementOverrides = {}, independentSupplementEvidence = false } = {}) {
+  const value = {
     id: `TX-${sourceOrder}`,
     sourceOrder,
-    date: `2026-08-0${sourceOrder}`,
+    date: supplement ? `2026-07-0${sourceOrder}` : `2026-08-0${sourceOrder}`,
     person: `匿名${profileId}`,
     project: `脱敏项目${sourceOrder}`,
     label: `匿名${profileId}`,
@@ -46,16 +51,33 @@ function transaction(profileId, category, sourceOrder, unitId) {
     evidence: ["IMG-1"],
     sourceRefs: [unitId],
   };
+  if (supplement) {
+    Object.assign(value, {
+      supplement: true,
+      originalOccurrenceDate: value.date,
+      supplementReason: "测试历史补报",
+      sourceReference: unitId,
+      ...supplementOverrides,
+    });
+    if (independentSupplementEvidence) {
+      value.evidence.push("IMG-SUPPLEMENT");
+      value.supplementEvidence = ["IMG-SUPPLEMENT"];
+    }
+  }
+  return value;
 }
 
-async function auditedRequest(profileCount) {
+async function auditedRequest(profileCount, { supplement = false, supplementOverrides = {}, independentSupplementEvidence = false, period = "2026-08-01—2026-08-03" } = {}) {
   const suffix = crypto.randomBytes(6).toString("hex");
   const baseline = await fixture(`baseline-${profileCount}-${suffix}.bin`, Buffer.from(`baseline-${profileCount}\n`));
   const image = await fixture(`image-${profileCount}-${suffix}.png`, PNG);
+  const supplementImage = independentSupplementEvidence
+    ? await fixture(`supplement-image-${profileCount}-${suffix}.png`, PNG)
+    : null;
   const all = [
-    transaction("xiaohongshu", "小红书报销", 1, "UNIT-1"),
-    transaction("company", "公司报销", 2, "UNIT-2"),
-    transaction("residence", "驻所报销", 3, "UNIT-3"),
+    transaction("xiaohongshu", "小红书报销", 1, "UNIT-1", { supplement, supplementOverrides, independentSupplementEvidence }),
+    transaction("company", "公司报销", 2, "UNIT-2", { supplement, supplementOverrides, independentSupplementEvidence }),
+    transaction("residence", "驻所报销", 3, "UNIT-3", { supplement, supplementOverrides, independentSupplementEvidence }),
   ].slice(0, profileCount);
   const totals = Object.fromEntries(all.map((item) => [item.category, item.amount]));
   const real = all.filter((item) => item.settlement === "employee_reimbursement")
@@ -67,7 +89,7 @@ async function auditedRequest(profileCount) {
       batchId: `artifact-batch-${profileCount}`,
       rootPath: tempRoot,
       archivePath: path.join(tempRoot, "archive"),
-      period: "2026-08-01—2026-08-03",
+      period,
       targetCategory: "小红书报销",
       reviewRevision: 1,
     },
@@ -75,6 +97,7 @@ async function auditedRequest(profileCount) {
     files: [
       { id: "BASE", role: "baseline", path: baseline.path, sha256: baseline.sha256 },
       { id: "IMG-1", role: "material", path: image.path, sha256: image.sha256, kind: "image", disposition: "used" },
+      ...(supplementImage ? [{ id: "IMG-SUPPLEMENT", role: "material", path: supplementImage.path, sha256: supplementImage.sha256, kind: "image", disposition: "used" }] : []),
     ],
     sourceScopes: [{ id: "SCOPE-1", fileId: "IMG-1", locator: "full-image", terminalConfirmed: true, expectedUnitCount: profileCount }],
     sourceUnits: all.map((_, index) => ({ id: `UNIT-${index + 1}`, scopeId: "SCOPE-1", locator: `region-${index + 1}`, disposition: "used" })),
@@ -112,15 +135,19 @@ test.after(async () => {
   if (tempRoot) await fs.rm(tempRoot, { recursive: true, force: true });
 });
 
-test("supplement detail template preserves the approved detail presentation and requires its three supplement fields", async () => {
-  const templatePath = path.join(skillRoot, "assets", "templates", "补报明细模板.xlsx");
-  const template = await JSZip.loadAsync(await fs.readFile(templatePath));
-  const workbook = await template.file("xl/workbook.xml").async("string");
-  const worksheet = await template.file("xl/worksheets/sheet1.xml").async("string");
-  const styles = await template.file("xl/styles.xml").async("string");
-  assert.match(workbook, /name="补报明细模板"/u);
-  assert.match(worksheet, /原始发生日期.*补报原因.*关联原始凭证/u);
-  assert.match(styles, /formatCode="0\.000"/u);
+test("built-in visual contracts replace runtime template dependencies", () => {
+  const detail = getDetailContract("xiaohongshu");
+  const screenshot = getScreenshotContract("xiaohongshu");
+  const supplement = getSupplementContract("xiaohongshu");
+  assert.equal(detail.source, "builtin");
+  assert.equal(screenshot.source, "builtin");
+  assert.equal(supplement.source, "builtin");
+  assert.deepEqual(detail.columns, ["日期", "支出明细", "支出金额", "费用组合计", "费用分类", "结算方式"]);
+  assert.deepEqual(supplement.supplementFields, ["原始发生日期", "补报原因", "关联原始凭证/来源编号"]);
+  assert.equal(detail.numberFormat, "0.000");
+  assert.equal(detail.rowHeights.data, 24);
+  assert.equal(screenshot.rowHeights.screenshotData, 172.5);
+  assert.match(detail.stylesXml, /formatCode="0\.000"/u);
 });
 
 test("one shared writer emits only affected profile detail and screenshot workbooks", async (t) => {
@@ -135,6 +162,8 @@ test("one shared writer emits only affected profile detail and screenshot workbo
         assert.match(artifact.detail.sha256, /^[0-9a-f]{64}$/u);
         assert.match(artifact.screenshot.sha256, /^[0-9a-f]{64}$/u);
         assert.match(artifact.summary.sha256, /^[0-9a-f]{64}$/u);
+        assert.equal(artifact.supplement, null);
+        assert.equal(artifact.visualContracts.supplement, null);
         assert.match(artifact.summary.text, /费用合计：/u);
         assert.match(artifact.summary.text, /实报合计：/u);
         assert.match(path.basename(artifact.summary.path), /_报销文字说明\.odt$/u);
@@ -148,9 +177,14 @@ test("one shared writer emits only affected profile detail and screenshot workbo
         const detailSheet = await detail.file("xl/worksheets/sheet1.xml").async("string");
         const screenshotSheet = await screenshot.file("xl/worksheets/sheet1.xml").async("string");
         const detailStyles = await detail.file("xl/styles.xml").async("string");
-        assert.equal(artifact.detail.templateSha256, sha256(await fs.readFile(path.join(skillRoot, "assets", "templates", artifact.detail.templateFile))));
+        assert.equal(Object.hasOwn(artifact.detail, "templateFile"), false);
+        assert.equal(Object.hasOwn(artifact.detail, "templateSha256"), false);
+        assert.equal(artifact.detail.visualContractSource, "builtin");
+        assert.equal(artifact.detail.visualContractId, "current-detail-person-grouped");
+        assert.equal(artifact.detail.visualContractVersion, "1.0.0");
+        assert.match(artifact.detail.visualContractDigest, /^[0-9a-f]{64}$/u);
         assert.match(detailStyles, /formatCode="0\.000"/u);
-        assert.match(detailSheet, /<c r="C8" s="36">/u);
+        assert.match(detailSheet, /<c r="C8" s="2">/u);
         assert.match(detailSheet, /ySplit="6"[^>]*topLeftCell="A7"/u);
         assert.match(detailSheet, /<col min="2" max="2" width="40"/u);
         assert.match(detailSheet, /SUM\(C\d+:C\d+\)/u);
@@ -166,10 +200,85 @@ test("one shared writer emits only affected profile detail and screenshot workbo
   }
 });
 
+test("supplement transactions keep the normal detail and emit one additional bound supplement workbook", async () => {
+  const { request } = await auditedRequest(1, { supplement: true });
+  const result = await buildReimbursementArtifacts(request);
+  const artifact = result.artifacts[0];
+  assert.equal(artifact.detail.presentationKind, "detail");
+  assert.match(path.basename(artifact.detail.path), /_本次报销明细\.xlsx$/u);
+  assert.ok(artifact.supplement);
+  assert.match(path.basename(artifact.supplement.path), /_补报表\.xlsx$/u);
+  assert.equal(artifact.supplement.visualContractId, "ordinary-reimbursement-supplement-detail");
+  assert.equal(artifact.supplement.originalOccurrenceDate, "2026-07-01");
+  assert.equal(artifact.supplement.supplementReason, "测试历史补报");
+  assert.equal(artifact.supplement.sourceReference, "UNIT-1");
+  assert.deepEqual(artifact.supplement.entries, [{
+      transactionId: "TX-1",
+      originalOccurrenceDate: "2026-07-01",
+      supplementReason: "测试历史补报",
+      sourceReference: "UNIT-1",
+  }]);
+  assert.equal(artifact.evidenceArchive[0].archiveKind, "reimbursement");
+  const detailWorkbook = await JSZip.loadAsync(await fs.readFile(artifact.detail.path));
+  const detailSheet = await detailWorkbook.file("xl/worksheets/sheet1.xml").async("string");
+  assert.doesNotMatch(detailSheet, /补报说明/u);
+  const supplementWorkbook = await JSZip.loadAsync(await fs.readFile(artifact.supplement.path));
+  const supplementSheet = await supplementWorkbook.file("xl/worksheets/sheet1.xml").async("string");
+  assert.match(supplementSheet, /补报表（按人员分类）/u);
+  assert.match(supplementSheet, /补报说明：TX-1/u);
+  assert.match(supplementSheet, /原始发生日期：2026-07-01/u);
+  assert.match(supplementSheet, /补报原因：测试历史补报/u);
+  assert.match(supplementSheet, /关联原始凭证\/来源编号：UNIT-1/u);
+  await fs.rm(result.stagingRoot, { recursive: true, force: true });
+});
+
+test("only explicitly identified independent supplement evidence receives the conditional archive kind", async () => {
+  const { request } = await auditedRequest(1, { supplement: true, independentSupplementEvidence: true });
+  const result = await buildReimbursementArtifacts(request);
+  assert.deepEqual(
+    result.artifacts[0].evidenceArchive.map(({ evidenceId, archiveKind }) => ({ evidenceId, archiveKind })),
+    [
+      { evidenceId: "IMG-1", archiveKind: "reimbursement" },
+      { evidenceId: "IMG-SUPPLEMENT", archiveKind: "supplement" },
+    ],
+  );
+  await fs.rm(result.stagingRoot, { recursive: true, force: true });
+});
+
+test("supplement required fields fail closed instead of falling back to transaction data", async (t) => {
+  const cases = [
+    ["missing original occurrence date", { originalOccurrenceDate: null }, /originalOccurrenceDate/iu],
+    ["blank reason", { supplementReason: " " }, /supplementReason/iu],
+    ["invalid source reference type", { sourceReference: 17 }, /sourceReference/iu],
+    ["invalid original occurrence calendar date", { originalOccurrenceDate: "2026-02-31" }, /originalOccurrenceDate.*calendar|calendar.*originalOccurrenceDate/iu],
+  ];
+  for (const [name, overrides, error] of cases) {
+    await t.test(name, async () => {
+      const { request } = await auditedRequest(1, { supplement: true, supplementOverrides: overrides });
+      await assert.rejects(() => buildReimbursementArtifacts(request), error);
+    });
+  }
+});
+
+test("period parsing requires both endpoints and supports abbreviated Chinese end dates", async (t) => {
+  await t.test("abbreviated end date is normalized", async () => {
+    const { request } = await auditedRequest(1, { period: "2026年8月1日-8月2日" });
+    const result = await buildReimbursementArtifacts(request);
+    assert.equal(result.artifacts[0].periodEndDate, "2026-08-02");
+    await fs.rm(result.stagingRoot, { recursive: true, force: true });
+  });
+  for (const period of ["2026-08-01", "2026-08-01—bad", "2026年8月1日-8月"]) {
+    await t.test("rejects incomplete period: " + period, async () => {
+      const { request } = await auditedRequest(1, { period });
+      await assert.rejects(() => buildReimbursementArtifacts(request), /period.*complete start and end date/iu);
+    });
+  }
+});
+
 test("evidence changed after manifest audit is rejected before artifact staging", async () => {
   const { request, image } = await auditedRequest(1);
   await fs.writeFile(image.path, Buffer.concat([PNG, Buffer.from("changed")]));
-  await assert.rejects(() => buildReimbursementArtifacts(request), /evidence|SHA changed|stable/iu);
+  await assert.rejects(() => buildReimbursementArtifacts(request), /evidence|SHA changed|stable|SHA256 mismatch/iu);
   const expectedRoot = path.join(os.tmpdir(), `codex-xhs-artifacts-${request.stagingToken}`);
   await assert.rejects(() => fs.stat(expectedRoot), { code: "ENOENT" });
 });

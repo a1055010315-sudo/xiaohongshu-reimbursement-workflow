@@ -8,11 +8,11 @@
 
 每个受影响 profile 独立生成：
 
-- 更新后的正式根表候选；
 - 当期报销明细；
 - 报销明细对应截图表；
-- 截至结束日期的总表快照；
-- 报销文字说明和截图归档；发布审计只在任务临时目录生成并在发布完成后清理。
+- 本批受控发布所用的候选总表；
+- 报销文字说明和截图凭证目录；
+- 仅在有补报时额外生成补报表，有独立补报凭证时额外建立补报凭证目录。发布审计只在任务临时目录生成并在发布完成后清理。
 
 三份正式根表分别为 `小红书支出总表.xlsx`、`公司支出总表.xlsx` 和 `驻所支出.xlsx`。金额使用 BigInt milliunits 计算，工作簿统一显示三位小数。候选关闭后由独立进程重读真实 XLSX/OOXML 审计；发布前后均 fresh 读取并核对 SHA256。
 
@@ -69,7 +69,7 @@ codex plugin list --json
 - `references/ledger-profiles.json`：三 profile 的 canonical 配置；
 - `scripts/run_reimbursement_workflow.mjs`：普通报销 prepare/finalize/publish 总控；
 - `scripts/`：manifest、XLSX 构建、OOXML facts、transition、业务审计和安全发布实现；
-- `assets/templates/`：已批准的明细和截图表版式模板；
+- `scripts/builtin_visual_contracts.mjs`：明细、截图表和补报表的代码内置视觉合同；`assets/templates/` 仅保留迁移/视觉回归夹具，不是运行前置依赖；
 - `tests/`：单元、真实 XLSX、安全、恢复和性能测试。
 
 仓库不包含真实报销截图、财务数据、账号凭证或本机财务路径。

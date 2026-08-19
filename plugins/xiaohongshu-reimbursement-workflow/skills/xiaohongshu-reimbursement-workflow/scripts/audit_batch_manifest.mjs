@@ -2,11 +2,13 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
 import crypto from "node:crypto";
+import { fileURLToPath } from "node:url";
 
 import {
   canonicalDigest as digest,
   formatMilliunits as formatAmount,
   loadProfileRegistry,
+  normalizeClassification,
   parseMilliunits as parseAmount,
   resolveProfile,
 } from "./finance_domain.mjs";
@@ -405,12 +407,38 @@ async function mapWithConcurrency(items, limit, worker) {
   return results;
 }
 
-const manifestPath = process.argv[2];
-
-try {
-  if (!manifestPath || process.argv[3] !== undefined) {
-    throw new Error("Use audit_batch_manifest.mjs <manifest.json>.");
+// Keep the auditor usable when it is copied as a standalone script (for
+// example, the profile-registry isolation test).  The normal plugin path
+// dynamically loads the shared cache; an injected cache always wins and is
+// the preferred path for the workflow's multi-stage run.
+async function loadEvidenceCache() {
+  try {
+    const module = await import("./evidence_cache.mjs");
+    return new module.EvidenceCache({ maxBytes: 25 * 1024 * 1024 });
+  } catch (error) {
+    if (error?.code === "ERR_MODULE_NOT_FOUND" || /Cannot find module|Cannot find the module/iu.test(error?.message ?? "")) {
+      return null;
+    }
+    throw error;
   }
+}
+
+async function readEvidenceWithCache(cache, file, options) {
+  if (!cache) return null;
+  if (typeof cache.readStable !== "function") throw new Error("evidenceCache.readStable must be a function.");
+  const cached = await cache.readStable(file.path, options);
+  if (cached?.sourceSha256 !== options.expectedSha256) {
+    throw new Error(`Manifest file SHA256 does not match: ${file.id}`);
+  }
+  return cached;
+}
+
+export async function auditBatchManifest(manifestPath, options = {}) {
+  requireObject(options, "audit options");
+  const unknownOption = Object.keys(options).find((key) => key !== "evidenceCache");
+  if (unknownOption) throw new Error(`audit options contains unsupported field ${unknownOption}.`);
+  const injectedEvidenceCache = options.evidenceCache;
+  const evidenceCache = injectedEvidenceCache === undefined ? await loadEvidenceCache() : injectedEvidenceCache;
   const absoluteManifestPath = path.resolve(manifestPath);
   const manifestSnapshot = await readStableUtf8JsonFile(absoluteManifestPath, {
     maxBytes: DEFAULT_STABLE_JSON_MAX_BYTES,
@@ -543,6 +571,19 @@ try {
   }
 
   const verifiedFiles = await mapWithConcurrency(normalizedFiles, 4, async (file) => {
+    if (evidenceCache && file.role === "material" && file.kind === "image" && file.disposition === "used") {
+      const cached = await readEvidenceWithCache(evidenceCache, file, {
+        sourceId: file.id,
+        kind: "image",
+        expectedSha256: file.sha256,
+        // Audit owns the stable file/hash contract; the artifact stage can
+        // parse these retained bytes without touching the source again.
+        parse: false,
+      });
+      if (cached) {
+        return { ...file, size: cached.size, imageKind: cached.imageKind, width: cached.width, height: cached.height };
+      }
+    }
     const stat = await fsp.stat(file.path);
     if (!stat.isFile()) throw new Error(`Manifest file is not a regular file: ${file.id}`);
     const actualSha256 = await sha256File(file.path);
@@ -594,7 +635,7 @@ try {
       const profile = profileRegistry ? resolveProfile(rawCategory, profileRegistry) : undefined;
       const category = profile?.targetCategory ?? rawCategory;
       const classification = manifest.version === 3
-        ? cleanString(transaction.classification, `manifest.transactions[${index}].classification`)
+        ? normalizeClassification(transaction.classification, `manifest.transactions[${index}].classification`)
         : undefined;
       const amount = parseAmount(transaction.amount, `manifest.transactions[${index}].amount`, {
         allowNegative: manifest.version >= 2,
@@ -659,6 +700,29 @@ try {
       if (imageEvidence.length > 0 && transaction.missingEvidenceConfirmed === true) {
         throw new Error(`Transaction ${id} cannot have image evidence and missingEvidenceConfirmed together.`);
       }
+      let supplementEvidence = [];
+      if (transaction.supplementEvidence !== undefined) {
+        if (manifest.version !== 3 || !Array.isArray(transaction.supplementEvidence) || transaction.supplementEvidence.length === 0) {
+          throw new Error(`manifest.transactions[${index}].supplementEvidence must be a non-empty array in v3.`);
+        }
+        supplementEvidence = transaction.supplementEvidence.map((value, evidenceIndex) =>
+          cleanString(value, `manifest.transactions[${index}].supplementEvidence[${evidenceIndex}]`),
+        );
+        if (new Set(supplementEvidence).size !== supplementEvidence.length) {
+          throw new Error(`manifest.transactions[${index}].supplementEvidence contains duplicate ids.`);
+        }
+        if (transaction.supplement !== true) {
+          throw new Error(`manifest.transactions[${index}].supplementEvidence requires supplement: true.`);
+        }
+        for (const evidenceId of supplementEvidence) {
+          if (!evidence.includes(evidenceId) || fileById.get(evidenceId)?.kind !== "image") {
+            throw new Error(`Transaction ${id} supplementEvidence must be image ids from its evidence array.`);
+          }
+        }
+        if (!imageEvidence.some((evidenceId) => !supplementEvidence.includes(evidenceId))) {
+          throw new Error(`Transaction ${id} must retain at least one ordinary reimbursement image outside supplementEvidence.`);
+        }
+      }
       categoryTotals.set(category, (categoryTotals.get(category) ?? 0n) + amount);
       settlementTotals.set(settlement, (settlementTotals.get(settlement) ?? 0n) + amount);
       if (settlement === "employee_reimbursement") {
@@ -683,6 +747,7 @@ try {
         if (adjustment) normalized.adjustment = adjustment;
       }
       normalized.evidence = evidence;
+      if (supplementEvidence.length > 0) normalized.supplementEvidence = supplementEvidence;
       if (sourceRefs !== undefined) normalized.sourceRefs = sourceRefs;
       normalized.missingEvidenceConfirmed = transaction.missingEvidenceConfirmed === true;
       return normalized;
@@ -849,6 +914,7 @@ try {
   if (manifest.version >= 2) {
     const factTransactions = transactionsForDigest.map(({
       evidence,
+      supplementEvidence,
       missingEvidenceConfirmed,
       sourceRefs,
       ...transaction
@@ -870,9 +936,10 @@ try {
       .filter((file) => file.role === "material" && file.disposition === "used")
       .map(({ id, sha256, kind, disposition }) => ({ id, sha256, kind, disposition }))
       .sort((left, right) => left.id.localeCompare(right.id));
-    const transactionEvidence = transactionsForDigest.map(({ id, evidence, missingEvidenceConfirmed }) => ({
+    const transactionEvidence = transactionsForDigest.map(({ id, evidence, supplementEvidence = [], missingEvidenceConfirmed }) => ({
       transactionId: id,
       evidence,
+      supplementEvidence,
       missingEvidenceConfirmed,
     }));
     evidenceDigest = digest({ usedMaterials, transactionEvidence });
@@ -990,8 +1057,17 @@ try {
       [...settlementTotals].map(([settlement, total]) => [settlement, formatAmount(total)]),
     );
   }
-  process.stdout.write(`${JSON.stringify(result)}\n`);
-  process.exitCode = 0;
-} catch (error) {
-  fail(error instanceof Error ? error.message : String(error));
+  return result;
+}
+
+if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url))) {
+  const manifestPath = process.argv[2];
+  try {
+    if (!manifestPath || process.argv[3] !== undefined) throw new Error("Use audit_batch_manifest.mjs <manifest.json>.");
+    const result = await auditBatchManifest(manifestPath);
+    process.stdout.write(`${JSON.stringify(result)}\n`);
+    process.exitCode = 0;
+  } catch (error) {
+    fail(error instanceof Error ? error.message : String(error));
+  }
 }

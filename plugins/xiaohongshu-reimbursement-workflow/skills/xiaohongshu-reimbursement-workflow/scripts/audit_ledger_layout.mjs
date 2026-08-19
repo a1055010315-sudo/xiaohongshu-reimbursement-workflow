@@ -1003,6 +1003,14 @@ export async function auditLedgerLayout(options) {
     person: item.person,
     classification: item.classification,
   }));
+  const manifestRowRanges = [];
+  for (let index = 0; index < expected.length; index += 1) {
+    if (expected[index].origin !== "manifest") continue;
+    const row = index + FIRST_DATA_ROW;
+    const prior = manifestRowRanges.at(-1);
+    if (prior && prior.endRow + 1 === row) prior.endRow = row;
+    else manifestRowRanges.push({ startRow: row, endRow: row });
+  }
   const body = {
     kind: "root-workbook-business-audit-v1",
     requiresGate1Binding: true,
@@ -1038,6 +1046,7 @@ export async function auditLedgerLayout(options) {
     projection: {
       baselineRecordCount: baseline.rows.length,
       manifestRecordCount: selectedTransactions.length,
+      manifestRowRanges,
       transactionCount: candidate.rows.length,
       startRow: FIRST_DATA_ROW,
       endRow: candidate.lastRow,

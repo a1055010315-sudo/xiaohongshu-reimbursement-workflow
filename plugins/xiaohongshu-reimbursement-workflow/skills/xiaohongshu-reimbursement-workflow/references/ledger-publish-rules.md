@@ -102,7 +102,7 @@
 
 包装器重载两份工件、当前 preview 字节、plan 和活动候选，任何摘要/路径/修订号/SHA256 不一致都阻塞；还必须在任何恢复或发布动作前从当前活动候选 fresh-rerender 完整 `physicalRange`，逐段比对 Sheet/range/PNG SHA256，不能只相信可手写重算的 Gate 工件。随后以同一组受绑定参数运行 recovery-only 探测，存在 stale journal 时必须在重读旧基线审计之前完成恢复，避免目标已替换后旧基线哈希使恢复入口不可达。无遗留事务才重新执行全量审计并开始新发布；无 journal 但标准目标已等于候选时按 `already_current` 幂等收口。禁止绕过 plan/Gate 工件传自由路径或直接调用 correction 的 `run_safe_publish.mjs`。启动器固定以 `shell: false` 和 `-ExecutionPolicy Bypass` 调用 `safe_publish.ps1`；保留脚本内部的锁、phase journal、崩溃恢复、回滚、临界窗口哈希、备份哈希核验和可恢复原子替换。不直接调用 PowerShell、不编辑根表、不临时拼接含中文绝对路径的 `.ps1`。
 
-脚本返回非零时停止并完整报告恢复信息，不因目标存在或有部分输出声称成功；目标或备份在临界区被外部改变时不得强制覆盖或删除，保留 `preserved_target`/`preserved_backup` 供人工处理。脚本成功后仍须重新打开目标，检查可读性、公式和结构；目标 SHA256 必须与归档候选完全一致。候选快照继续保留为本批提交时的总表快照。
+脚本返回非零时停止并完整报告恢复信息，不因目标存在或有部分输出声称成功；目标或备份在临界区被外部改变时不得强制覆盖或删除，保留 `preserved_target`/`preserved_backup` 供人工处理。脚本成功后仍须重新打开目标，检查可读性、公式和结构；目标 SHA256 必须与归档候选总表完全一致。该候选总表作为本批第三份业务表保留，不再额外生成语义重复的快照文件。
 
 ## 9. 已发布后的纯展示修订
 

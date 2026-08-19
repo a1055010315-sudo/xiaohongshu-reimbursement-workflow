@@ -278,6 +278,28 @@ test("v3 reimbursement closes source coverage and emits normalized classificatio
   ]);
 });
 
+test("v3 enforces the minimal classification boundary without persisting authorization state", async () => {
+  for (const [name, classification] of [
+    ["generic", "人员工资"],
+    ["concrete-project", "上海竞业2"],
+  ]) {
+    const manifest = makeManifest();
+    manifest.transactions[0].classification = classification;
+    const result = runAudit(await writeJson(`classification-${name}.json`, manifest));
+    assert.equal(result.status, 0, JSON.stringify(result.payload));
+    assert.equal(result.payload.normalizedTransactions[0].classification, classification);
+    assert.equal(Object.hasOwn(result.payload.normalizedTransactions[0], "authorization"), false);
+  }
+
+  for (const classification of ["话费", "上海天崇", "东莞柯南"]) {
+    const rejected = makeManifest();
+    rejected.transactions[0].classification = classification;
+    const result = runAudit(await writeJson(`classification-disallowed-${classification}.json`, rejected));
+    assert.equal(result.status, 1);
+    assert.match(result.payload.error, new RegExp(`classification.*${classification}.*expense description.*approved grouping`, "iu"));
+  }
+});
+
 test("v3 reimbursement certificate exposes the exact multi-profile digest preimages", async () => {
   const result = runAudit(await writeJson("certificate-multi-profile.json", makeMultiProfileManifest()));
   assert.equal(result.status, 0, JSON.stringify(result.payload));

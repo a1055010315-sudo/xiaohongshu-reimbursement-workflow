@@ -1,6 +1,6 @@
 {
   "name": "xiaohongshu-reimbursement-workflow",
-  "version": "0.5.0+codex.20260817030646",
+  "version": "0.5.0+codex.20260819121632",
   "description": "Shared profile-driven Xiaohongshu, company, and residence reimbursement workflow with source binding, independent OOXML audit, two approval gates, and recoverable publishing.",
   "author": {
     "name": "a1055010315-sudo",

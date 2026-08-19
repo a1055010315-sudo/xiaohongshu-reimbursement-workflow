@@ -21,7 +21,7 @@ description: "Run or resume the shared Xiaohongshu, company, and residence ordin
 | 微信或聊天材料收集、核对 | [微信证据核对规则](references/wechat-evidence-review.md) |
 | 文字说明、明细、截图归档、对应截图表 | [批次归档与展示规则](references/batch-output-rules.md) |
 | 工作簿构建或验收 | [Excel 整理与验收规则](references/expense-workbook-rules.md) |
-| 普通补报输入 | 使用 `assets/templates/补报明细模板.xlsx`；没有该模板时沿用本次报销明细模板，并补齐相同字段 |
+| 普通补报输入 | 使用代码内置补报视觉合同；模板文件仅可作为迁移/视觉回归夹具，不是运行前置依赖 |
 | 候选总表、两道门禁、发布 | [候选总表与发布规则](references/ledger-publish-rules.md) |
 | 补齐历史遗漏、画布分类标注或修改既有业务字段 | [历史账本业务修正规则](references/ledger-business-correction.md) + [Excel 整理与验收规则](references/expense-workbook-rules.md) + [候选总表与发布规则](references/ledger-publish-rules.md) |
 | 既有总表零增量重排修正 | [Excel 整理与验收规则](references/expense-workbook-rules.md) + [候选总表与发布规则](references/ledger-publish-rules.md) + [批次归档与展示规则](references/batch-output-rules.md) |
@@ -31,14 +31,14 @@ description: "Run or resume the shared Xiaohongshu, company, and residence ordin
 
 ## 2. 业务边界
 
-1. manifest v3 按固定 registry 把交易路由到 `小红书报销`、`公司报销`、`驻所报销`。只为本批实际有交易的 profile 生成正式根表及五类带日期前缀的批次交付物；无交易 profile 不创建空文件、不修改根表。
+1. manifest v3 按固定 registry 把交易路由到 `小红书报销`、`公司报销`、`驻所报销`。只为本批实际有交易的 profile 生成文字说明、三份业务表（本次报销明细、报销明细对应截图表、候选总表）和截图凭证目录；正式根表留在根目录。有补报时额外生成补报表；只有交易在 `evidence` 中另以 `supplementEvidence` 明确列出独立补报专用图片时才创建补报凭证目录，且该交易仍须保留至少一张普通图片凭证。无补报 profile 不创建空补报产物，无交易 profile 不创建空文件、不修改根表。
 2. 三个 canonical 根表/Sheet 分别是 `小红书支出总表.xlsx`/`Sheet1`、`公司支出总表.xlsx`/`公司支出`、`驻所支出.xlsx`/`驻所支出`。`住所` 和 `住所支出.xlsx` 只作 residence 输入别名，输出身份始终 canonical；公司所有未受管 Sheet 必须逐 Part 保持。
 3. 用户明确写出具体单子、项目或业务名称时，相关支出备注归入该名称，不得降级为 `日常报销`；具体规范见 Excel reference。
 4. 金额只用 BigInt milliunits，最多三位小数，工作簿金额与合计统一使用批准的 `0.000`；超过三位小数先确认，禁止 Number 汇总、二进制浮点和静默舍入。
 5. OCR 只辅助定位；原图和用户业务说明才是审计材料。不得覆盖用户原件、历史归档或已验收文件；修正使用 `_修正版N`。
 6. 无法从当前对话和磁盘可靠判断的业务事实才询问。一次合并同阶段疑点，并给每项独立编号；视觉疑点必须附对应图片。
 
-补报输入使用受控的 `assets/templates/补报明细模板.xlsx`。它沿用本次报销明细的版式，并要求记录原始发生日期、补报原因和关联原始凭证/来源编号。模板只是输入载体，不决定金额、来源覆盖、费用组合或根表更新；补报仍走普通批次的完整审计和两道门禁。
+正常的本次报销明细始终使用代码内置 detail 合同。补报由独立的 `getSupplementContract()` 额外生成补报表，并要求记录原始发生日期、补报原因和关联原始凭证/来源编号；不得用补报合同替换正常明细，也不得把补报说明附在正常明细尾部。`supplementEvidence` 只是当前交易 `evidence` 的可选图片子集，不得据此移走或替代普通付款凭证。历史 `.xlsx` 模板只作迁移和视觉回归参考，不决定金额、来源覆盖、费用组合或根表更新；补报仍走普通批次的完整审计和两道门禁。
 
 ## 3. 两道不可省略的门禁
 
@@ -47,7 +47,7 @@ description: "Run or resume the shared Xiaohongshu, company, and residence ordin
 1. `本次报销通过无误`
 2. `确认更新根目录支出总表`
 
-第一道门禁仅在适用模式的完整审阅包和候选快照已展示、路径与 SHA256 已报告后，由用户在一条新消息中发送才有效。普通批次一次确认摘要、明细、图片对应关系和候选内容；重排修正确认范围、排序不变量、全区预览和活动候选。不要增加“摘要自然语言确认”这一第三次等待。普通新任务用 `scripts/build_gate_binding.mjs` context v2 机械绑定 `mode + batchId + factsDigest + operationDigest + candidateRevision + 当前候选绝对路径/SHA256 + reviewPackageDigest + candidatePlanSha256 + sourceCoverageDigest`；context v1 只用于恢复已开始批次。重排修正调用 `scripts/build_ledger_reorder_gate_artifact.mjs --gate gate-1` 时，把 `--preview-index` 传成必须不存在的新输出路径；同一调用按“实时全量审计活动候选 → 从该候选受控分段渲染完整重排区 → 写绑定 `planFileSha256 + 候选规范路径/SHA256` 的严格 v2 索引 → 生成 Gate 1 工件”执行，禁止提供既有索引或外部 PNG。展示该工件返回的绑定预览和 `bindingDigest` 后，精确门禁只接受这个当前任务内的摘要；发布器还必须 fresh-rerender 并逐段比对图片 SHA256。
+第一道门禁仅在适用模式的完整审阅包和候选总表已展示、路径与 SHA256 已报告后，由用户在一条新消息中发送才有效。普通批次一次确认摘要、明细、图片对应关系和候选内容；重排修正确认范围、排序不变量、全区预览和活动候选。不要增加“摘要自然语言确认”这一第三次等待。普通新任务用 `scripts/build_gate_binding.mjs` context v2 机械绑定 `mode + batchId + factsDigest + operationDigest + candidateRevision + 当前候选绝对路径/SHA256 + reviewPackageDigest + candidatePlanSha256 + sourceCoverageDigest`，并为每个 profile 使用恰为 `[profileId]` 的 `affectedProfileIds` 和完整 `previewScopes`：全部 root 段、一个 detail、一个 screenshot；每段绑定 `profileId + role + sheetName + rangeAddress + sourceSha256 + previewSha256`。context v1 只用于恢复已开始批次。重排修正调用 `scripts/build_ledger_reorder_gate_artifact.mjs --gate gate-1` 时，把 `--preview-index` 传成必须不存在的新输出路径；同一调用按“实时全量审计活动候选 → 从该候选受控分段渲染完整重排区 → 写绑定 `planFileSha256 + 候选规范路径/SHA256` 的严格 v2 索引 → 生成 Gate 1 工件”执行，禁止提供既有索引或外部 PNG。展示该工件返回的绑定预览和 `bindingDigest` 后，精确门禁只接受这个当前任务内的摘要；发布器还必须 fresh-rerender 并逐段比对图片 SHA256。
 
 ### 普通批次 Gate 1 展示清单
 
@@ -60,7 +60,7 @@ description: "Run or resume the shared Xiaohongshu, company, and residence ordin
 
 全部受影响 profile 的四项内容、Gate 1 `bindingDigest` 和审阅包摘要均已展示后，才可在回复末尾单独提示 `本次报销通过无误`。任一项漏展示时，即使脚本已经生成 PNG 或返回 `review` 对象，也不得接受这句确认，必须先补齐完整审阅包。
 
-第二道门禁仅在第一道门禁后的独立终审通过、当前候选绝对路径和 SHA256 已报告后，由用户在一条新消息中发送才有效。普通新任务必须在终审后重新生成并展示根表候选、本次报销明细、报销明细对应截图表的独立 Gate 2 预览；预览从已核验的 Gate 1 图像复制到新的受控路径前，逐项重新核对当前源文件 SHA256，Gate 2 聚合摘要绑定新图片 SHA256、其源文件 SHA256 和终审结果。随后再用 `scripts/build_gate_binding.mjs` context v2 绑定 `mode + batchId + operationDigest + candidateRevision + 当前候选绝对路径/SHA256 + 当前基线绝对路径/SHA256 + finalAuditDigest + candidatePlanSha256 + sourceCoverageDigest`。重排修正必须先用 `scripts/build_ledger_reorder_gate_artifact.mjs --gate gate-2` 从同一 v2 plan、当前活动候选和实时终审机械生成 Gate 2 工件，展示其 `bindingDigest` 后再等待精确文本。候选内容、路径、SHA256、修订号、操作摘要、计划摘要、来源覆盖、基线、预览或终审结果任一变化时两道门禁立即失效。新候选必须重新完整展示、重新取得第一道门禁、重新终审，再取得第二道门禁。
+第二道门禁仅在第一道门禁后的独立终审通过、当前候选绝对路径和 SHA256 已报告后，由用户在一条新消息中发送才有效。普通新任务必须在终审后重新生成并展示根表候选、本次报销明细、报销明细对应截图表的独立 Gate 2 预览；复制前逐项重新核对当前源文件 SHA256，并按 `profileId + role + sheetName + rangeAddress + sourceSha256` 与 Gate 1 完整身份配对，禁止依赖数组位置，缺失、重复或陈旧身份均阻塞。Gate 2 继续逐 profile 绑定同一完整 scope 集合和新的 `previewSha256`，聚合摘要绑定新图片 SHA256、其源文件 SHA256 和终审结果。随后再用 `scripts/build_gate_binding.mjs` context v2 绑定 `mode + batchId + operationDigest + candidateRevision + 当前候选绝对路径/SHA256 + 当前基线绝对路径/SHA256 + finalAuditDigest + candidatePlanSha256 + sourceCoverageDigest`。重排修正必须先用 `scripts/build_ledger_reorder_gate_artifact.mjs --gate gate-2` 从同一 v2 plan、当前活动候选和实时终审机械生成 Gate 2 工件，展示其 `bindingDigest` 后再等待精确文本。候选内容、路径、SHA256、修订号、操作摘要、计划摘要、来源覆盖、基线、预览或终审结果任一变化时两道门禁立即失效。新候选必须重新完整展示、重新取得第一道门禁、重新终审，再取得第二道门禁。
 
 Gate 工件只保存可重算的上下文、审计和摘要，不代表用户授权；两句门禁是否已接受及其预期 `bindingDigest` 只保存在当前任务内。重排发布器必须同时验证两份 Gate 工件及当前任务记住的两个摘要，不能仅信工件自带字段，也不能绕过工件直接调用通用发布器。
 
@@ -82,7 +82,7 @@ v2 批次使用首次规范化时分配且后续不变的 `batchId`；以下三�
 
 普通新增只调用 `scripts/run_reimbursement_workflow.mjs`，不手工串接 builder/auditor/publisher：
 
-1. `--prepare <request.json>`：稳定审计 manifest，同时构建所有受影响 profile 的根表候选、本次明细和截图对应表；内部只启动一个 root audit worker 处理 1/2/3 profile。返回 Gate 1 `bindingDigest`，根表仍未修改。
+1. `--prepare <request.json>`：稳定审计 manifest，同时构建所有受影响 profile 的根表候选、本次明细和截图对应表；有补报的 profile 另建补报表。内部只启动一个 root audit worker 处理 1/2/3 profile。返回 Gate 1 `bindingDigest`，根表仍未修改。
 2. 用户在新消息精确发送 `本次报销通过无误` 后，调用 `--finalize <request.json>`；从磁盘 fresh 重读并用一个批量 worker 终审，重新生成并返回当前根表、明细和截图表的 Gate 2 预览及 `bindingDigest`。展示这些预览后才可等待第二道门禁。
 3. 用户在新消息精确发送 `确认更新根目录支出总表` 后，调用 `--publish <request.json>`；同时传入当前任务记住的两份 binding digest 和两句精确文本。发布器 fresh 重验、exclusive 写入、发布后重审；任一 profile 失败时逆序恢复整批。
 
@@ -96,7 +96,7 @@ v2 批次使用首次规范化时分配且后续不变的 `batchId`；以下三�
 
 - 批次身份、registry/profile 配置摘要、规则版本和每个受影响 profile 的基线路径/SHA256；
 - 来源编号、原图或文字路径、SHA256、尺寸、检查状态和图内区域；
-- 稳定 `batchId`、交易 ID、唯一正安全整数 `sourceOrder`、日期、人员、项目、汇总标签、金额、canonical profile/category、最终 `classification`、独立的 `settlement` 结算方式和来源引用；新增记录只能分配新 `sourceOrder`，不能因展示排序重排；负数退款/调整还必须引用同 profile、同类目、同结算方式的正金额来源交易；
+- 稳定 `batchId`、交易 ID、唯一正安全整数 `sourceOrder`、日期、人员、项目、汇总标签、金额、canonical profile/category、最终 `classification`、独立的 `settlement` 结算方式和来源引用；`classification` 可直接使用的通用值仅为 `运营开支`、`日常报销`、`人员工资`、`社保`、`房租`、`广告费`，其他值只能是 manifest 冻结前由用户在当前对话明确指定或确认的具体项目名；`上海天崇`、`东莞柯南` 等主体/地点字面值不是项目名，必须按费用性质归类，本批已确认的东莞柯南地址费归 `日常报销`；不得把授权写入 manifest 或另建授权状态；新增记录只能分配新 `sourceOrder`，不能因展示排序重排；负数退款/调整还必须引用同 profile、同类目、同结算方式的正金额来源交易；
 - v3 的来源范围、末端确认和每个来源单元的唯一处置；每个单元只能是已关联交易、已唯一存在于对应 profile 基线或有明确排除原因，禁止把其他受支持 profile 当作“非目标”排除，也禁止裸行号排除。`sourceCoverageDigest` 与交易事实摘要分开计算；
 - 当前 `reviewRevision` 和操作配置；候选的 `candidateRevision` 在 `artifact-index.json` 维护，普通批次首次候选为 1，每生成一个新字节版本单调递增。`ledger-reorder-correction` 的 manifest operation 还必须记录 `candidateRevision`、`planFileSha256`、精确重排范围/日期边界、`date:asc + baselineOrder:asc` 排序键、每条记录的基线顺序号、逻辑记录数与物理记录行数、`expectedAmountDelta: "0"`、基线与当前/被替代候选路径及 SHA256；首版使用 `supersedes: null`，后续修订必须指向唯一被替代候选。候选绑定由机械计划和构建结果写入，禁止手工补写。
 
@@ -105,6 +105,7 @@ v2 批次使用首次规范化时分配且后续不变的 `batchId`；以下三�
 ### 失效规则
 
 - 每次恢复任务都重新枚举精确材料目录并比较路径、大小和 SHA256；只重新打开新增或内容变化的材料，未变化文件复用既有完整视觉核验结果。
+- manifest audit 与 artifact build 必须共享同一 EvidenceCache；每张唯一来源图片在两阶段合计只允许一次物理读取，缓存容量不足时阻塞而不是淘汰后重读。只改变 `classification` 等交易事实时只失效 artifact/preview 下游，不失效或重跑 evidence-scan。
 - 用户纠正人员、项目、日期、金额、类目、`settlement` 结算方式或证据归属时，只失效受影响交易及全部下游输出；第一道门禁后发生任何业务修正时，两道门禁和终审全部失效。
 - 画布标注先汇总为累积补丁集。每个新候选都从同一绑定根表基线 + 完整 manifest + 全部补丁重建，禁止在上一候选上继续打补丁；行号只定位，修改前完整业务指纹不匹配时阻塞。
 - 摘要、逐笔对应表、金额、缺图说明或其他用户可见审阅内容变化时递增 `reviewRevision`；第一道门禁只绑定用户最后完整看到的 revision。
@@ -161,7 +162,7 @@ v2 批次使用首次规范化时分配且后续不变的 `batchId`；以下三�
 
 ## 9. 阶段 B：一次构建、一次验收
 
-按批次归档 reference 生成：摘要预览、每个受影响 profile 的按人员连续分区本次明细、原图归档和带嵌入图片的对应截图表。人员分区只是明细展示结构，分区标题和空白分隔行不是交易，不得进入候选或根表。最终归档不得出现内部 manifest、验收证书、预览、日志或差异说明。
+按批次归档 reference 生成：摘要预览、每个受影响 profile 的按人员连续分区本次明细、原图归档和带嵌入图片的对应截图表；有补报时另建补报表。人员分区只是明细展示结构，分区标题和空白分隔行不是交易，不得进入候选或根表。最终归档不得出现空补报产物、内部 manifest、验收证书、预览、日志或差异说明。
 
 同一构建进程可批量生成所有阶段 B 工作簿；同一语义验证进程各打开一次；同一视觉进程只渲染有界实际数据区。同一阶段、同一工作簿字节版本内，每张来源图只读取、解码和登记一次；独立重开验证仍可读取已打包媒体，业务行不得因图片 SHA256 相同而删除。
 
@@ -207,6 +208,6 @@ v2 批次使用首次规范化时分配且后续不变的 `batchId`；以下三�
 
 ## 13. 最终报告与清理
 
-最终只报告用户需要判断的结果：批次和各 profile 归档路径、五类交付物、费用/实报/不实报金额、profile 隔离结果、明细行数、截图数、对应表 Sheet 与图片实例数、候选和根表路径、两道门禁状态、发布后 SHA256，以及临时内容是否清理。
+最终只报告用户需要判断的结果：批次和各 profile 归档路径、文字说明、三份业务表、截图凭证目录、条件补报产物、费用/实报/不实报金额、profile 隔离结果、明细行数、截图数、对应表 Sheet 与图片实例数、候选和根表路径、两道门禁状态、发布后 SHA256，以及临时内容是否清理。
 
 只清理由本任务创建且确认无用的专用临时内容。不得删除用户原件、归档交付物、历史文件、依赖 skill 或归属不明内容。按运行可靠性 reference 调用 `scripts/cleanup_task_temp.mjs`；清理器拒绝时保留现场并报告精确路径和原因。
