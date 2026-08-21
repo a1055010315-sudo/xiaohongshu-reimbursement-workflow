@@ -30,13 +30,24 @@
     "skillValidation": "Skill is valid!",
     "nodeScriptCount": 25,
     "powerShellScriptCount": 2,
-    "approvedTemplateCount": 6,
+    "templateCount": 5,
+    "templateManifestCount": 1,
+    "approvedTemplateAssetCount": 6,
     "testsPackaged": 18,
     "testSummary": "346 tests: 344 passed, 0 failed, 2 conditional skips"
+  },
+  "testEvidence": {
+    "runner": "Node.js v24.19.0",
+    "execution": "all 18 test files executed sequentially with the bundled runtime",
+    "runtimeTreeSha256": "2188793cf320dfece7289b719fbaaefecdc3949aff411c3ad2a8088b62c92ef5",
+    "summary": "346 tests: 344 passed, 0 failed, 2 conditional skips"
   },
   "performance": {
     "baselineVersion": "0.5.0+codex.20260819174146",
     "protocol": "same-host synthetic batch, alternating 7x7 medians; new finalize includes full-correspondence Gate 2",
+    "reportGeneratedAt": "2026-08-21T06:51:01.477Z",
+    "performanceReportSha256": "0704647da31cd9b60967ad6173ff89219f54a94dbe06c90dd5bd337d801138cc",
+    "measuredRuntimeTreeSha256": "2188793cf320dfece7289b719fbaaefecdc3949aff411c3ad2a8088b62c92ef5",
     "coldSpeedupPercent": 32.515,
     "hotSpeedupPercent": 32.081
   },
