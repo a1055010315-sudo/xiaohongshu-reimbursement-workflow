@@ -107,11 +107,14 @@ async function auditManifest(manifestPath, extraArgs = []) {
   return JSON.parse(child.stdout.trim());
 }
 
-function pngBytes(width = 900, height = 600) {
-  const bytes = Buffer.alloc(1200, 0); Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]).copy(bytes); bytes.writeUInt32BE(width, 16); bytes.writeUInt32BE(height, 20); return bytes;
+async function pngBytes(width = 900, height = 600) {
+  const svg = Buffer.from(`<svg width="${width}" height="${height}" xmlns="http://www.w3.org/2000/svg"><rect width="100%" height="100%" fill="white"/><path d="M0 0L${width} ${height}M0 ${height}L${width} 0" stroke="#204060" stroke-width="12"/><rect x="80" y="60" width="${width - 160}" height="${height - 120}" fill="none" stroke="#d04040" stroke-width="8"/></svg>`, "utf8");
+  return sharp(svg).png().toBuffer();
 }
 
 async function previewRenderer({ request, requestFileSha256 }) {
+  assert.equal(request.kind, "ordinary-reimbursement-preview-request-v2");
+  assert.match(request.bindingDigest, /^[0-9a-f]{64}$/u);
   assert.equal(request.bindings.length * 3, request.jobs.length);
   for (const binding of request.bindings) {
     assert.match(binding.candidateSha256, /^[0-9a-f]{64}$/u);
@@ -122,10 +125,25 @@ async function previewRenderer({ request, requestFileSha256 }) {
   }
   const previews = [];
   for (const job of request.jobs) {
-    const bytes = pngBytes(); await fs.writeFile(job.outputPath, bytes, { flag: "wx" });
-    previews.push({ profileId: job.profileId, role: job.role, workbookSha256: job.workbookSha256, outputPath: job.outputPath, sha256: sha256Bytes(bytes), size: bytes.length });
+    const bytes = await pngBytes(); await fs.writeFile(job.outputPath, bytes, { flag: "wx" });
+    previews.push({
+      profileId: job.profileId,
+      role: job.role,
+      workbookSha256: job.workbookSha256,
+      sheetName: job.sheetName,
+      rangeAddress: job.rangeAddress,
+      candidateSha256: job.candidateSha256,
+      planSha256: job.planSha256,
+      sourceCoverageDigest: job.sourceCoverageDigest,
+      batchRows: [...job.batchRows],
+      bindingDigest: job.bindingDigest,
+      outputPath: job.outputPath,
+      sha256: sha256Bytes(bytes),
+      size: bytes.length,
+      renderAttempts: 1,
+    });
   }
-  return { kind: "ordinary-reimbursement-preview-response-v1", requestNonce: request.requestNonce, requestFileSha256, enginePeakWorkingSetBytes: 1_000_000, previews };
+  return { kind: "ordinary-reimbursement-preview-response-v2", requestNonce: request.requestNonce, requestFileSha256, bindingDigest: request.bindingDigest, enginePeakWorkingSetBytes: 1_000_000, previews };
 }
 
 test("minimal ordinary workflow uses manifest v3, local ledger patch, batch previews, supplements, and clean archive", async () => {
@@ -139,17 +157,27 @@ test("minimal ordinary workflow uses manifest v3, local ledger patch, batch prev
     const suffix = "（含人员乙2031.2.20补报1笔23.45元、人员丙2031.3.3补报1笔6.78元）";
     const archivePath = path.join(temp, `2031.4.10-2031.4.15_小红书报销${suffix}`);
     const manifest = makeManifest(temp, archivePath, baseline, contextImage, voucherImage);
+    manifest.batch.summaryAnnotations = [{
+      profileId: "xiaohongshu",
+      person: "人员甲",
+      kind: "commission",
+      period: { start: "2031-03-01", end: "2031-03-31" },
+      amount: "12.34",
+      transactionIds: ["TX-001"],
+      sourceRefs: ["UNIT-1"],
+    }];
     const manifestPath = path.join(temp, "manifest.json");
     const manifestBytes = Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`, "utf8");
     await fs.writeFile(manifestPath, manifestBytes, { flag: "wx" });
     const audited = await auditManifest(manifestPath);
-    assert.equal(audited.validatorVersion, "5");
+    assert.equal(audited.validatorVersion, "6");
     assert.equal(audited.fileVerificationMode, "manifest-auditor");
     const deferredAudit = await auditManifest(manifestPath, ["--defer-ordinary-file-verification"]);
     assert.equal(deferredAudit.fileVerificationMode, "bound-builders");
     assert.deepEqual(audited.batch.mainPeriod, { start: "2031-04-10", end: "2031-04-15" });
     assert.equal(audited.normalizedTransactions[1].reportingKind, "supplement");
     assert.equal(audited.reimbursementFactsCertificate.factsPreimage.expectedTotals.uniqueMediaCount, 2);
+    assert.deepEqual(audited.reimbursementFactsCertificate.factsPreimage.summaryAnnotations, manifest.batch.summaryAnnotations);
 
     const presentation = await buildReimbursementArtifacts({ kind: "reimbursement-artifact-build-request-v1", stagingToken: crypto.randomBytes(32).toString("hex"), manifestPath, manifestSha256: sha256Bytes(manifestBytes), reimbursementFactsCertificate: audited.reimbursementFactsCertificate });
     taskRoots.push(presentation.stagingRoot);
@@ -162,6 +190,12 @@ test("minimal ordinary workflow uses manifest v3, local ledger patch, batch prev
     assert.equal(product.screenshot.imageCount, 2, "context evidence must be displayed only once");
     assert.equal(product.evidenceArchive.length, 2);
     assert.match(product.evidenceArchive[0].finalName, /^001_人员甲_当期费用_12.34_2031-04-10/u);
+    assert.match(product.summary.text, /^2031年4月10日—2031年4月15日小红书报销\n\n/u);
+    assert.match(product.summary.text, /人员甲：12.34元（含2031.3.1-2031.3.31引流提成12.34元）/u);
+    assert.match(product.summary.text, /人员乙：23.45元（含2031.2.20补报1笔23.45元）/u);
+    assert.doesNotMatch(product.summary.text, /<[^>]+>|填写规则/u);
+    assert.match(product.summary.templateSha256, /^[0-9a-f]{64}$/u);
+    assert.equal(product.summary.annotationCount, 1);
 
     const root = await buildRootWorkbookCandidates({ kind: "root-workbook-build-request-v1", stagingToken: crypto.randomBytes(32).toString("hex"), reimbursementFactsCertificate: audited.reimbursementFactsCertificate, artifacts: [{ profileId: "xiaohongshu", baselinePath: baseline.path, baselineSha256: baseline.sha256, baselineSize: baseline.size, candidateRevision: 1 }] });
     taskRoots.push(root.stagingRoot);
@@ -188,8 +222,82 @@ test("minimal ordinary workflow uses manifest v3, local ledger patch, batch prev
     const rootPreview = gate1.review[0].previews.find((item) => item.role === "root");
     assert.equal(rootPreview.rangeAddress, "A1:F4");
     assert.doesNotMatch(rootPreview.rangeAddress, /1363/u);
-    const gate2 = await finalizeReimbursementWorkflow({ statePath: gate1.statePath, expectedGate1BindingDigest: gate1.gate1BindingDigest, approvalText: "本次报销通过无误" });
-    const receipt = await publishReimbursementWorkflow({ statePath: gate2.statePath, expectedGate1BindingDigest: gate1.gate1BindingDigest, gate1ApprovalText: "本次报销通过无误", expectedGate2BindingDigest: gate2.gate2BindingDigest, gate2ApprovalText: "确认更新根目录支出总表" });
+    const independentReview = {
+      kind: "independent-evidence-review-v1",
+      reviewerRunId: crypto.randomBytes(16).toString("hex"),
+      gate1BindingDigest: gate1.gate1BindingDigest,
+      sourceCoverageDigest: audited.sourceCoverageDigest,
+      independence: { performedAfterGate1: true, originalSourcesReadFresh: true, gate1ArtifactsNotUsed: true, observationsNotCopied: true },
+      observations: [
+        { sourceRef: "UNIT-1", fileId: "IMG-CONTEXT", sourceSha256: contextImage.sha256, mediaKind: "image", width: 640, height: 480, facts: [{ transactionId: "TX-001", date: "2031-04-10", person: "人员甲", project: "当期费用", sourceAmount: "12.34" }] },
+        { sourceRef: "UNIT-2", fileId: "IMG-CONTEXT", sourceSha256: contextImage.sha256, mediaKind: "image", width: 640, height: 480, facts: [{ transactionId: "TX-002", date: "2031-02-20", person: "人员乙", project: "补报费用", sourceAmount: "23.45" }] },
+        { sourceRef: "UNIT-3", fileId: "IMG-VOUCHER", sourceSha256: voucherImage.sha256, mediaKind: "image", width: 800, height: 600, facts: [{ transactionId: "TX-003", date: "2031-03-03", person: "人员丙", project: "跨期费用", sourceAmount: "6.78" }] },
+      ],
+      annotationObservations: [{
+        profileId: "xiaohongshu",
+        person: "人员甲",
+        kind: "commission",
+        period: { start: "2031-03-01", end: "2031-03-31" },
+        amount: "12.34",
+        sourceRefs: ["UNIT-1"],
+      }],
+    };
+    const independentReviewBytes = Buffer.from(`${JSON.stringify(independentReview)}\n`, "utf8");
+    const independentReviewPath = path.join(temp, "independent-evidence-review.json");
+    await fs.writeFile(independentReviewPath, independentReviewBytes, { flag: "wx" });
+    const gate2 = await finalizeReimbursementWorkflow({
+      statePath: gate1.statePath,
+      expectedGate1BindingDigest: gate1.gate1BindingDigest,
+      approvalText: "本次报销通过无误",
+      independentEvidenceReviewPath: independentReviewPath,
+      independentEvidenceReviewSha256: sha256Bytes(independentReviewBytes),
+    });
+    const publishRequest = { statePath: gate2.statePath, expectedGate1BindingDigest: gate1.gate1BindingDigest, gate1ApprovalText: "本次报销通过无误", expectedGate2BindingDigest: gate2.gate2BindingDigest, gate2ApprovalText: "确认更新根目录支出总表" };
+
+    const originalCopyFile = fs.copyFile;
+    let copyAttempt = 0;
+    try {
+      fs.copyFile = async (...args) => {
+        copyAttempt += 1;
+        const attempt = copyAttempt;
+        await new Promise((resolve) => setTimeout(resolve, attempt === 1 ? 1 : 15));
+        if (attempt === 1) throw new Error("synthetic archive copy failure");
+        return originalCopyFile.call(fs, ...args);
+      };
+      await assert.rejects(publishReimbursementWorkflow(publishRequest), /synthetic archive copy failure/u);
+    } finally {
+      fs.copyFile = originalCopyFile;
+    }
+    assert.ok(copyAttempt > 1, "archive copy siblings must settle before failure cleanup");
+    await assert.rejects(fs.access(archivePath), /ENOENT/u);
+    assert.equal(sha256Bytes(await fs.readFile(baseline.path)), baseline.sha256, "archive preparation failure must not publish the ledger");
+
+    const originalOpen = fs.open;
+    let backupFailureInjected = false;
+    try {
+      fs.open = async (filePath, flags, ...rest) => {
+        const handle = await originalOpen.call(fs, filePath, flags, ...rest);
+        if (backupFailureInjected || flags !== "wx" || !/^\.rollback-[^-]+-[0-9a-f]+\.xlsx$/u.test(path.basename(String(filePath)))) return handle;
+        backupFailureInjected = true;
+        return {
+          writeFile: async () => {
+            await handle.writeFile(Buffer.from("owned partial rollback", "utf8"));
+            throw new Error("synthetic partial rollback backup failure");
+          },
+          sync: handle.sync.bind(handle),
+          close: handle.close.bind(handle),
+        };
+      };
+      await assert.rejects(publishReimbursementWorkflow(publishRequest), /synthetic partial rollback backup failure/u);
+    } finally {
+      fs.open = originalOpen;
+    }
+    assert.equal(backupFailureInjected, true);
+    assert.equal((await fs.readdir(path.dirname(gate2.statePath))).some((name) => name.startsWith(".rollback-")), false);
+    await assert.rejects(fs.access(archivePath), /ENOENT/u);
+    assert.equal(sha256Bytes(await fs.readFile(baseline.path)), baseline.sha256, "rollback backup failure must not publish the ledger");
+
+    const receipt = await publishReimbursementWorkflow(publishRequest);
     assert.equal(receipt.outputs.length, 1);
     const archiveNames = (await fs.readdir(archivePath)).sort();
     assert.equal(archiveNames.includes("01_小红书专项"), false);
@@ -226,6 +334,85 @@ test("manifest v3 rejects rounded source amounts and incomplete expected image c
   }
 });
 
+test("summary annotations strictly bind kind, reimbursement amount, transactions, and source refs", async () => {
+  const temp = await fs.mkdtemp(path.join(os.tmpdir(), "codex-xhs-summary-annotations-"));
+  const taskRoots = [];
+  try {
+    const baseline = await makeBaseline(path.join(temp, "小红书支出总表.xlsx"));
+    const context = await writeFixture(temp, "context.jpg", jpegWithoutEoi(32, 24, 3));
+    const voucher = await writeFixture(temp, "voucher.jpg", jpegWithoutEoi(36, 28, 4));
+    const manifest = makeManifest(temp, path.join(temp, "archive"), baseline, context, voucher);
+    manifest.batch.summaryAnnotations = [{
+      profileId: "xiaohongshu",
+      person: "人员甲",
+      kind: "commission",
+      period: { start: "2031-03-01", end: "2031-03-31" },
+      amount: "12.34",
+      transactionIds: ["TX-001"],
+      sourceRefs: ["UNIT-1"],
+    }, {
+      profileId: "xiaohongshu",
+      person: "人员乙",
+      kind: "bonus",
+      period: { start: "2031-02-01", end: "2031-02-28" },
+      amount: "23.45",
+      transactionIds: ["TX-002"],
+      sourceRefs: ["UNIT-2"],
+    }, {
+      profileId: "xiaohongshu",
+      person: "人员丙",
+      kind: "allowance",
+      period: { start: "2031-03-03", end: "2031-03-03" },
+      amount: "6.78",
+      transactionIds: ["TX-003"],
+      sourceRefs: ["UNIT-3"],
+    }];
+    const validPath = path.join(temp, "valid.json");
+    const validBytes = Buffer.from(`${JSON.stringify(manifest)}\n`, "utf8");
+    await fs.writeFile(validPath, validBytes, { flag: "wx" });
+    const valid = await auditManifest(validPath);
+    assert.deepEqual(valid.summaryAnnotations, manifest.batch.summaryAnnotations);
+    assert.deepEqual(valid.reimbursementFactsCertificate.factsPreimage.summaryAnnotations, manifest.batch.summaryAnnotations);
+    const built = await buildReimbursementArtifacts({
+      kind: "reimbursement-artifact-build-request-v1",
+      stagingToken: crypto.randomBytes(32).toString("hex"),
+      manifestPath: validPath,
+      manifestSha256: sha256Bytes(validBytes),
+      reimbursementFactsCertificate: valid.reimbursementFactsCertificate,
+    });
+    taskRoots.push(built.stagingRoot);
+    assert.match(built.artifacts[0].summary.text, /人员甲：12\.34元（含2031\.3\.1-2031\.3\.31引流提成12\.34元）/u);
+    assert.match(built.artifacts[0].summary.text, /人员乙：23\.45元（含2031\.2\.1-2031\.2\.28奖金23\.45元、含2031\.2\.20补报1笔23\.45元）/u);
+    assert.match(built.artifacts[0].summary.text, /人员丙：6\.78元（含2031\.3\.3补贴6\.78元、含2031\.3\.3补报1笔6\.78元）/u);
+    assert.equal(built.artifacts[0].summary.annotationCount, 3);
+    assert.equal(built.artifacts[0].summary.annotationDigest, canonicalDigest(manifest.batch.summaryAnnotations));
+
+    const without = structuredClone(manifest);
+    without.batch.summaryAnnotations = [];
+    const withoutPath = path.join(temp, "without.json");
+    await fs.writeFile(withoutPath, `${JSON.stringify(without)}\n`, { flag: "wx" });
+    const withoutAudit = await auditManifest(withoutPath);
+    assert.notEqual(valid.factsDigest, withoutAudit.factsDigest, "annotations must change certificate factsDigest");
+
+    for (const [name, mutate, message] of [
+      ["amount", (copy) => { copy.batch.summaryAnnotations[0].amount = "10"; }, /amount must equal the reimbursementAmount total/u],
+      ["source", (copy) => { copy.batch.summaryAnnotations[0].sourceRefs = ["UNIT-2"]; }, /sourceRefs must exactly equal/u],
+      ["kind", (copy) => { copy.batch.summaryAnnotations[0].kind = "free-form"; }, /kind must be commission, bonus, or allowance/u],
+    ]) {
+      const invalid = structuredClone(manifest);
+      mutate(invalid);
+      const invalidPath = path.join(temp, `invalid-${name}.json`);
+      await fs.writeFile(invalidPath, `${JSON.stringify(invalid)}\n`, { flag: "wx" });
+      const child = spawnSync(process.execPath, [manifestAuditor, invalidPath], { encoding: "utf8" });
+      assert.equal(child.status, 1);
+      assert.match(child.stderr, message);
+    }
+  } finally {
+    await Promise.all(taskRoots.map((taskRoot) => fs.rm(taskRoot, { recursive: true, force: true })));
+    await fs.rm(temp, { recursive: true, force: true });
+  }
+});
+
 test("a batch without supplements emits no empty parentheses or supplement workbooks", async () => {
   const temp = await fs.mkdtemp(path.join(os.tmpdir(), "codex-xhs-no-supplement-"));
   const taskRoots = [];
@@ -237,8 +424,8 @@ test("a batch without supplements emits no empty parentheses or supplement workb
     manifest.files = [manifest.files[0], { ...manifest.files[1], usage: "voucher" }];
     manifest.sourceScopes = [{ id: "SCOPE-CONTEXT", fileId: "IMG-CONTEXT", locator: "full-image", terminalConfirmed: true, expectedUnitCount: 1 }];
     manifest.sourceUnits = [{ id: "UNIT-1", scopeId: "SCOPE-CONTEXT", locator: "row-1", disposition: "used" }];
-    manifest.transactions = [manifest.transactions[0]];
-    manifest.expected = { transactionCount: 1, feeTotal: "12.34", reimbursementTotal: "12.34", companyPaidNoReimbursementTotal: "0", uniqueMediaCount: 1, mediaReferenceCount: 1 };
+    manifest.transactions = [{ ...manifest.transactions[0], reimbursementAmount: "10" }];
+    manifest.expected = { transactionCount: 1, feeTotal: "12.34", reimbursementTotal: "10", companyPaidNoReimbursementTotal: "0", uniqueMediaCount: 1, mediaReferenceCount: 1 };
     const manifestPath = path.join(temp, "manifest.json");
     const bytes = Buffer.from(`${JSON.stringify(manifest)}\n`, "utf8"); await fs.writeFile(manifestPath, bytes, { flag: "wx" });
     const audited = await auditManifest(manifestPath);
@@ -247,8 +434,93 @@ test("a batch without supplements emits no empty parentheses or supplement workb
     const product = result.artifacts[0];
     assert.equal(product.supplementSuffix, "");
     assert.deepEqual(product.supplements, []);
+    assert.match(product.summary.text, /人员甲：10元/u);
+    assert.match(product.summary.text, /实报合计：10元/u);
+    assert.doesNotMatch(product.summary.text, /人员甲：12.34元/u);
+    assert.doesNotMatch(product.summary.text, /（含.*补报/u);
     assert.doesNotMatch(path.basename(product.detail.path), /（）/u);
     assert.doesNotMatch(path.basename(product.summary.path), /（）/u);
+    const detailZip = await JSZip.loadAsync(await fs.readFile(product.detail.path));
+    const detailSheet = await detailZip.file("xl/worksheets/sheet1.xml").async("string");
+    assert.match(detailSheet, /主期：2031\.4\.10-2031\.4\.15｜补报：无补报｜对公已付不实报单列/u);
+    assert.match(detailSheet, /补报（0笔）/u);
+    assert.match(detailSheet, /<sheetView workbookViewId="0" showGridLines="0">/u);
+    assert.match(detailSheet, /说明：本表按人员分类；主期1笔；无补报；主期与补报分开标注；凭证对应关系详见截图表。/u);
+    assert.doesNotMatch(detailSheet, /（）/u);
+  } finally {
+    await Promise.all(taskRoots.map((taskRoot) => fs.rm(taskRoot, { recursive: true, force: true })));
+    await fs.rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("detail and supplement artifacts keep source amounts separate from reimbursement totals", async () => {
+  const temp = await fs.mkdtemp(path.join(os.tmpdir(), "codex-xhs-independent-amounts-"));
+  const taskRoots = [];
+  try {
+    const baseline = await makeBaseline(path.join(temp, "小红书支出总表.xlsx"));
+    const context = await writeFixture(temp, "context.jpg", jpegWithoutEoi(120, 90, 11));
+    const voucher = await writeFixture(temp, "voucher.jpg", jpegWithoutEoi(140, 100, 13));
+    const manifest = makeManifest(temp, path.join(temp, "archive"), baseline, context, voucher);
+    manifest.batch.summaryAnnotations = [];
+    manifest.transactions[0].reimbursementAmount = "10";
+    manifest.transactions[1].reimbursementAmount = "20";
+    manifest.transactions[2].reimbursementAmount = "5";
+    manifest.expected.reimbursementTotal = "35";
+    const manifestPath = path.join(temp, "manifest.json");
+    const bytes = Buffer.from(`${JSON.stringify(manifest)}\n`, "utf8");
+    await fs.writeFile(manifestPath, bytes, { flag: "wx" });
+    const audited = await auditManifest(manifestPath);
+    assert.deepEqual(audited.reimbursementFactsCertificate.factsPreimage.summaryAnnotations, []);
+    assert.equal(audited.reimbursementFactsCertificate.factsPreimage.expectedTotals.feeTotal, "42.57");
+    assert.equal(audited.reimbursementFactsCertificate.factsPreimage.expectedTotals.realTotal, "35");
+
+    const result = await buildReimbursementArtifacts({
+      kind: "reimbursement-artifact-build-request-v1",
+      stagingToken: crypto.randomBytes(32).toString("hex"),
+      manifestPath,
+      manifestSha256: sha256Bytes(bytes),
+      reimbursementFactsCertificate: audited.reimbursementFactsCertificate,
+    });
+    taskRoots.push(result.stagingRoot);
+    const product = result.artifacts[0];
+    assert.deepEqual(product.detail.totals, {
+      sourceAmount: "42.57",
+      reimbursementAmount: "35",
+      companyPaidNoReimbursementAmount: "0",
+    });
+    assert.equal(product.summary.annotationCount, 0);
+    assert.match(product.summary.text, /人员甲：10元/u);
+    assert.match(product.summary.text, /人员乙：20元/u);
+    assert.match(product.summary.text, /人员丙：5元/u);
+    assert.doesNotMatch(product.summary.text, /引流提成|奖金|补贴/u);
+
+    const detailZip = await JSZip.loadAsync(await fs.readFile(product.detail.path));
+    const detailSheet = await detailZip.file("xl/worksheets/sheet1.xml").async("string");
+    assert.match(detailSheet, /<c r="A4"[^>]*><v>10<\/v><\/c>/u, "main-period reimbursement card must be a literal bound value");
+    assert.match(detailSheet, /<c r="C4"[^>]*><v>25<\/v><\/c>/u, "supplement reimbursement card must be a literal bound value");
+    assert.match(detailSheet, /<c r="E4"[^>]*><f>A4\+C4<\/f><v>35<\/v><\/c>/u, "reimbursement total formula/cache must bind both reimbursement cards");
+    assert.match(detailSheet, /<c r="A5"[^>]*>.*对公已付不实报：0/su);
+    assert.match(detailSheet, /<c r="D5"[^>]*>.*费用合计：42\.57/su);
+    assert.match(detailSheet, /<c r="C3"[^>]*>.*补报（2笔）/su);
+    assert.match(detailSheet, /<c r="F6"[^>]*>.*报销属性/su);
+    assert.match(detailSheet, /<c r="E7"[^>]*>.*人员小计/su, "employee group must use the prior-period personnel subtotal label");
+    assert.match(detailSheet, /<row r="13" ht="28"[^>]*>.*<c r="A13"[^>]*>.*说明：本表按人员分类；主期1笔；补报：人员乙1笔、人员丙1笔；主期与补报分开标注；凭证对应关系详见截图表。.*<\/row>/su, "detail must end with a dynamic merged 28pt description row");
+    assert.match(detailSheet, /<mergeCell ref="A13:F13"\/>/u);
+    assert.match(detailSheet, /<sheetView workbookViewId="0" showGridLines="0">/u);
+    for (const amount of ["12.34", "23.45", "6.78"]) assert.match(detailSheet, new RegExp(`<c r="C\\d+"[^>]*><v>${amount.replace(".", "\\.")}<\\/v><\\/c>`, "u"));
+
+    const personSupplement = product.supplements.find((item) => item.person === "人员乙");
+    assert.equal(personSupplement.sourceAmount, "23.45");
+    assert.equal(personSupplement.reimbursementAmount, "20");
+    const supplementZip = await JSZip.loadAsync(await fs.readFile(personSupplement.path));
+    const supplementWorkbook = await supplementZip.file("xl/workbook.xml").async("string");
+    assert.match(supplementWorkbook, /<sheet name="人员乙补报明细"/u);
+    const supplementSheet = await supplementZip.file("xl/worksheets/sheet1.xml").async("string");
+    assert.match(supplementSheet, /补报实报合计：20元｜费用合计：23\.45元｜共1笔/u);
+    assert.match(supplementSheet, /<c r="C5"[^>]*><v>23\.45<\/v><\/c>/u);
+    assert.match(supplementSheet, /<c r="F5"[^>]*>.*实报/su);
+    assert.match(supplementSheet, /<row r="6" ht="28"[^>]*>.*补报总计.*<c r="C6"[^>]*><f>SUM\(C5:C5\)<\/f><v>23\.45<\/v><\/c>/su);
+    assert.match(supplementSheet, /<mergeCell ref="A6:B6"\/><mergeCell ref="C6:F6"\/>/u);
   } finally {
     await Promise.all(taskRoots.map((taskRoot) => fs.rm(taskRoot, { recursive: true, force: true })));
     await fs.rm(temp, { recursive: true, force: true });
@@ -355,8 +627,12 @@ test("48-transaction synthetic stress fixture preserves supplements and 56/58 ev
     assert.equal(product.supplements.length, 2);
     assert.equal(product.supplementSuffix, "（含人员乙2031.2.1-2031.2.21补报21笔2429.56元、人员丙2031.3.3补报1笔456.78元）");
     assert.match(product.summary.text, /无截图说明：人员乙-项目乙汇总费用-234.56元/u);
+    assert.match(product.summary.text, /人员丁对公已付不实报：1700元/u);
+    assert.match(product.summary.text, /实报合计：4810.68元/u);
     const detailZip = await JSZip.loadAsync(await fs.readFile(product.detail.path));
-    assert.match(await detailZip.file("xl/worksheets/sheet1.xml").async("string"), /合成电费/u);
+    const detailSheet = await detailZip.file("xl/worksheets/sheet1.xml").async("string");
+    assert.match(detailSheet, /合成电费/u);
+    assert.match(detailSheet, /对公费用合计/u);
     const root = await buildRootWorkbookCandidates({ kind: "root-workbook-build-request-v1", stagingToken: crypto.randomBytes(32).toString("hex"), reimbursementFactsCertificate: audited.reimbursementFactsCertificate, artifacts: [{ profileId: "xiaohongshu", baselinePath: baseline.path, baselineSha256: baseline.sha256, baselineSize: baseline.size, candidateRevision: 1 }] });
     taskRoots.push(root.stagingRoot);
     assert.equal(root.artifacts[0].audit.projection.batchRowCount, 48);
@@ -368,9 +644,110 @@ test("48-transaction synthetic stress fixture preserves supplements and 56/58 ev
   }
 });
 
+test("generated artifacts preserve zero through three money decimals and dynamic screenshot layout", async () => {
+  const temp = await fs.mkdtemp(path.join(os.tmpdir(), "codex-xhs-money-layout-"));
+  const taskRoots = [];
+  try {
+    const baseline = await makeBaseline(path.join(temp, "小红书支出总表.xlsx"));
+    const image = await writeFixture(temp, "vertical-context.jpg", jpegWithoutEoi(640, 1280, 17));
+    const manifest = makeManifest(temp, path.join(temp, "archive"), baseline, image, image);
+    const amounts = ["1", "2.3", "4.56", "7.891"];
+    manifest.batch.summaryAnnotations = [];
+    manifest.files = [manifest.files[0], fileEntry("IMG-CONTEXT", "material", image, { kind: "image", disposition: "used", usage: "context" })];
+    manifest.sourceScopes = [{ id: "SCOPE-CONTEXT", fileId: "IMG-CONTEXT", locator: "full-image", terminalConfirmed: true, expectedUnitCount: 4 }];
+    manifest.sourceUnits = amounts.map((_, index) => ({ id: `UNIT-${index + 1}`, scopeId: "SCOPE-CONTEXT", locator: `row-${index + 1}`, disposition: "used" }));
+    manifest.transactions = amounts.map((sourceAmount, index) => ({
+      id: `TX-P${index + 1}`,
+      sourceOrder: index + 1,
+      date: `2031-02-0${index + 1}`,
+      person: "精度人员",
+      project: `精度项目${index + 1}`,
+      label: "精度人员",
+      classification: "精度分类",
+      sourceAmount,
+      reimbursementAmount: sourceAmount,
+      reportingKind: "supplement",
+      supplementReason: "精度回归",
+      category: "小红书报销",
+      settlement: "employee_reimbursement",
+      evidence: ["IMG-CONTEXT"],
+      sourceRefs: [`UNIT-${index + 1}`],
+    }));
+    manifest.expected = { transactionCount: 4, feeTotal: "15.751", reimbursementTotal: "15.751", companyPaidNoReimbursementTotal: "0", uniqueMediaCount: 1, mediaReferenceCount: 4 };
+    const manifestPath = path.join(temp, "manifest.json");
+    const manifestBytes = Buffer.from(`${JSON.stringify(manifest)}\n`, "utf8");
+    await fs.writeFile(manifestPath, manifestBytes, { flag: "wx" });
+    const audited = await auditManifest(manifestPath);
+    const artifacts = await buildReimbursementArtifacts({ kind: "reimbursement-artifact-build-request-v1", stagingToken: crypto.randomBytes(32).toString("hex"), manifestPath, manifestSha256: sha256Bytes(manifestBytes), reimbursementFactsCertificate: audited.reimbursementFactsCertificate });
+    taskRoots.push(artifacts.stagingRoot);
+    const product = artifacts.artifacts[0];
+    const root = await buildRootWorkbookCandidates({ kind: "root-workbook-build-request-v1", stagingToken: crypto.randomBytes(32).toString("hex"), reimbursementFactsCertificate: audited.reimbursementFactsCertificate, artifacts: [{ profileId: "xiaohongshu", baselinePath: baseline.path, baselineSha256: baseline.sha256, baselineSize: baseline.size, candidateRevision: 1 }] });
+    taskRoots.push(root.stagingRoot);
+
+    const styleFormat = (stylesXml, worksheetXml, ref) => {
+      const cell = new RegExp(`<c\\b[^>]*\\br="${ref}"[^>]*>`, "u").exec(worksheetXml)?.[0];
+      assert.ok(cell, `${ref} cell`);
+      const styleId = Number(/\bs="([0-9]+)"/u.exec(cell)?.[1]);
+      const cellXfs = /<(?:[A-Za-z_][\w.-]*:)?cellXfs\b[^>]*>([\s\S]*?)<\/(?:[A-Za-z_][\w.-]*:)?cellXfs>/u.exec(stylesXml)?.[1] ?? "";
+      const xfs = [...cellXfs.matchAll(/<(?:[A-Za-z_][\w.-]*:)?xf\b[^>]*>/gu)].map((match) => match[0]);
+      assert.ok(xfs[styleId], `${ref} style ${styleId}`);
+      const numFmtId = Number(/\bnumFmtId="([0-9]+)"/u.exec(xfs[styleId])?.[1] ?? 0);
+      const formats = new Map([...stylesXml.matchAll(/<(?:[A-Za-z_][\w.-]*:)?numFmt\b[^>]*\bnumFmtId="([0-9]+)"[^>]*\bformatCode="([^"]+)"[^>]*\/>/gu)].map((match) => [Number(match[1]), match[2]]));
+      return formats.get(numFmtId);
+    };
+    const checkMoneyCells = async (filePath, refs) => {
+      const zip = await JSZip.loadAsync(await fs.readFile(filePath));
+      const worksheet = await zip.file("xl/worksheets/sheet1.xml").async("string");
+      const styles = await zip.file("xl/styles.xml").async("string");
+      for (const [ref, value, format] of refs) {
+        assert.match(worksheet, new RegExp(`<c\\b[^>]*\\br="${ref}"[^>]*>[\\s\\S]*?<v>${value.replace(".", "\\.")}<\\/v><\\/c>`, "u"), `${ref} exact value`);
+        assert.equal(styleFormat(styles, worksheet, ref), format, `${ref} number format`);
+      }
+      return { zip, worksheet, styles };
+    };
+
+    const detail = await checkMoneyCells(product.detail.path, [
+      ["C8", "1", "0"], ["C9", "2.3", "0.0"], ["C10", "4.56", "0.00"], ["C11", "7.891", "0.000"], ["E4", "15.751", "0.000"],
+    ]);
+    assert.match(detail.worksheet, /补报（4笔）/u);
+    assert.match(detail.worksheet, /<row r="12" ht="28"[^>]*>.*说明：本表按人员分类；主期0笔；补报：精度人员4笔；主期与补报分开标注；凭证对应关系详见截图表。.*<\/row>/su);
+    assert.match(detail.worksheet, /<mergeCell ref="A12:F12"\/>/u);
+    assert.match(detail.worksheet, /<sheetView workbookViewId="0" showGridLines="0">/u);
+
+    assert.equal(product.supplements.length, 1);
+    assert.equal(product.supplements[0].sheetName, "精度人员补报明细");
+    const supplement = await checkMoneyCells(product.supplements[0].path, [
+      ["C5", "1", "0"], ["C6", "2.3", "0.0"], ["C7", "4.56", "0.00"], ["C8", "7.891", "0.000"], ["C9", "15.751", "0.000"],
+    ]);
+    assert.match(supplement.worksheet, /<row r="9" ht="28"[^>]*>.*补报总计.*<f>SUM\(C5:C8\)<\/f><v>15\.751<\/v>/su);
+    assert.match(supplement.worksheet, /<mergeCell ref="A9:B9"\/><mergeCell ref="C9:F9"\/>/u);
+
+    const screenshot = await checkMoneyCells(product.screenshot.path, [
+      ["D2", "1", "0"], ["D3", "2.3", "0.0"], ["D4", "4.56", "0.00"], ["D5", "7.891", "0.000"],
+    ]);
+    assert.match(screenshot.worksheet, /<sheetView workbookViewId="0" showGridLines="0"\/>/u);
+    assert.match(screenshot.worksheet, /<row r="2" ht="172\.5"/u);
+    for (const row of [3, 4, 5]) assert.match(screenshot.worksheet, new RegExp(`<row r="${row}" ht="60"`, "u"));
+    const drawing = await screenshot.zip.file("xl/drawings/drawing1.xml").async("string");
+    const anchor = /<xdr:from><xdr:col>5<\/xdr:col><xdr:colOff>(\d+)<\/xdr:colOff><xdr:row>1<\/xdr:row><xdr:rowOff>(\d+)<\/xdr:rowOff><\/xdr:from><xdr:ext cx="(\d+)" cy="(\d+)"\/>/u.exec(drawing);
+    assert.ok(anchor, "centered first screenshot anchor");
+    const [colOffPx, rowOffPx, widthPx, heightPx] = anchor.slice(1).map((value) => Number(value) / 9525);
+    assert.ok(widthPx <= 320 && heightPx <= 220 && colOffPx + widthPx <= 320 && rowOffPx + heightPx <= 220, "image must stay inside its manifest box");
+    assert.ok(Math.abs(widthPx / heightPx - 0.5) < 0.01, "image aspect ratio must be preserved");
+
+    const preview = await checkMoneyCells(root.artifacts[0].previewPath, [
+      ["C2", "1", "0"], ["C3", "2.3", "0.0"], ["C4", "4.56", "0.00"], ["C5", "7.891", "0.000"], ["D2", "15.751", "0.000"],
+    ]);
+    for (const row of [2, 3, 4, 5]) assert.match(preview.worksheet, new RegExp(`<row r="${row}" ht="30"`, "u"));
+  } finally {
+    await Promise.all(taskRoots.map((taskRoot) => fs.rm(taskRoot, { recursive: true, force: true })));
+    await fs.rm(temp, { recursive: true, force: true });
+  }
+});
+
 test("sanitized templates contain only static layout and one blank standard data row", async () => {
   const templates = await loadArtifactTemplates();
-  for (const template of Object.values(templates)) {
+  for (const template of [templates.currentDetail, templates.screenshotMap, templates.supplementDetail, templates.ledgerBatchPreview]) {
     const zip = await JSZip.loadAsync(await fs.readFile(template.filePath));
     assert.equal(zip.file("xl/sharedStrings.xml"), null, `${template.id} retained shared strings`);
     const sheet = await zip.file("xl/worksheets/sheet1.xml").async("string");
@@ -380,6 +757,9 @@ test("sanitized templates contain only static layout and one blank standard data
     assert.ok(dataRow);
     assert.doesNotMatch(dataRow, /<(?:\w+:)?(?:v|f|is)\b/iu);
   }
+  assert.equal(templates.summaryText.definition.sha256, templates.summaryText.sha256);
+  assert.match(templates.summaryText.text, /^YYYY年M月D日—YYYY年M月D日小红书报销/u);
+  assert.doesNotMatch(templates.summaryText.text, /20\d{2}-\d{2}-\d{2}|\d+\.\d{2}元/u);
 });
 
 test("image validation accepts decodable JPEG without EOI and rejects structurally forged media", async () => {

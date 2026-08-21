@@ -15,11 +15,12 @@ import {
   readStableUtf8JsonFile,
 } from "./workflow_primitives.mjs";
 
-const VALIDATOR_VERSION = "5";
+const VALIDATOR_VERSION = "6";
 const SHA256_RE = /^[0-9a-f]{64}$/;
 const SETTLEMENTS = new Set(["employee_reimbursement", "company_paid_no_reimbursement"]);
 const ADJUSTMENT_TYPES = new Set(["refund", "adjustment"]);
 const OPERATION_MODES = new Set(["reimbursement-batch", "ledger-reorder-correction"]);
+const SUMMARY_ANNOTATION_KINDS = new Set(["commission", "bonus", "allowance"]);
 
 function fail(message) {
   process.stderr.write(`${JSON.stringify({ ok: false, error: message })}\n`);
@@ -62,6 +63,91 @@ function cleanIsoDate(value, field) {
     throw new Error(`${field} must be a valid ISO date in YYYY-MM-DD form.`);
   }
   return result;
+}
+
+function requireExactKeys(value, keys, field) {
+  requireObject(value, field);
+  for (const key of Object.keys(value)) {
+    if (!keys.has(key)) throw new Error(`${field} contains unknown field ${key}.`);
+  }
+  for (const key of keys) {
+    if (!Object.hasOwn(value, key)) throw new Error(`${field}.${key} is required.`);
+  }
+}
+
+function cleanUniqueStringArray(value, field) {
+  if (!Array.isArray(value) || value.length === 0) throw new Error(`${field} must be a non-empty array.`);
+  const result = value.map((item, index) => cleanString(item, `${field}[${index}]`));
+  if (new Set(result).size !== result.length) throw new Error(`${field} contains duplicate ids.`);
+  return result;
+}
+
+function normalizeSummaryAnnotations(rawAnnotations, transactions) {
+  if (rawAnnotations === undefined) return [];
+  if (!Array.isArray(rawAnnotations)) throw new Error("manifest.batch.summaryAnnotations must be an array.");
+  const transactionById = new Map(transactions.map((transaction) => [transaction.id, transaction]));
+  const usedTransactionIds = new Set();
+  const seenAnnotations = new Set();
+  return rawAnnotations.map((rawAnnotation, index) => {
+    const field = `manifest.batch.summaryAnnotations[${index}]`;
+    const annotation = requireObject(rawAnnotation, field);
+    requireExactKeys(annotation, new Set(["profileId", "person", "kind", "period", "amount", "transactionIds", "sourceRefs"]), field);
+    const profileId = cleanString(annotation.profileId, `${field}.profileId`);
+    const person = cleanString(annotation.person, `${field}.person`);
+    const kind = cleanString(annotation.kind, `${field}.kind`);
+    if (!SUMMARY_ANNOTATION_KINDS.has(kind)) {
+      throw new Error(`${field}.kind must be commission, bonus, or allowance.`);
+    }
+    const rawPeriod = requireObject(annotation.period, `${field}.period`);
+    requireExactKeys(rawPeriod, new Set(["start", "end"]), `${field}.period`);
+    const start = cleanIsoDate(rawPeriod.start, `${field}.period.start`);
+    const end = cleanIsoDate(rawPeriod.end, `${field}.period.end`);
+    if (end < start) throw new Error(`${field}.period.end must not precede start.`);
+    const amount = parseAmount(annotation.amount, `${field}.amount`, { allowNegative: true });
+    const transactionIds = cleanUniqueStringArray(annotation.transactionIds, `${field}.transactionIds`);
+    const sourceRefs = cleanUniqueStringArray(annotation.sourceRefs, `${field}.sourceRefs`).sort((left, right) => left.localeCompare(right));
+    const selected = transactionIds.map((transactionId) => {
+      const transaction = transactionById.get(transactionId);
+      if (!transaction) throw new Error(`${field} references missing transaction ${transactionId}.`);
+      if (usedTransactionIds.has(transactionId)) throw new Error(`Transaction ${transactionId} is used by more than one summary annotation.`);
+      if (transaction.profileId !== profileId || transaction.person !== person) {
+        throw new Error(`${field} transaction ${transactionId} differs from its profile/person binding.`);
+      }
+      if (transaction.settlement !== "employee_reimbursement") {
+        throw new Error(`${field} transaction ${transactionId} must be employee reimbursement.`);
+      }
+      return transaction;
+    });
+    const reimbursementTotal = selected.reduce(
+      (sum, transaction) => sum + parseAmount(transaction.reimbursementAmount, `${transaction.id}.reimbursementAmount`, { allowNegative: true }),
+      0n,
+    );
+    if (amount !== reimbursementTotal) {
+      throw new Error(`${field}.amount must equal the reimbursementAmount total of transactionIds.`);
+    }
+    const expectedSourceRefs = [...new Set(selected.flatMap((transaction) => transaction.sourceRefs))]
+      .sort((left, right) => left.localeCompare(right));
+    if (JSON.stringify(sourceRefs) !== JSON.stringify(expectedSourceRefs)) {
+      throw new Error(`${field}.sourceRefs must exactly equal the source refs of transactionIds.`);
+    }
+    const orderedTransactionIds = [...selected]
+      .sort((left, right) => left.sourceOrder - right.sourceOrder)
+      .map((transaction) => transaction.id);
+    const normalized = {
+      profileId,
+      person,
+      kind,
+      period: { start, end },
+      amount: formatAmount(amount),
+      transactionIds: orderedTransactionIds,
+      sourceRefs,
+    };
+    const identity = digest(normalized);
+    if (seenAnnotations.has(identity)) throw new Error(`${field} duplicates another summary annotation.`);
+    seenAnnotations.add(identity);
+    for (const transactionId of orderedTransactionIds) usedTransactionIds.add(transactionId);
+    return normalized;
+  });
 }
 
 function isStrictDescendant(parentPath, childPath) {
@@ -467,6 +553,9 @@ try {
   if (mainPeriod) normalizedBatch.mainPeriod = mainPeriod;
   if (batchId !== undefined) normalizedBatch.batchId = batchId;
   if (targetProfile) normalizedBatch.targetProfileId = targetProfile.profileId;
+  if (batch.summaryAnnotations !== undefined && !(manifest.version === 3 && normalizedOperation.mode === "reimbursement-batch")) {
+    throw new Error("manifest.batch.summaryAnnotations is only valid for manifest.version 3 reimbursement-batch.");
+  }
 
   if (!Array.isArray(manifest.files) || manifest.files.length === 0) {
     throw new Error("manifest.files must be a non-empty array.");
@@ -588,6 +677,7 @@ try {
   let sourceCoverageCounts;
   let affectedProfileIds;
   let profileSummaries;
+  let normalizedSummaryAnnotations = [];
   if (normalizedOperation.mode === "reimbursement-batch") {
     if (!Array.isArray(manifest.transactions) || manifest.transactions.length === 0) {
       throw new Error("manifest.transactions must be a non-empty array for reimbursement-batch.");
@@ -769,6 +859,11 @@ try {
       normalized.missingEvidenceConfirmed = transaction.missingEvidenceConfirmed === true;
       return normalized;
     });
+
+    if (manifest.version === 3) {
+      normalizedSummaryAnnotations = normalizeSummaryAnnotations(batch.summaryAnnotations, normalizedTransactions);
+      normalizedBatch.summaryAnnotations = normalizedSummaryAnnotations;
+    }
 
     const transactionById = new Map(normalizedTransactions.map((transaction) => [transaction.id, transaction]));
     const refundTotalsBySource = new Map();
@@ -997,6 +1092,7 @@ try {
       batchId,
       targetCategory,
       transactions: factTransactions,
+      ...(manifest.version === 3 ? { summaryAnnotations: normalizedSummaryAnnotations } : {}),
       expectedTotals: normalizedExpectedTotals ?? null,
       ...(profileRegistry
         ? {
@@ -1118,6 +1214,7 @@ try {
     result.profileConfigDigest = profileRegistry.profileConfigDigest;
     result.affectedProfileIds = affectedProfileIds;
     result.profileSummaries = profileSummaries;
+    result.summaryAnnotations = normalizedSummaryAnnotations;
     result.reimbursementFactsCertificate = reimbursementFactsCertificate;
   }
   if (normalizedOperation.mode === "reimbursement-batch") {

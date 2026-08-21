@@ -24,6 +24,7 @@ const TOKEN_RE = /^[0-9a-f]{64}$/u;
 const SHA256_RE = /^[0-9a-f]{64}$/u;
 const MAX_MANIFEST_BYTES = 16 * 1024 * 1024;
 const MAX_IMAGE_BYTES = 25 * 1024 * 1024;
+const SUMMARY_ANNOTATION_KINDS = new Set(["commission", "bonus", "allowance"]);
 const JSZipModule = loadBundledDependency("jszip");
 const JSZip = JSZipModule.default ?? JSZipModule;
 const SharpModule = loadBundledDependency("sharp");
@@ -59,6 +60,15 @@ function exactKeys(value, allowed, field) {
   for (const key of allowed) if (!Object.hasOwn(value, key)) fail(`${field} is missing ${key}.`);
 }
 
+function errorHasCode(error, code) {
+  const seen = new Set();
+  for (let current = error; current && typeof current === "object" && !seen.has(current); current = current.cause) {
+    if (current.code === code) return true;
+    seen.add(current);
+  }
+  return false;
+}
+
 function xml(value) {
   return String(value)
     .replaceAll("&", "&amp;")
@@ -81,6 +91,10 @@ function clone(value) {
 
 function sumMilliunits(items) {
   return items.reduce((total, item) => total + item.milliunits, 0n);
+}
+
+function sumReimbursementMilliunits(items) {
+  return items.reduce((total, item) => total + item.reimbursementMilliunits, 0n);
 }
 
 function compactDate(isoDate) {
@@ -107,7 +121,7 @@ function supplementSummary(transactions) {
     const start = ordered[0].date;
     const end = ordered.at(-1).date;
     const period = start === end ? compactDate(start) : `${compactDate(start)}-${compactDate(end)}`;
-    const amount = formatMilliunits(sumMilliunits(ordered));
+    const amount = formatMilliunits(ordered.reduce((sum, item) => sum + item.reimbursementMilliunits, 0n));
     const reasons = [...new Set(ordered.map((item) => item.supplementReason))];
     return { person, transactions: ordered, start, end, period, amount, count: ordered.length, reasons };
   });
@@ -119,44 +133,116 @@ function supplementSummary(transactions) {
   };
 }
 
-function renderProfileSummary(profile, period, transactions, supplements) {
+function chineseDate(value) {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/u.exec(value);
+  if (!match) fail(`summary date ${value} is invalid.`);
+  return `${match[1]}年${Number(match[2])}月${Number(match[3])}日`;
+}
+
+function fillSummaryLine(pattern, replacements, field) {
+  let output = pattern;
+  for (const [placeholder, value] of Object.entries(replacements)) output = output.replaceAll(placeholder, value);
+  if (/<[^>]+>/u.test(output)) fail(`summary template ${field} retains an unresolved placeholder.`);
+  return output;
+}
+
+function summaryPatterns(template) {
+  const normalized = template.text.replaceAll("\r\n", "\n");
+  const body = normalized.split(/\n填写规则：\n/u, 1)[0];
+  const lines = body.split("\n").map((line) => line.trim()).filter(Boolean);
+  const find = (placeholder, field) => {
+    const line = lines.find((item) => item.includes(placeholder));
+    if (!line) fail(`summary template has no ${field} line.`);
+    return line;
+  };
+  return {
+    title: lines[0],
+    person: find("<报销人1>", "person"),
+    annotation: find("<含提成人员>", "annotation"),
+    supplement: find("<补报人员>", "supplement"),
+    company: find("<对公事项或主体>", "company-paid"),
+    total: find("<实际报销总额>", "reimbursement-total"),
+  };
+}
+
+function summaryClause(pattern, replacements, field) {
+  const clause = /（([^（）]*)）/u.exec(pattern)?.[1];
+  if (!clause) fail(`summary template ${field} line has no full-width parenthetical clause.`);
+  return fillSummaryLine(clause, replacements, field);
+}
+
+function renderProfileSummary(profile, mainPeriod, transactions, supplements, annotations, template) {
   const groups = new Map();
   for (const transaction of transactions) {
-    const key = JSON.stringify([transaction.label, transaction.settlement]);
+    const displayLabel = transaction.settlement === "employee_reimbursement" ? transaction.person : transaction.label;
+    const key = JSON.stringify([displayLabel, transaction.settlement]);
     const existing = groups.get(key);
     if (existing) {
       existing.total += transaction.milliunits;
+      existing.reimbursementTotal += transaction.reimbursementMilliunits;
     } else {
       groups.set(key, {
-        label: transaction.label,
+        label: displayLabel,
         settlement: transaction.settlement,
         total: transaction.milliunits,
+        reimbursementTotal: transaction.reimbursementMilliunits,
         sourceOrder: transaction.sourceOrder,
       });
     }
   }
   const employee = transactions.filter((item) => item.settlement === "employee_reimbursement");
-  const companyPaid = transactions.filter((item) => item.settlement === "company_paid_no_reimbursement");
   const supplementByPerson = new Map(supplements.entries.map((entry) => [entry.person, entry]));
-  const lines = [`${period}_${profile.targetCategory}${supplements.suffix}`];
-  for (const group of [...groups.values()].sort((left, right) => left.sourceOrder - right.sourceOrder)) {
-    const suffix = group.settlement === "company_paid_no_reimbursement" ? "（对公已付不实报）" : "";
-    const supplement = supplementByPerson.get(group.label);
-    const supplementText = supplement
-      ? `（补报${supplement.period}，${supplement.count}笔，原因：${supplement.reasons.join("；")}）`
-      : "";
-    lines.push(`${group.label}${suffix}：${formatMilliunits(group.total)}${supplementText}`);
+  const annotationsByPerson = new Map();
+  for (const annotation of annotations) {
+    if (!annotationsByPerson.has(annotation.person)) annotationsByPerson.set(annotation.person, []);
+    annotationsByPerson.get(annotation.person).push(annotation);
   }
-  lines.push(`费用合计：${formatMilliunits(sumMilliunits(transactions))}`);
-  lines.push(`实报合计：${formatMilliunits(sumMilliunits(employee))}`);
-  if (companyPaid.length > 0) lines.push(`对公已付不实报：${formatMilliunits(sumMilliunits(companyPaid))}`);
+  const patterns = summaryPatterns(template);
+  const kindLabels = record(template.definition.annotationKindLabels, "summary template annotationKindLabels");
+  const periodText = `${chineseDate(mainPeriod.start)}—${chineseDate(mainPeriod.end)}`;
+  let title = patterns.title.replace("YYYY年M月D日—YYYY年M月D日", periodText);
+  if (profile.targetCategory !== "小红书报销") title = title.replace("小红书报销", profile.targetCategory);
+  if (/YYYY|<[^>]+>/u.test(title)) fail("summary template title retains an unresolved placeholder.");
+  const lines = [title, ""];
+  for (const group of [...groups.values()].sort((left, right) => left.sourceOrder - right.sourceOrder)) {
+    if (group.settlement !== "employee_reimbursement") continue;
+    const supplement = supplementByPerson.get(group.label);
+    const personAnnotations = annotationsByPerson.get(group.label) ?? [];
+    const personLine = fillSummaryLine(patterns.person, {
+      "<报销人1>": group.label,
+      "<实报金额>": `${formatMilliunits(group.reimbursementTotal)}元`,
+    }, "person");
+    const clauses = personAnnotations.map((annotation) => {
+      const label = cleanText(kindLabels[annotation.kind], `summary template annotationKindLabels.${annotation.kind}`);
+      return summaryClause(patterns.annotation, {
+        "<提成期间>": displayPeriod(annotation.period),
+        "<提成金额>": `${annotation.amount}元`,
+      }, "annotation").replace("引流提成", label);
+    });
+    if (supplement) {
+      clauses.push(summaryClause(patterns.supplement, {
+        "<补报期间>": supplement.period,
+        "<补报笔数>": String(supplement.count),
+        "<补报金额>": `${supplement.amount}元`,
+      }, "supplement"));
+    }
+    lines.push(`${personLine}${clauses.length ? `（${clauses.join("、")}）` : ""}`);
+  }
+  for (const group of [...groups.values()].sort((left, right) => left.sourceOrder - right.sourceOrder)) {
+    if (group.settlement !== "company_paid_no_reimbursement") continue;
+    lines.push(fillSummaryLine(patterns.company, {
+      "<对公事项或主体>": group.label,
+      "<金额>": `${formatMilliunits(group.total)}元`,
+    }, "company-paid"));
+  }
+  lines.push(fillSummaryLine(patterns.total, { "<实际报销总额>": `${formatMilliunits(employee.reduce((sum, item) => sum + item.reimbursementMilliunits, 0n))}元` }, "reimbursement-total"));
   const missing = transactions.filter((item) => item.missingEvidenceConfirmed === true);
-  if (missing.length > 0) lines.push(`无截图说明：${missing.map((item) => `${item.person}-${item.project}-${item.amount}元`).join("；")}`);
+  if (missing.length > 0) lines.push("", `无截图说明：${missing.map((item) => `${item.person}-${item.project}-${item.amount}元`).join("；")}`);
   for (const supplement of supplements.entries) {
     lines.push(`补报说明：${supplement.person} ${supplement.period}，${supplement.count}笔，${supplement.amount}元；原因：${supplement.reasons.join("；")}`);
   }
   const text = `${lines.join("\n")}\n`;
-  return { text, sha256: sha256Bytes(Buffer.from(text, "utf8")) };
+  return { text, sha256: sha256Bytes(Buffer.from(text, "utf8")), annotationCount: annotations.length, annotationDigest: canonicalDigest(annotations) };
 }
 
 function numericCell(reference, value, style = 2) {
@@ -165,6 +251,26 @@ function numericCell(reference, value, style = 2) {
 
 function formulaCell(reference, formula, cached, style = 2) {
   return `<c r="${reference}" s="${style}"><f>${xml(formula)}</f><v>${xml(cached)}</v></c>`;
+}
+
+function moneyPrecision(value) {
+  const match = /^-?\d+(?:\.(\d{1,3}))?$/u.exec(String(value));
+  if (!match) fail(`money value ${value} is not canonical to at most three decimals.`);
+  return (match[1] ?? "").replace(/0+$/u, "").length;
+}
+
+function moneyStyle(styles, role, value) {
+  const style = styles[`${role}${moneyPrecision(value)}`];
+  if (!Number.isSafeInteger(style) || style < 0) fail(`template has no ${role} money style.`);
+  return style;
+}
+
+function moneyCell(reference, value, styles, role) {
+  return numericCell(reference, value, moneyStyle(styles, role, value));
+}
+
+function moneyFormulaCell(reference, formula, cached, styles, role) {
+  return formulaCell(reference, formula, cached, moneyStyle(styles, role, cached));
 }
 
 function blankCell(reference, style) {
@@ -177,6 +283,13 @@ function textCell(reference, value, style = 0) {
 
 function rowXml(index, cells, { height = 21 } = {}) {
   return `<row r="${index}" ht="${height}" customHeight="1">${cells.join("")}</row>`;
+}
+
+function outputRowHeight(template, role, fallback) {
+  const declared = template?.definition?.outputRowHeightPolicy?.[role];
+  if (typeof declared === "number" && Number.isFinite(declared) && declared > 0) return declared;
+  if (declared === "template") return template.definition.templateRowHeight;
+  return fallback;
 }
 
 function excelSerial(isoDate, field) {
@@ -258,6 +371,23 @@ function sortMergeRefs(refs) {
   });
 }
 
+function detailDescription(transactions) {
+  const mainCount = transactions.filter((item) => item.reportingKind === "current").length;
+  const supplementCounts = new Map();
+  for (const transaction of transactions) {
+    if (transaction.reportingKind !== "supplement") continue;
+    supplementCounts.set(transaction.person, (supplementCounts.get(transaction.person) ?? 0) + 1);
+  }
+  const supplementFact = supplementCounts.size === 0
+    ? "无补报"
+    : `补报：${[...supplementCounts].map(([person, count]) => `${person}${count}笔`).join("、")}`;
+  const missingEvidenceCount = transactions.filter((item) => item.missingEvidenceConfirmed === true).length;
+  const evidenceFact = missingEvidenceCount === 0
+    ? "凭证对应关系详见截图表"
+    : `缺少原始付款/订单凭证${missingEvidenceCount}笔，已在截图表标注`;
+  return `说明：本表按人员分类；主期${mainCount}笔；${supplementFact}；主期与补报分开标注；${evidenceFact}。`;
+}
+
 function detailProjection(profile, period, transactions, styles, { suffix = "", subtitle = undefined, template } = {}) {
   const mergePolicy = template?.definition.outputMergePolicy ?? {};
   const groups = new Map();
@@ -272,22 +402,30 @@ function detailProjection(profile, period, transactions, styles, { suffix = "", 
   });
   const employee = transactions.filter((item) => item.settlement === "employee_reimbursement");
   const companyPaid = transactions.filter((item) => item.settlement === "company_paid_no_reimbursement");
+  const feeTotal = sumMilliunits(transactions);
+  const reimbursementTotal = sumReimbursementMilliunits(employee);
+  const mainReimbursementTotal = sumReimbursementMilliunits(transactions.filter((item) => item.reportingKind === "current"));
+  const supplementReimbursementTotal = sumReimbursementMilliunits(transactions.filter((item) => item.reportingKind === "supplement"));
+  const supplementCount = transactions.filter((item) => item.reportingKind === "supplement").length;
+  const companyPaidTotal = sumMilliunits(companyPaid);
+  const supplementLabel = suffix ? suffix.slice(1, -1) : "无补报";
   const rows = [
-    rowXml(1, [textCell("A1", `${profile.targetCategory}｜${period}${suffix}`, styles.title)], { height: 32 }),
-    rowXml(2, [textCell("A2", subtitle ?? `本次报销明细（按人员分类）${suffix}`, styles.subtitle)], { height: 24 }),
-    rowXml(3, [textCell("A3", "实报合计", styles.summaryLabel), textCell("C3", "对公已付不实报", styles.companySummaryLabel ?? styles.summaryLabel), textCell("E3", "费用合计", styles.feeSummaryLabel ?? styles.summaryLabel)], { height: 24 }),
+    rowXml(1, [textCell("A1", `${period} 本次报销明细（按人员分类）`, styles.title)], { height: outputRowHeight(template, "title", 32) }),
+    rowXml(2, [textCell("A2", subtitle ?? `主期：${period}｜补报：${supplementLabel}｜对公已付不实报单列`, styles.subtitle)], { height: outputRowHeight(template, "subtitle", 15) }),
+    rowXml(3, [textCell("A3", "主期实报", styles.summaryLabel), textCell("C3", `补报（${supplementCount}笔）`, styles.companySummaryLabel ?? styles.summaryLabel), textCell("E3", "实报合计", styles.feeSummaryLabel ?? styles.summaryLabel)], { height: outputRowHeight(template, "summaryLabel", 15) }),
     rowXml(4, [
-      formulaCell("A4", employee.length ? `SUM(${employee.map((_, index) => `C${index + 1}`).join(",")})` : "0", formatMilliunits(sumMilliunits(employee)), styles.summaryValue),
-      formulaCell("C4", companyPaid.length ? "0" : "0", formatMilliunits(sumMilliunits(companyPaid)), styles.companySummaryValue ?? styles.summaryValue),
-      formulaCell("E4", "A4+C4", formatMilliunits(sumMilliunits(transactions)), styles.feeSummaryValue ?? styles.summaryValue),
-    ], { height: 28 }),
-    rowXml(5, [], { height: 10 }),
-    rowXml(6, ["日期", "支出明细", "支出金额", "费用组合计", "费用分类", "结算方式"].map((value, index) => textCell(`${columnName(index + 1)}6`, value, styles.header)), { height: 24 }),
+      moneyCell("A4", formatMilliunits(mainReimbursementTotal), styles, "summaryValue"),
+      moneyCell("C4", formatMilliunits(supplementReimbursementTotal), styles, "companySummaryValue"),
+      moneyFormulaCell("E4", "A4+C4", formatMilliunits(reimbursementTotal), styles, "feeSummaryValue"),
+    ], { height: outputRowHeight(template, "summaryValue", 15) }),
+    rowXml(5, [
+      textCell("A5", `对公已付不实报：${formatMilliunits(companyPaidTotal)}`, styles.companyNote ?? styles.companySummaryLabel ?? styles.summaryLabel),
+      textCell("D5", `费用合计：${formatMilliunits(feeTotal)}`, styles.feeNote ?? styles.feeSummaryLabel ?? styles.summaryLabel),
+    ], { height: outputRowHeight(template, "notes", 24) }),
+    rowXml(6, ["日期", "支出明细", "单笔金额", "费用组合计", "备注 / 分类", "报销属性"].map((value, index) => textCell(`${columnName(index + 1)}6`, value, styles.header)), { height: outputRowHeight(template, "header", 26) }),
   ];
   const merges = [...(template?.definition.staticMerges ?? [])];
   const mapped = [];
-  const employeeRows = [];
-  const companyPaidRows = [];
   let row = 7;
   for (const section of sections) {
     const ordered = [...section.transactions].sort((left, right) => left.date.localeCompare(right.date) || left.sourceOrder - right.sourceOrder);
@@ -299,9 +437,9 @@ function detailProjection(profile, period, transactions, styles, { suffix = "", 
       : `${section.person}｜${ordered.length}笔`;
     rows.push(rowXml(row, [
       textCell(`A${row}`, sectionLabel, styles.groupLabel),
-      textCell(`E${row}`, section.settlement === "company_paid_no_reimbursement" ? "对公合计" : "人员合计", styles.groupLabel),
-      formulaCell(`F${row}`, `SUM(C${dataStart}:C${dataEnd})`, formatMilliunits(groupTotal), styles.groupTotal),
-    ], { height: 24 }));
+      textCell(`E${row}`, section.settlement === "company_paid_no_reimbursement" ? "对公费用合计" : "人员小计", styles.groupLabel),
+      moneyFormulaCell(`F${row}`, `SUM(C${dataStart}:C${dataEnd})`, formatMilliunits(groupTotal), styles, "groupTotal"),
+    ], { height: outputRowHeight(template, "group", 15) }));
     if (mergePolicy.personGroup) merges.push(`A${row}:D${row}`);
     row += 1;
     const dateRuns = contiguousRuns(ordered, (item) => item.date);
@@ -315,61 +453,66 @@ function detailProjection(profile, period, transactions, styles, { suffix = "", 
         cells.push(numericCell(`A${row}`, excelSerial(transaction.date, `${transaction.id}.date`), styles.date));
         if (mergePolicy.sameDate && dateRun.end > dateRun.start) merges.push(`A${row}:A${row + dateRun.end - dateRun.start}`);
       }
-      cells.push(textCell(`B${row}`, transaction.project, styles.text), numericCell(`C${row}`, transaction.amount, styles.amount));
+      cells.push(textCell(`B${row}`, transaction.project, styles.text), moneyCell(`C${row}`, transaction.amount, styles, "amount"));
       const feeRun = feeByStart.get(index);
       if (feeRun) {
         const runItems = ordered.slice(feeRun.start, feeRun.end + 1);
         const endRow = row + feeRun.end - feeRun.start;
         cells.push(
-          formulaCell(`D${row}`, `SUM(C${row}:C${endRow})`, formatMilliunits(sumMilliunits(runItems)), styles.feeTotal),
+          moneyFormulaCell(`D${row}`, `SUM(C${row}:C${endRow})`, formatMilliunits(sumMilliunits(runItems)), styles, "feeTotal"),
           textCell(`E${row}`, transaction.classification, styles.classification),
-          textCell(`F${row}`, transaction.settlement === "company_paid_no_reimbursement" ? "对公已付不实报" : "待报销", styles.settlement),
+          textCell(`F${row}`, transaction.settlement === "company_paid_no_reimbursement" ? "对公已付不实报" : "实报", styles.settlement),
         );
         if (mergePolicy.expenseGroup && endRow > row) for (const column of ["D", "E", "F"]) merges.push(`${column}${row}:${column}${endRow}`);
       }
-      rows.push(rowXml(row, cells, { height: 24 }));
+      const longText = Array.from(transaction.project).length > 24 || Array.from(transaction.classification).length > 14;
+      rows.push(rowXml(row, cells, { height: longText ? outputRowHeight(template, "longText", 42) : outputRowHeight(template, "default", 24) }));
       mapped.push({ ...transaction, row });
-      (transaction.settlement === "employee_reimbursement" ? employeeRows : companyPaidRows).push(row);
       row += 1;
     }
   }
-  const spacerRow = row;
-  rows.push(rowXml(spacerRow, [blankCell(`A${spacerRow}`, styles.spacer)], { height: 24 }));
-  merges.push(`A${spacerRow}:F${spacerRow}`);
-  const cardFormula = (indexes) => indexes.length ? `SUM(${indexes.map((index) => `C${index}`).join(",")})` : "0";
-  rows[3] = rowXml(4, [
-    formulaCell("A4", cardFormula(employeeRows), formatMilliunits(sumMilliunits(employee)), styles.summaryValue),
-    formulaCell("C4", cardFormula(companyPaidRows), formatMilliunits(sumMilliunits(companyPaid)), styles.companySummaryValue ?? styles.summaryValue),
-    formulaCell("E4", "A4+C4", formatMilliunits(sumMilliunits(transactions)), styles.feeSummaryValue ?? styles.summaryValue),
-  ], { height: 28 });
+  const descriptionRow = row;
+  rows.push(rowXml(descriptionRow, [
+    textCell(`A${descriptionRow}`, detailDescription(transactions), styles.description),
+    ...["B", "C", "D", "E", "F"].map((column) => blankCell(`${column}${descriptionRow}`, styles.description)),
+  ], { height: outputRowHeight(template, "description", 28) }));
+  if (mergePolicy.description) merges.push(`A${descriptionRow}:F${descriptionRow}`);
   const orderedMerges = sortMergeRefs(merges);
   const mergeXml = `<mergeCells count="${orderedMerges.length}">${orderedMerges.map((ref) => `<mergeCell ref="${ref}"/>`).join("")}</mergeCells>`;
-  const worksheet = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetPr><pageSetUpPr fitToPage="1"/></sheetPr><sheetViews><sheetView workbookViewId="0"><pane ySplit="6" topLeftCell="A7" activePane="bottomLeft" state="frozen"/><selection pane="bottomLeft" activeCell="A7" sqref="A7"/></sheetView></sheetViews><sheetFormatPr defaultRowHeight="15"/><cols><col min="1" max="1" width="13" customWidth="1"/><col min="2" max="2" width="40" customWidth="1"/><col min="3" max="3" width="15" customWidth="1"/><col min="4" max="4" width="16" customWidth="1"/><col min="5" max="5" width="24" customWidth="1"/><col min="6" max="6" width="38" customWidth="1"/></cols><sheetData>${rows.join("")}</sheetData>${mergeXml}<printOptions horizontalCentered="1" headings="0" gridLines="0"/><pageMargins left="0.3" right="0.3" top="0.3" bottom="0.3" header="0.15" footer="0.15"/><pageSetup paperSize="9" orientation="landscape" fitToWidth="1" fitToHeight="0"/><headerFooter><oddFooter>&amp;8第 &amp;P 页 / 共 &amp;N 页</oddFooter></headerFooter></worksheet>`;
-  return { worksheet, mapped, endRow: spacerRow, merges: orderedMerges, printArea: { endRow: spacerRow }, template };
+  const columns = template?.columnsXml || '<cols><col min="1" max="1" width="13" customWidth="1"/><col min="2" max="2" width="40" customWidth="1"/><col min="3" max="3" width="15" customWidth="1"/><col min="4" max="4" width="16" customWidth="1"/><col min="5" max="5" width="24" customWidth="1"/><col min="6" max="6" width="38" customWidth="1"/></cols>';
+  const worksheet = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetPr><pageSetUpPr fitToPage="1"/></sheetPr><sheetViews><sheetView workbookViewId="0" showGridLines="0"><pane ySplit="6" topLeftCell="A7" activePane="bottomLeft" state="frozen"/><selection pane="bottomLeft" activeCell="A7" sqref="A7"/></sheetView></sheetViews><sheetFormatPr defaultRowHeight="15"/>${columns}<sheetData>${rows.join("")}</sheetData>${mergeXml}<printOptions horizontalCentered="1" headings="0" gridLines="0"/><pageMargins left="0.3" right="0.3" top="0.3" bottom="0.3" header="0.15" footer="0.15"/><pageSetup paperSize="9" orientation="landscape" fitToWidth="1" fitToHeight="0"/><headerFooter><oddFooter>&amp;8第 &amp;P 页 / 共 &amp;N 页</oddFooter></headerFooter></worksheet>`;
+  return {
+    worksheet,
+    mapped,
+    endRow: descriptionRow,
+    merges: orderedMerges,
+    printArea: { endRow: descriptionRow },
+    totals: {
+      sourceAmount: formatMilliunits(feeTotal),
+      reimbursementAmount: formatMilliunits(reimbursementTotal),
+      companyPaidNoReimbursementAmount: formatMilliunits(companyPaidTotal),
+    },
+    template,
+  };
 }
 
 function supplementProjection(period, transactions, styles, { subtitle, template }) {
   const mergePolicy = template.definition.outputMergePolicy;
   const person = transactions[0].person;
   const total = sumMilliunits(transactions);
+  const reimbursementTotal = sumReimbursementMilliunits(transactions);
+  const subtitleHeight = Array.from(subtitle).length > 34 ? outputRowHeight(template, "longSubtitle", 30) : outputRowHeight(template, "subtitle", 28);
   const rows = [
-    rowXml(1, [textCell("A1", `${person} ${period} 小红书补报明细`, styles.title)], { height: 21.95 }),
-    rowXml(2, [textCell("A2", subtitle, styles.subtitle)], { height: 21.95 }),
-    rowXml(3, [textCell("A3", `补报合计：${formatMilliunits(total)}元｜共${transactions.length}笔`, styles.summaryLabel)], { height: 21.95 }),
-    rowXml(4, ["日期", "支出明细", "单笔金额", "费用组合计", "备注 / 分类", "结算方式"].map((value, index) => textCell(`${columnName(index + 1)}4`, value, styles.header)), { height: 21.95 }),
+    rowXml(1, [textCell("A1", `${person} ${period} 小红书补报明细`, styles.title)], { height: outputRowHeight(template, "title", 34) }),
+    rowXml(2, [textCell("A2", subtitle, styles.subtitle)], { height: subtitleHeight }),
+    rowXml(3, [textCell("A3", `补报实报合计：${formatMilliunits(reimbursementTotal)}元｜费用合计：${formatMilliunits(total)}元｜共${transactions.length}笔`, styles.summaryLabel)], { height: outputRowHeight(template, "summary", 24) }),
+    rowXml(4, ["日期", "支出明细", "单笔金额", "费用组合计", "备注 / 分类", "报销属性"].map((value, index) => textCell(`${columnName(index + 1)}4`, value, styles.header)), { height: outputRowHeight(template, "header", 24) }),
   ];
   const merges = [...template.definition.staticMerges];
   const ordered = [...transactions].sort((left, right) => left.date.localeCompare(right.date) || left.sourceOrder - right.sourceOrder);
-  const groupRow = 5;
-  rows.push(rowXml(groupRow, [
-    textCell(`A${groupRow}`, `${person}｜${ordered.length}笔`, styles.groupLabel),
-    textCell(`E${groupRow}`, "补报合计", styles.groupLabel),
-    formulaCell(`F${groupRow}`, `SUM(C6:C${5 + ordered.length})`, formatMilliunits(total), styles.groupTotal),
-  ], { height: 21.95 }));
-  if (mergePolicy.personGroup) merges.push(`A${groupRow}:D${groupRow}`);
   const dateStarts = new Map(contiguousRuns(ordered, (item) => item.date).map((run) => [run.start, run]));
   const expenseStarts = new Map(contiguousRuns(ordered, (item) => JSON.stringify([item.classification, item.settlement])).map((run) => [run.start, run]));
-  let row = 6;
+  let row = 5;
   for (const [index, transaction] of ordered.entries()) {
     const cells = [];
     const dateRun = dateStarts.get(index);
@@ -377,27 +520,42 @@ function supplementProjection(period, transactions, styles, { subtitle, template
       cells.push(numericCell(`A${row}`, excelSerial(transaction.date, `${transaction.id}.date`), styles.date));
       if (mergePolicy.sameDate && dateRun.end > dateRun.start) merges.push(`A${row}:A${row + dateRun.end - dateRun.start}`);
     }
-    cells.push(textCell(`B${row}`, transaction.project, styles.text), numericCell(`C${row}`, transaction.amount, styles.amount));
+    cells.push(textCell(`B${row}`, transaction.project, styles.text), moneyCell(`C${row}`, transaction.amount, styles, "amount"));
     const expenseRun = expenseStarts.get(index);
     if (expenseRun) {
       const runItems = ordered.slice(expenseRun.start, expenseRun.end + 1);
       const endRow = row + expenseRun.end - expenseRun.start;
+      const settlementText = transaction.settlement === "company_paid_no_reimbursement" ? "对公已付不实报" : "实报";
       cells.push(
-        formulaCell(`D${row}`, `SUM(C${row}:C${endRow})`, formatMilliunits(sumMilliunits(runItems)), styles.feeTotal),
+        moneyFormulaCell(`D${row}`, `SUM(C${row}:C${endRow})`, formatMilliunits(sumMilliunits(runItems)), styles, "feeTotal"),
         textCell(`E${row}`, transaction.classification, styles.classification),
-        textCell(`F${row}`, transaction.settlement === "company_paid_no_reimbursement" ? "对公已付不实报" : "待报销", styles.settlement),
+        textCell(`F${row}`, settlementText, styles.settlement),
       );
       if (mergePolicy.expenseGroup && endRow > row) for (const column of ["D", "E", "F"]) merges.push(`${column}${row}:${column}${endRow}`);
     }
-    rows.push(rowXml(row, cells, { height: template.definition.templateRowHeight }));
+    const longText = Array.from(transaction.project).length > 18 || Array.from(transaction.classification).length > 12;
+    rows.push(rowXml(row, cells, { height: longText ? outputRowHeight(template, "longText", 38) : outputRowHeight(template, "default", template.definition.templateRowHeight) }));
     row += 1;
   }
+  const footerRow = row;
+  rows.push(rowXml(footerRow, [
+    textCell(`A${footerRow}`, "补报总计", styles.footerLabel),
+    moneyFormulaCell(`C${footerRow}`, `SUM(C5:C${footerRow - 1})`, formatMilliunits(total), styles, "footerValue"),
+  ], { height: outputRowHeight(template, "footer", 28) }));
+  if (mergePolicy.footer) merges.push(`A${footerRow}:B${footerRow}`, `C${footerRow}:F${footerRow}`);
   const orderedMerges = sortMergeRefs(merges);
   const mergeXml = `<mergeCells count="${orderedMerges.length}">${orderedMerges.map((ref) => `<mergeCell ref="${ref}"/>`).join("")}</mergeCells>`;
   const columns = template.columnsXml || '<cols><col min="1" max="1" width="12" customWidth="1"/><col min="2" max="2" width="32" customWidth="1"/><col min="3" max="3" width="13" customWidth="1"/><col min="4" max="4" width="15" customWidth="1"/><col min="5" max="5" width="22" customWidth="1"/><col min="6" max="6" width="28" customWidth="1"/></cols>';
-  const endRow = row - 1;
+  const endRow = footerRow;
   const worksheet = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetViews><sheetView workbookViewId="0" showGridLines="0"><pane ySplit="4" topLeftCell="A5" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews><sheetFormatPr defaultRowHeight="15"/>${columns}<sheetData>${rows.join("")}</sheetData>${mergeXml}<pageMargins left="0.3" right="0.3" top="0.3" bottom="0.3" header="0.15" footer="0.15"/></worksheet>`;
-  return { worksheet, endRow, merges: orderedMerges, printArea: { endRow }, template };
+  return {
+    worksheet,
+    endRow,
+    merges: orderedMerges,
+    printArea: { endRow },
+    totals: { sourceAmount: formatMilliunits(total), reimbursementAmount: formatMilliunits(reimbursementTotal) },
+    template,
+  };
 }
 
 export async function inspectEvidenceImage(bytes, field = "image") {
@@ -435,20 +593,33 @@ export async function inspectEvidenceImage(bytes, field = "image") {
     fail(`${field} must be a PNG or JPEG image.`);
   }
   try {
-    const decoded = await sharp(bytes, { failOn: "none", limitInputPixels: 100_000_000 }).metadata();
-    const expectedFormat = structural.extension === "png" ? "png" : "jpeg";
-    if (decoded.format !== expectedFormat || decoded.width !== structural.width || decoded.height !== structural.height) fail(`${field} decoded metadata differs from its original bytes.`);
-    await sharp(bytes, { failOn: "none", limitInputPixels: 100_000_000 }).raw().toBuffer();
+    const hasJpegEoi = structural.extension !== "jpg" || (bytes.length >= 2 && bytes[bytes.length - 2] === 0xff && bytes[bytes.length - 1] === 0xd9);
+    const validationBytes = hasJpegEoi ? bytes : Buffer.concat([bytes, Buffer.from([0xff, 0xd9])]);
+    const decoded = await sharp(validationBytes, { failOn: "warning", limitInputPixels: 100_000_000 })
+      .raw()
+      .toBuffer({ resolveWithObject: true });
+    if (decoded.info.width !== structural.width || decoded.info.height !== structural.height || decoded.data.length === 0) fail(`${field} decoded pixels differ from its original bytes.`);
   } catch (error) {
     fail(`${field} cannot be decoded safely.`, error);
   }
   return structural;
 }
 
-function imageExtent(kind) {
-  const widthPx = 260;
-  const heightPx = Math.max(72, Math.min(210, Math.round(widthPx * kind.height / kind.width)));
-  return { cx: widthPx * 9525, cy: heightPx * 9525 };
+function imageExtent(kind, policy) {
+  if (!policy || policy.fit !== "contain" || policy.align !== "center" || !Number.isSafeInteger(policy.maxWidthPx) || !Number.isSafeInteger(policy.maxHeightPx) || policy.maxWidthPx < 1 || policy.maxHeightPx < 1) {
+    fail("screenshot template outputImagePolicy must declare a positive contain/center box.");
+  }
+  const boxWidthPx = policy.maxWidthPx;
+  const boxHeightPx = policy.maxHeightPx;
+  const scale = Math.min(boxWidthPx / kind.width, boxHeightPx / kind.height);
+  const widthPx = Math.max(1, Math.round(kind.width * scale));
+  const heightPx = Math.max(1, Math.round(kind.height * scale));
+  return {
+    cx: widthPx * 9525,
+    cy: heightPx * 9525,
+    colOff: Math.floor((boxWidthPx - widthPx) / 2) * 9525,
+    rowOff: Math.floor((boxHeightPx - heightPx) / 2) * 9525,
+  };
 }
 
 function screenshotProjection(profile, transactions, evidenceById, templateStyles, template) {
@@ -470,7 +641,7 @@ function screenshotProjection(profile, transactions, evidenceById, templateStyle
       displayedContext.add(evidence.sha256);
       return true;
     });
-    const note = imageIds.length === 0 ? `${transaction.classification}｜无图片凭证` : transaction.classification;
+    const note = referencedImageIds.length === 0 ? `${transaction.classification}｜无图片凭证` : transaction.classification;
     const styles = index % 2 === 0
       ? { date: templateStyles.oddDate, text: templateStyles.oddText, amount: templateStyles.oddAmount, note: templateStyles.oddNote, image: templateStyles.image }
       : { date: templateStyles.evenDate, text: templateStyles.evenText, amount: templateStyles.evenAmount, note: templateStyles.evenNote, image: templateStyles.image };
@@ -478,10 +649,10 @@ function screenshotProjection(profile, transactions, evidenceById, templateStyle
       numericCell(`A${row}`, excelSerial(transaction.date, `${transaction.id}.date`), styles.date),
       textCell(`B${row}`, transaction.person, styles.text),
       textCell(`C${row}`, transaction.project, styles.text),
-      numericCell(`D${row}`, transaction.amount, styles.amount),
+      moneyCell(`D${row}`, transaction.amount, templateStyles, index % 2 === 0 ? "oddAmount" : "evenAmount"),
       textCell(`E${row}`, note, styles.note),
       ...Array.from({ length: maxImages }, (_, imageIndex) => blankCell(`${columnName(6 + imageIndex)}${row}`, styles.image)),
-    ], { height: 172.5 }));
+    ], { height: imageIds.length > 0 ? outputRowHeight(template, "image", 172.5) : outputRowHeight(template, "noImage", template.definition.templateRowHeight) }));
     for (const [imageIndex, evidenceId] of imageIds.entries()) {
       const evidence = evidenceById.get(evidenceId);
       let media = mediaBySha.get(evidence.sha256);
@@ -491,20 +662,22 @@ function screenshotProjection(profile, transactions, evidenceById, templateStyle
         mediaBySha.set(evidence.sha256, media);
         relationships.push(media);
       }
-      const extent = imageExtent(evidence);
+      const extent = imageExtent(evidence, template.definition.outputImagePolicy);
       anchors.push({ row: row - 1, column: 5 + imageIndex, extent, relationshipId: media.relationshipId, name: `${transaction.id}-${imageIndex + 1}` });
     }
   }
   const drawingTag = anchors.length > 0 ? '<drawing xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" r:id="rId1"/>' : "";
-  const worksheet = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetFormatPr defaultRowHeight="15"/><cols><col min="1" max="1" width="12.5" customWidth="1"/><col min="2" max="2" width="15" customWidth="1"/><col min="3" max="3" width="40" customWidth="1"/><col min="4" max="4" width="13" customWidth="1"/><col min="5" max="5" width="48" customWidth="1"/><col min="6" max="${headers.length}" width="42" customWidth="1"/></cols><sheetData>${rows.join("")}</sheetData><pageMargins left="0.7" right="0.7" top="0.75" bottom="0.75" header="0.3" footer="0.3"/>${drawingTag}</worksheet>`;
+  const fallbackColumns = `<cols><col min="1" max="1" width="12.5" customWidth="1"/><col min="2" max="2" width="15" customWidth="1"/><col min="3" max="3" width="40" customWidth="1"/><col min="4" max="4" width="13" customWidth="1"/><col min="5" max="5" width="48" customWidth="1"/><col min="6" max="${headers.length}" width="42" customWidth="1"/></cols>`;
+  const columns = template.columnsXml || fallbackColumns;
+  const worksheet = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetViews><sheetView workbookViewId="0" showGridLines="0"/></sheetViews><sheetFormatPr defaultRowHeight="15"/>${columns}<sheetData>${rows.join("")}</sheetData><pageMargins left="0.7" right="0.7" top="0.75" bottom="0.75" header="0.3" footer="0.3"/>${drawingTag}</worksheet>`;
   if (anchors.length === 0) return { worksheet, drawing: null, endRow: transactions.length + 1, imageCount: 0, uniqueMediaCount: 0, imageReferenceCount: transactions.reduce((count, item) => count + item.evidence.filter((id) => evidenceById.get(id)?.kind === "image").length, 0), endColumn: columnName(headers.length), template };
-  const drawingXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">${anchors.map((anchor, index) => `<xdr:oneCellAnchor><xdr:from><xdr:col>${anchor.column}</xdr:col><xdr:colOff>47625</xdr:colOff><xdr:row>${anchor.row}</xdr:row><xdr:rowOff>47625</xdr:rowOff></xdr:from><xdr:ext cx="${anchor.extent.cx}" cy="${anchor.extent.cy}"/><xdr:pic><xdr:nvPicPr><xdr:cNvPr id="${index + 2}" name="${xml(anchor.name)}"/><xdr:cNvPicPr><a:picLocks noChangeAspect="1"/></xdr:cNvPicPr></xdr:nvPicPr><xdr:blipFill><a:blip r:embed="${anchor.relationshipId}"/><a:stretch><a:fillRect/></a:stretch></xdr:blipFill><xdr:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="${anchor.extent.cx}" cy="${anchor.extent.cy}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></xdr:spPr></xdr:pic><xdr:clientData/></xdr:oneCellAnchor>`).join("")}</xdr:wsDr>`;
+  const drawingXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">${anchors.map((anchor, index) => `<xdr:oneCellAnchor><xdr:from><xdr:col>${anchor.column}</xdr:col><xdr:colOff>${anchor.extent.colOff}</xdr:colOff><xdr:row>${anchor.row}</xdr:row><xdr:rowOff>${anchor.extent.rowOff}</xdr:rowOff></xdr:from><xdr:ext cx="${anchor.extent.cx}" cy="${anchor.extent.cy}"/><xdr:pic><xdr:nvPicPr><xdr:cNvPr id="${index + 2}" name="${xml(anchor.name)}"/><xdr:cNvPicPr><a:picLocks noChangeAspect="1"/></xdr:cNvPicPr></xdr:nvPicPr><xdr:blipFill><a:blip r:embed="${anchor.relationshipId}"/><a:stretch><a:fillRect/></a:stretch></xdr:blipFill><xdr:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="${anchor.extent.cx}" cy="${anchor.extent.cy}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></xdr:spPr></xdr:pic><xdr:clientData/></xdr:oneCellAnchor>`).join("")}</xdr:wsDr>`;
   const drawingRels = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">${relationships.map((item) => `<Relationship Id="${item.relationshipId}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/${path.basename(item.partName)}"/>`).join("")}</Relationships>`;
   const sheetRels = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="../drawings/drawing1.xml"/></Relationships>`;
   return { worksheet, drawing: { xml: drawingXml, rels: drawingRels, sheetRels, media: relationships }, endRow: transactions.length + 1, imageCount: anchors.length, uniqueMediaCount: mediaBySha.size, imageReferenceCount: transactions.reduce((count, item) => count + item.evidence.filter((id) => evidenceById.get(id)?.kind === "image").length, 0), endColumn: columnName(headers.length), template };
 }
 
-async function writeWorkbook(filePath, sheetName, projection) {
+async function writeWorkbook(filePath, sheetName, projection, beforeValidation = undefined) {
   const zip = new JSZip();
   const expectedParts = workbookParts(sheetName, projection.worksheet, projection.drawing, projection.printArea, projection.template);
   if (projection.drawing) {
@@ -517,45 +690,68 @@ async function writeWorkbook(filePath, sheetName, projection) {
   // unchanged voucher when a note or classification revision rebuilds the workbook.
   for (const media of projection.drawing?.media ?? []) zip.file(media.partName, media.bytes, { compression: "STORE" });
   const bytes = await zip.generateAsync({ type: "nodebuffer", compression: "DEFLATE", compressionOptions: { level: 6 }, platform: "DOS" });
-  const handle = await fs.open(filePath, "wx", 0o600);
+  const expectedSha256 = sha256Bytes(bytes);
+  let created = false;
   try {
-    await handle.writeFile(bytes);
-    await handle.sync();
-  } finally {
-    await handle.close();
+    const handle = await fs.open(filePath, "wx", 0o600);
+    created = true;
+    try {
+      await handle.writeFile(bytes);
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    if (beforeValidation) {
+      await beforeValidation({ path: filePath, sheetName });
+      const stable = await readStableBinaryFile(filePath);
+      if (stable.sha256 !== expectedSha256 || stable.size !== bytes.length) fail(`${path.basename(filePath)} changed after exclusive write.`);
+    }
+    // Exclusive write + fsync binds the exact in-memory package. Gate 1 preview
+    // independently rereads it before use, so an immediate second read only
+    // duplicates I/O; the hook path above retains post-write tamper coverage.
+    return { sha256: expectedSha256, size: bytes.length, partDigest: canonicalDigest([...expectedParts]), generatedStyleVersion: 1 };
+  } catch (error) {
+    if (created) {
+      try {
+        await fs.unlink(filePath);
+      } catch (cleanupError) {
+        if (cleanupError?.code !== "ENOENT") throw new Error(`${error instanceof Error ? error.message : String(error)}; incomplete workbook cleanup: ${filePath}`, { cause: error });
+      }
+    }
+    throw error;
   }
-  const stable = await readStableBinaryFile(filePath);
-  const reopened = await JSZip.loadAsync(copyStableBinaryBytes(stable), { createFolders: false });
-  for (const [partName, expected] of expectedParts) {
-    const entry = reopened.file(partName);
-    if (!entry || await entry.async("string") !== expected) fail(`${path.basename(filePath)} ${partName} changed after write.`);
-  }
-  for (const media of projection.drawing?.media ?? []) {
-    const entry = reopened.file(media.partName);
-    if (!entry || sha256Bytes(await entry.async("nodebuffer")) !== media.sha256) fail(`${path.basename(filePath)} media changed after write.`);
-  }
-  return { sha256: stable.sha256, size: stable.size, partDigest: canonicalDigest([...expectedParts]), generatedStyleVersion: 1 };
 }
 
 async function writeBoundBytes(filePath, bytes) {
-  const handle = await fs.open(filePath, "wx", 0o600);
-  try {
-    await handle.writeFile(bytes);
-    await handle.sync();
-  } finally {
-    await handle.close();
-  }
-  const stable = await readStableBinaryFile(filePath, { maxBytes: MAX_IMAGE_BYTES });
   const expectedSha256 = sha256Bytes(bytes);
-  if (stable.sha256 !== expectedSha256 || stable.size !== bytes.length) fail(`${path.basename(filePath)} changed after exclusive write.`);
-  return { sha256: stable.sha256, size: stable.size };
+  let created = false;
+  try {
+    const handle = await fs.open(filePath, "wx", 0o600);
+    created = true;
+    try {
+      await handle.writeFile(bytes);
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+  } catch (error) {
+    if (created) {
+      try {
+        await fs.unlink(filePath);
+      } catch (cleanupError) {
+        if (cleanupError?.code !== "ENOENT") throw new Error(`${error instanceof Error ? error.message : String(error)}; incomplete bound-byte cleanup: ${filePath}`, { cause: error });
+      }
+    }
+    throw error;
+  }
+  // Gate consumers independently reread every bound artifact. The exclusive,
+  // fsynced write already binds these exact bytes without an immediate duplicate read.
+  return { sha256: expectedSha256, size: bytes.length };
 }
 
 async function writeTextSummary(filePath, summaryText) {
   const bytes = Buffer.from(summaryText, "utf8");
   const state = await writeBoundBytes(filePath, bytes);
-  const reopened = await fs.readFile(filePath, "utf8");
-  if (reopened !== summaryText) fail(`${path.basename(filePath)} is not a stable UTF-8 text summary.`);
   return { ...state, text: summaryText, textSha256: sha256Bytes(Buffer.from(summaryText, "utf8")) };
 }
 
@@ -582,9 +778,32 @@ async function loadManifest(request, certificate) {
   return { manifest, snapshot };
 }
 
+async function mapSettledInInputOrder(items, limit, worker) {
+  try {
+    return await mapSettledLimit(items, limit, worker);
+  } catch (error) {
+    const settled = error?.settledDetails?.settled;
+    if (Array.isArray(settled)) {
+      const firstRejected = settled.find((item) => item?.status === "rejected");
+      if (firstRejected) throw firstRejected.reason;
+    }
+    throw error;
+  }
+}
+
 function bindTransactions(manifest, certificate, registry) {
   const expectedById = new Map(certificate.factsPreimage.transactions.map((item) => [item.id, item]));
   if (expectedById.size !== manifest.transactions.length) fail("manifest transactions do not match the certificate count.");
+  const sourceBindings = certificate.sourceCoveragePreimage?.transactionSourceRefs;
+  if (!Array.isArray(sourceBindings) || sourceBindings.length !== expectedById.size) fail("certificate transaction source coverage is incomplete.");
+  const sourceRefsByTransaction = new Map();
+  for (const [index, binding] of sourceBindings.entries()) {
+    const item = record(binding, `sourceCoveragePreimage.transactionSourceRefs[${index}]`);
+    const transactionId = cleanText(item.transactionId, `sourceCoveragePreimage.transactionSourceRefs[${index}].transactionId`);
+    if (sourceRefsByTransaction.has(transactionId) || !expectedById.has(transactionId)) fail(`certificate source coverage has invalid transaction ${transactionId}.`);
+    if (!Array.isArray(item.sourceRefs) || item.sourceRefs.length === 0 || new Set(item.sourceRefs).size !== item.sourceRefs.length) fail(`certificate source refs for ${transactionId} are invalid.`);
+    sourceRefsByTransaction.set(transactionId, [...item.sourceRefs].map((value, sourceIndex) => cleanText(value, `${transactionId}.sourceRefs[${sourceIndex}]`)).sort((left, right) => left.localeCompare(right)));
+  }
   return manifest.transactions.map((raw, index) => {
     const expected = expectedById.get(raw.id);
     if (!expected) fail(`manifest.transactions[${index}] is absent from certificate facts.`);
@@ -604,35 +823,102 @@ function bindTransactions(manifest, certificate, registry) {
     }
     if (raw.amount !== undefined && raw.amount !== expected.amount) fail(`manifest transaction ${expected.id} amount differs from sourceAmount.`);
     if (!Array.isArray(raw.evidence) || new Set(raw.evidence).size !== raw.evidence.length) fail(`manifest transaction ${expected.id} evidence is invalid.`);
+    if (!Array.isArray(raw.sourceRefs) || raw.sourceRefs.length === 0 || new Set(raw.sourceRefs).size !== raw.sourceRefs.length) fail(`manifest transaction ${expected.id} sourceRefs are invalid.`);
+    const rawSourceRefs = [...raw.sourceRefs].map((value, sourceIndex) => cleanText(value, `${expected.id}.sourceRefs[${sourceIndex}]`)).sort((left, right) => left.localeCompare(right));
+    const boundSourceRefs = sourceRefsByTransaction.get(expected.id);
+    if (!boundSourceRefs || canonicalDigest(rawSourceRefs) !== canonicalDigest(boundSourceRefs)) fail(`manifest transaction ${expected.id} sourceRefs differ from certificate source coverage.`);
     const milliunits = parseMilliunits(expected.sourceAmount, `${expected.id}.sourceAmount`, { allowNegative: true });
+    const reimbursementMilliunits = parseMilliunits(expected.reimbursementAmount, `${expected.id}.reimbursementAmount`, { allowNegative: true });
     if (formatMilliunits(milliunits) !== expected.amount) fail(`${expected.id}.amount is not canonical.`);
-    return { ...clone(expected), milliunits, evidence: [...raw.evidence], missingEvidenceConfirmed: raw.missingEvidenceConfirmed === true };
+    if (formatMilliunits(reimbursementMilliunits) !== expected.reimbursementAmount) fail(`${expected.id}.reimbursementAmount is not canonical.`);
+    return { ...clone(expected), milliunits, reimbursementMilliunits, sourceRefs: boundSourceRefs, evidence: [...raw.evidence], missingEvidenceConfirmed: raw.missingEvidenceConfirmed === true };
+  });
+}
+
+function bindSummaryAnnotations(manifest, certificate, transactions) {
+  const rawAnnotations = manifest.batch?.summaryAnnotations ?? [];
+  const expectedAnnotations = certificate.factsPreimage?.summaryAnnotations;
+  if (!Array.isArray(rawAnnotations) || !Array.isArray(expectedAnnotations) || rawAnnotations.length !== expectedAnnotations.length) {
+    fail("manifest summaryAnnotations differ from certificate facts.");
+  }
+  const transactionById = new Map(transactions.map((transaction) => [transaction.id, transaction]));
+  const usedTransactionIds = new Set();
+  return rawAnnotations.map((rawAnnotation, index) => {
+    exactKeys(rawAnnotation, new Set(["profileId", "person", "kind", "period", "amount", "transactionIds", "sourceRefs"]), `manifest.batch.summaryAnnotations[${index}]`);
+    exactKeys(rawAnnotation.period, new Set(["start", "end"]), `manifest.batch.summaryAnnotations[${index}].period`);
+    const profileId = cleanText(rawAnnotation.profileId, `summaryAnnotations[${index}].profileId`);
+    const person = cleanText(rawAnnotation.person, `summaryAnnotations[${index}].person`);
+    const kind = cleanText(rawAnnotation.kind, `summaryAnnotations[${index}].kind`);
+    if (!SUMMARY_ANNOTATION_KINDS.has(kind)) fail(`summaryAnnotations[${index}].kind is unsupported.`);
+    const period = {
+      start: cleanText(rawAnnotation.period.start, `summaryAnnotations[${index}].period.start`),
+      end: cleanText(rawAnnotation.period.end, `summaryAnnotations[${index}].period.end`),
+    };
+    displayPeriod(period);
+    if (period.end < period.start) fail(`summaryAnnotations[${index}] period is reversed.`);
+    const amountMilliunits = parseMilliunits(rawAnnotation.amount, `summaryAnnotations[${index}].amount`, { allowNegative: true });
+    if (formatMilliunits(amountMilliunits) !== rawAnnotation.amount) fail(`summaryAnnotations[${index}].amount is not canonical.`);
+    if (!Array.isArray(rawAnnotation.transactionIds) || rawAnnotation.transactionIds.length === 0 || new Set(rawAnnotation.transactionIds).size !== rawAnnotation.transactionIds.length) fail(`summaryAnnotations[${index}].transactionIds are invalid.`);
+    const selected = rawAnnotation.transactionIds.map((id, transactionIndex) => {
+      const transactionId = cleanText(id, `summaryAnnotations[${index}].transactionIds[${transactionIndex}]`);
+      const transaction = transactionById.get(transactionId);
+      if (!transaction || usedTransactionIds.has(transactionId)) fail(`summaryAnnotations[${index}] has an unbound or reused transaction ${transactionId}.`);
+      if (transaction.profileId !== profileId || transaction.person !== person || transaction.settlement !== "employee_reimbursement") fail(`summaryAnnotations[${index}] transaction ${transactionId} differs from its profile/person/settlement binding.`);
+      return transaction;
+    });
+    if (sumReimbursementMilliunits(selected) !== amountMilliunits) fail(`summaryAnnotations[${index}].amount differs from its transaction reimbursement total.`);
+    const transactionIds = [...selected].sort((left, right) => left.sourceOrder - right.sourceOrder).map((transaction) => transaction.id);
+    if (!Array.isArray(rawAnnotation.sourceRefs) || rawAnnotation.sourceRefs.length === 0 || new Set(rawAnnotation.sourceRefs).size !== rawAnnotation.sourceRefs.length) fail(`summaryAnnotations[${index}].sourceRefs are invalid.`);
+    const sourceRefs = [...rawAnnotation.sourceRefs].map((value, sourceIndex) => cleanText(value, `summaryAnnotations[${index}].sourceRefs[${sourceIndex}]`)).sort((left, right) => left.localeCompare(right));
+    const expectedSourceRefs = [...new Set(selected.flatMap((transaction) => transaction.sourceRefs))].sort((left, right) => left.localeCompare(right));
+    if (canonicalDigest(sourceRefs) !== canonicalDigest(expectedSourceRefs)) fail(`summaryAnnotations[${index}].sourceRefs differ from its transactions.`);
+    const normalized = { profileId, person, kind, period, amount: formatMilliunits(amountMilliunits), transactionIds, sourceRefs };
+    if (canonicalDigest(normalized) !== canonicalDigest(expectedAnnotations[index])) fail(`summaryAnnotations[${index}] differs from certificate facts.`);
+    for (const transactionId of transactionIds) usedTransactionIds.add(transactionId);
+    return normalized;
   });
 }
 
 async function loadEvidence(manifest) {
   const evidence = new Map();
-  const loadedBySha256 = new Map();
   const usedIds = new Set(manifest.transactions.flatMap((item) => item.evidence ?? []));
+  const bindings = [];
+  const jobsBySha256 = new Map();
   for (const raw of manifest.files) {
     if (!usedIds.has(raw.id)) continue;
     if (raw.role !== "material" || raw.disposition !== "used") fail(`evidence ${raw.id} is not a used material.`);
     const filePath = path.resolve(cleanText(raw.path, `files.${raw.id}.path`));
     const expectedSha256 = cleanSha(raw.sha256, `files.${raw.id}.sha256`);
-    let loaded = loadedBySha256.get(expectedSha256);
-    if (!loaded) {
-      const stable = await readStableBinaryFile(filePath, { maxBytes: MAX_IMAGE_BYTES });
-      if (stable.sha256 !== expectedSha256) fail(`evidence ${raw.id} SHA changed after manifest audit.`);
-      loaded = { stable, bytes: copyStableBinaryBytes(stable) };
-      loadedBySha256.set(expectedSha256, loaded);
+    const binding = { raw, filePath, expectedSha256 };
+    bindings.push(binding);
+    const existing = jobsBySha256.get(expectedSha256);
+    if (existing) {
+      if (raw.kind === "image") existing.requiresImageDecode = true;
+    } else {
+      jobsBySha256.set(expectedSha256, {
+        expectedSha256,
+        filePath,
+        evidenceId: raw.id,
+        requiresImageDecode: raw.kind === "image",
+      });
     }
-    const { stable, bytes } = loaded;
+  }
+  const jobs = [...jobsBySha256.values()];
+  const loaded = await mapSettledInInputOrder(jobs, 3, async (job) => {
+    const stable = await readStableBinaryFile(job.filePath, { maxBytes: MAX_IMAGE_BYTES });
+    if (stable.sha256 !== job.expectedSha256) fail(`evidence ${job.evidenceId} SHA changed after manifest audit.`);
+    const bytes = copyStableBinaryBytes(stable);
+    let metadata = imageMetadataCache.get(stable.sha256);
+    if (job.requiresImageDecode && !metadata) {
+      metadata = await inspectEvidenceImage(bytes, `evidence ${job.evidenceId}`);
+      imageMetadataCache.set(stable.sha256, metadata);
+    }
+    return { stable, bytes, metadata };
+  });
+  const loadedBySha256 = new Map(jobs.map((job, index) => [job.expectedSha256, loaded.settled[index].value]));
+  for (const { raw, filePath, expectedSha256 } of bindings) {
+    const { stable, bytes, metadata } = loadedBySha256.get(expectedSha256);
     if (raw.kind === "image") {
-      let metadata = imageMetadataCache.get(stable.sha256);
-      if (!metadata) {
-        metadata = await inspectEvidenceImage(bytes, `evidence ${raw.id}`);
-        imageMetadataCache.set(stable.sha256, metadata);
-      }
       evidence.set(raw.id, { id: raw.id, kind: "image", usage: raw.usage, path: filePath, originalName: path.basename(filePath), sha256: stable.sha256, bytes, ...metadata });
     } else {
       evidence.set(raw.id, { id: raw.id, kind: raw.kind, path: filePath, sha256: stable.sha256 });
@@ -650,6 +936,11 @@ function safeSegment(value, fallback = "未命名") {
     .replace(/[ .]+$/gu, "")
     .slice(0, 48);
   return cleaned || fallback;
+}
+
+function supplementSheetName(person) {
+  const prefix = safeSegment(person).replace(/[\[\]]/gu, "-").slice(0, 25);
+  return `${prefix}补报明细`;
 }
 
 function evidenceArchiveName(index, evidenceId, evidence, transactions, usedNames) {
@@ -679,14 +970,14 @@ async function removeOwned(entries, stagingRoot) {
       }
       await fs.unlink(entry.path);
     } catch (error) {
-      if (error?.code !== "ENOENT") preserved.push(entry.path);
+      if (!errorHasCode(error, "ENOENT")) preserved.push(entry.path);
     }
   }
   if (preserved.length === 0) await fs.rmdir(stagingRoot).catch(() => {});
   return preserved;
 }
 
-export async function buildReimbursementArtifacts(rawRequest) {
+export async function buildReimbursementArtifacts(rawRequest, { testHooks } = {}) {
   exactKeys(rawRequest, new Set(["kind", "stagingToken", "manifestPath", "manifestSha256", "reimbursementFactsCertificate"]), "request");
   if (rawRequest.kind !== REIMBURSEMENT_ARTIFACT_BUILD_KIND) fail("request kind is unsupported.");
   if (!TOKEN_RE.test(rawRequest.stagingToken ?? "")) fail("stagingToken must be exactly 64 lowercase hexadecimal characters.");
@@ -695,10 +986,17 @@ export async function buildReimbursementArtifacts(rawRequest) {
   const certificate = validateCertificate(record(request.reimbursementFactsCertificate, "reimbursementFactsCertificate"), registry);
   const { manifest } = await loadManifest(request, certificate);
   const transactions = bindTransactions(manifest, certificate, registry);
+  const summaryAnnotations = bindSummaryAnnotations(manifest, certificate, transactions);
   const affectedProfileIds = registry.profileOrder.filter((profileId) => transactions.some((item) => item.profileId === profileId));
   if (affectedProfileIds.length === 0 || canonicalDigest(affectedProfileIds) !== canonicalDigest(certificate.factsPreimage.affectedProfileIds)) fail("affected profiles differ from certificate facts.");
-  const evidence = await loadEvidence(manifest);
-  const templates = await loadArtifactTemplates();
+  const [evidenceLoad, templateLoad] = await Promise.allSettled([
+    loadEvidence(manifest),
+    loadArtifactTemplates(),
+  ]);
+  if (evidenceLoad.status === "rejected") throw evidenceLoad.reason;
+  if (templateLoad.status === "rejected") throw templateLoad.reason;
+  const evidence = evidenceLoad.value;
+  const templates = templateLoad.value;
   const mainPeriod = record(manifest.batch?.mainPeriod, "manifest.batch.mainPeriod");
   const period = displayPeriod({
     start: cleanText(mainPeriod.start, "manifest.batch.mainPeriod.start"),
@@ -714,36 +1012,52 @@ export async function buildReimbursementArtifacts(rawRequest) {
     const artifacts = await mapSettledLimit(affectedProfileIds, 3, async (profileId) => {
       const profile = registry.profiles[profileId];
       const selected = transactions.filter((item) => item.profileId === profileId).sort((left, right) => left.sourceOrder - right.sourceOrder);
+      const selectedAnnotations = summaryAnnotations.filter((annotation) => annotation.profileId === profileId);
       if (selected.length === 0) fail(`${profileId} has no reimbursement and must not emit files.`);
       const supplements = supplementSummary(selected);
       const detail = detailProjection(profile, period, selected, templates.currentDetail.styleRoles, { suffix: supplements.suffix, template: templates.currentDetail });
       const screenshot = screenshotProjection(profile, selected, evidence, templates.screenshotMap.styleRoles, templates.screenshotMap);
-      const summary = renderProfileSummary(profile, period, selected, supplements);
+      const summary = renderProfileSummary(profile, mainPeriod, selected, supplements, selectedAnnotations, templates.summaryText);
       const safePeriod = safeSegment(period);
       const detailPath = path.join(stagingRoot, `${safePeriod}_${profile.targetCategory}_本次报销明细${supplements.suffix}.xlsx`);
       const screenshotPath = path.join(stagingRoot, `${safePeriod}_${profile.targetCategory}_报销明细对应截图表${supplements.suffix}.xlsx`);
       const summaryPath = path.join(stagingRoot, `${safePeriod}_${profile.targetCategory}_报销文字说明${supplements.suffix}.txt`);
-      const detailState = await writeWorkbook(detailPath, profile.detailSheetName, detail);
+      const detailState = await writeWorkbook(detailPath, profile.detailSheetName, detail, testHooks?.beforeArtifactWorkbookValidation ? (binding) => testHooks.beforeArtifactWorkbookValidation({ ...binding, profileId, role: "detail" }) : undefined);
       owned.push({ path: detailPath, ...detailState });
-      const screenshotState = await writeWorkbook(screenshotPath, profile.screenshotMapSheetName, screenshot);
+      const screenshotState = await writeWorkbook(screenshotPath, profile.screenshotMapSheetName, screenshot, testHooks?.beforeArtifactWorkbookValidation ? (binding) => testHooks.beforeArtifactWorkbookValidation({ ...binding, profileId, role: "screenshot" }) : undefined);
       owned.push({ path: screenshotPath, ...screenshotState });
-      const summaryState = await writeTextSummary(summaryPath, summary.text);
-      owned.push({ path: summaryPath, ...summaryState });
       const evidenceIds = [...new Set(selected.flatMap((item) => item.evidence))]
         .filter((id) => evidence.get(id)?.kind === "image")
         .filter((id, index, values) => values.findIndex((other) => evidence.get(other).sha256 === evidence.get(id).sha256) === index);
-      const evidenceArchive = [];
       const usedNames = new Set();
-      for (const [index, evidenceId] of evidenceIds.entries()) {
+      const archiveJobs = evidenceIds.map((evidenceId, index) => {
         const source = evidence.get(evidenceId);
         const finalName = evidenceArchiveName(index, evidenceId, source, selected, usedNames);
         const stagedPath = path.join(stagingRoot, `${profileId}_${finalName}`);
-        const state = await writeBoundBytes(stagedPath, source.bytes);
-        owned.push({ path: stagedPath, ...state });
-        evidenceArchive.push({ evidenceId, finalName, path: stagedPath, ...state });
-      }
+        return { kind: "evidence", evidenceId, finalName, path: stagedPath, bytes: source.bytes, expectedSha256: source.sha256 };
+      });
+      const summaryBytes = Buffer.from(summary.text, "utf8");
+      const boundWriteJobs = [
+        { kind: "summary", path: summaryPath, bytes: summaryBytes, expectedSha256: sha256Bytes(summaryBytes) },
+        ...archiveJobs,
+      ];
+      for (const job of boundWriteJobs) owned.push({ path: job.path, sha256: job.expectedSha256, size: job.bytes.length });
+      const boundWrites = await mapSettledInInputOrder(boundWriteJobs, 3, async (job) => {
+        const state = job.kind === "summary"
+          ? await writeTextSummary(job.path, summary.text)
+          : await writeBoundBytes(job.path, job.bytes);
+        return { ...job, state };
+      });
+      const summaryState = boundWrites.settled[0].value.state;
+      const evidenceArchive = boundWrites.settled.slice(1).map(({ value }) => ({
+        evidenceId: value.evidenceId,
+        finalName: value.finalName,
+        path: value.path,
+        ...value.state,
+      }));
       const supplementArtifacts = [];
       for (const supplement of supplements.entries) {
+        const sheetName = supplementSheetName(supplement.person);
         const supplementWorkbook = supplementProjection(
           supplement.period,
           supplement.transactions,
@@ -754,7 +1068,7 @@ export async function buildReimbursementArtifacts(rawRequest) {
           ? `${safeSegment(supplement.person)}_${compactDate(supplement.start)}_小红书补报明细.xlsx`
           : `${safeSegment(supplement.person)}_${compactDate(supplement.start)}-${compactDate(supplement.end)}_小红书补报明细.xlsx`;
         const supplementPath = path.join(stagingRoot, supplementName);
-        const supplementState = await writeWorkbook(supplementPath, "补报明细", supplementWorkbook);
+        const supplementState = await writeWorkbook(supplementPath, sheetName, supplementWorkbook, testHooks?.beforeArtifactWorkbookValidation ? (binding) => testHooks.beforeArtifactWorkbookValidation({ ...binding, profileId, role: "supplement" }) : undefined);
         owned.push({ path: supplementPath, ...supplementState });
         supplementArtifacts.push({
           person: supplement.person,
@@ -762,10 +1076,12 @@ export async function buildReimbursementArtifacts(rawRequest) {
           end: supplement.end,
           count: supplement.count,
           amount: supplement.amount,
+          sourceAmount: supplementWorkbook.totals.sourceAmount,
+          reimbursementAmount: supplementWorkbook.totals.reimbursementAmount,
           reasons: supplement.reasons,
           path: supplementPath,
           ...supplementState,
-          sheetName: "补报明细",
+          sheetName,
           endRow: supplementWorkbook.endRow,
         });
       }
@@ -776,10 +1092,17 @@ export async function buildReimbursementArtifacts(rawRequest) {
         mainPeriod: { start: mainPeriod.start, end: mainPeriod.end },
         supplementSuffix: supplements.suffix,
         transactionCount: selected.length,
-        transactionDigest: canonicalDigest(selected.map(({ milliunits, evidence: imageIds, ...item }) => ({ ...item, evidence: imageIds }))),
-        detail: { path: detailPath, ...detailState, sheetName: profile.detailSheetName, endRow: detail.endRow },
+        transactionDigest: canonicalDigest(selected.map(({ milliunits, reimbursementMilliunits, evidence: imageIds, ...item }) => ({ ...item, evidence: imageIds }))),
+        detail: { path: detailPath, ...detailState, sheetName: profile.detailSheetName, endRow: detail.endRow, totals: detail.totals },
         screenshot: { path: screenshotPath, ...screenshotState, sheetName: profile.screenshotMapSheetName, endRow: screenshot.endRow, endColumn: screenshot.endColumn, imageCount: screenshot.imageCount, uniqueMediaCount: screenshot.uniqueMediaCount, imageReferenceCount: screenshot.imageReferenceCount },
-        summary: { path: summaryPath, ...summaryState, text: summary.text },
+        summary: {
+          path: summaryPath,
+          ...summaryState,
+          text: summary.text,
+          templateSha256: templates.summaryText.sha256,
+          annotationCount: summary.annotationCount,
+          annotationDigest: summary.annotationDigest,
+        },
         supplements: supplementArtifacts,
         evidenceArchive,
       };

@@ -30,13 +30,13 @@ async function createFixture(filePath) {
     horizontalAlignment: "center",
   };
   const rows = [
-    { id: "R1", row: 2, date: "2026-07-30", person: "Alpha", amount: 100.58 },
-    { id: "R2", row: 3, date: "2026-06-10", person: "Beta", amount: 10.125 },
-    { id: "R3", row: 5, date: "2026-06-30", person: "Gamma", amount: -2 },
-    { id: "R4", row: 6, date: "2026-07-10", person: "Same-day first", amount: 3 },
-    { id: "R5", row: 7, date: "2026-07-10", person: "Same-day second", amount: 4 },
-    { id: "R6", row: 9, date: "2026-05-31", person: "Outside scope", amount: 7 },
-    { id: "R7", row: 10, date: "2026-06-01", person: "Start boundary", amount: 1.875 },
+    { id: "R1", row: 2, date: "2031-07-30", person: "Alpha", amount: 100.58 },
+    { id: "R2", row: 3, date: "2031-06-10", person: "Beta", amount: 10.125 },
+    { id: "R3", row: 5, date: "2031-06-30", person: "Gamma", amount: -2 },
+    { id: "R4", row: 6, date: "2031-07-10", person: "Same-day first", amount: 3 },
+    { id: "R5", row: 7, date: "2031-07-10", person: "Same-day second", amount: 4 },
+    { id: "R6", row: 9, date: "2031-05-31", person: "Outside scope", amount: 7 },
+    { id: "R7", row: 10, date: "2031-06-01", person: "Start boundary", amount: 1.875 },
   ];
   const fills = ["#FCE4D6", "#DDEBF7", "#E2F0D9", "#FFF2CC", "#E4DFEC", "#D9EAD3", "#F4CCCC"];
   for (let index = 0; index < rows.length; index += 1) {
@@ -91,12 +91,12 @@ async function createBlockFixture(filePath) {
   sheet.getRange("A1:F1").values = [["Date", "Person", "Amount", "Group", "Reserved", "Reserved"]];
   sheet.getRange("A1:F1").format = { fill: "#1F4E78", font: { bold: true, color: "#FFFFFF" } };
   const rows = [
-    [new Date("2026-07-20T00:00:00Z"), "Alpha", 100, "alpha-group", null, null],
-    [new Date("2026-06-10T00:00:00Z"), "Beta-1", 10, "beta-group", null, null],
+    [new Date("2031-07-20T00:00:00Z"), "Alpha", 100, "alpha-group", null, null],
+    [new Date("2031-06-10T00:00:00Z"), "Beta-1", 10, "beta-group", null, null],
     [null, "Beta-2", 20.125, null, null, null],
-    [new Date("2026-06-30T00:00:00Z"), "Gamma-1", -2, "gamma-group", null, null],
+    [new Date("2031-06-30T00:00:00Z"), "Gamma-1", -2, "gamma-group", null, null],
     [null, "Gamma-2", 4, null, null, null],
-    [new Date("2026-05-31T00:00:00Z"), "Outside scope", 7, "outside", null, null],
+    [new Date("2031-05-31T00:00:00Z"), "Outside scope", 7, "outside", null, null],
   ];
   sheet.getRange("A2:F7").values = rows;
   const fills = ["#FCE4D6", "#DDEBF7", "#E2F0D9", "#FFF2CC", "#E4DFEC", "#D9EAD3"];

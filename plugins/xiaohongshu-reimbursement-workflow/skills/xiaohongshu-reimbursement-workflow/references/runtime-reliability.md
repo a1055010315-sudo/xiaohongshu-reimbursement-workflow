@@ -33,7 +33,7 @@ node scripts/run_reimbursement_workflow.mjs --publish <request.json>
 
 - 完整参数化合成批次回归必须使用批次预览，禁止全历史渲染。
 - 根表构建器不得导入 `audit_ledger_layout.mjs` 或全表 facts reader。
-- 普通完整流程相对旧全表链至少减少 20% 墙钟时间；备注/分类修订目标至少减少 50%。
+- 在同机、同一参数化合成负载和相同冷/热规则下，最终 `prepare + Gate 1 + full-correspondence Gate 2 finalize` 的冷、热中位插件可控时间都必须比只读安装版 `0.5.0+codex.20260819174146` 的 `prepare + Gate 1 + finalize` 至少减少 20%；未安装中间版不得作为基线。
 - 性能变慢时先检查全表扫描、原图重复读取、旧预览重渲染和失败后全批重试，不通过增加并行旧链解决。
 
 ## 错误边界

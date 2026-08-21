@@ -135,9 +135,9 @@ test.before(async () => {
     expectedSourceSha256: await sha256File(sourcePath),
     sheetName: "Ledger",
     physicalRange: "A2:F10",
-    scopeStart: "2026-06-01",
+    scopeStart: "2031-06-01",
     scopeStartInclusive: true,
-    scopeEnd: "2026-07-30",
+    scopeEnd: "2031-07-30",
     scopeEndInclusive: true,
     sortKeys: ["date:asc", "baselineOrder:asc"],
     stableTieBreaker: "baselineOrder",
@@ -177,12 +177,12 @@ test("builds, exhaustively audits, preserves blank rows, and renders an anonymou
   assert.equal(audited.payload.audit, "exhaustive");
 
   const expectedRows = [
-    { row: 2, date: "2026-06-01", person: "Start boundary" },
-    { row: 3, date: "2026-06-10", person: "Beta" },
-    { row: 5, date: "2026-06-30", person: "Gamma" },
-    { row: 6, date: "2026-07-10", person: "Same-day first" },
-    { row: 7, date: "2026-07-10", person: "Same-day second" },
-    { row: 10, date: "2026-07-30", person: "Alpha" },
+    { row: 2, date: "2031-06-01", person: "Start boundary" },
+    { row: 3, date: "2031-06-10", person: "Beta" },
+    { row: 5, date: "2031-06-30", person: "Gamma" },
+    { row: 6, date: "2031-07-10", person: "Same-day first" },
+    { row: 7, date: "2031-07-10", person: "Same-day second" },
+    { row: 10, date: "2031-07-30", person: "Alpha" },
   ];
   const previewPath = path.join(tempDir, "anonymous-candidate-preview.png");
   const visual = runArtifactHelper(["verify-render", outputPath, previewPath]);
@@ -846,9 +846,9 @@ test("mechanically generates and executes a v2 plan for vertical merged record b
       candidateRevision: 1,
       sheetName: "Ledger",
       physicalRange: "A2:F7",
-      scopeStart: "2026-06-01",
+      scopeStart: "2031-06-01",
       scopeStartInclusive: true,
-      scopeEnd: "2026-07-30",
+      scopeEnd: "2031-07-30",
       scopeEndInclusive: true,
       dateColumn: "A",
       amountColumn: "C",
@@ -912,7 +912,7 @@ test("mechanically generates and executes a v2 plan for vertical merged record b
     const previewPath = path.join(stagingRoot, "block-preview.png");
     const visual = runArtifactHelper(["verify-block", generatedPlan.activeCandidatePath, previewPath]);
     assert.deepEqual(visual.payload.persons, ["Beta-1", "Beta-2", "Gamma-1", "Gamma-2", "Alpha", "Outside scope"]);
-    assert.deepEqual(visual.payload.dates, ["2026-06-10", "2026-06-30", "2026-07-20", "2026-05-31"]);
+    assert.deepEqual(visual.payload.dates, ["2031-06-10", "2031-06-30", "2031-07-20", "2031-05-31"]);
     assert.equal(visual.payload.outsideMarker, "outside");
     assert.equal(visual.payload.auxiliaryMarker, "immutable");
     assert.ok(visual.payload.previewSize > 100);
