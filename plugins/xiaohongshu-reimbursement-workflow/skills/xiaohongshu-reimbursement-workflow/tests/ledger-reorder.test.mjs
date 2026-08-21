@@ -20,7 +20,8 @@ const promoteScript = path.join(skillRoot, "scripts", "promote_active_revision.m
 const auditActiveScript = path.join(skillRoot, "scripts", "audit_active_revisions.mjs");
 const publishScript = path.join(skillRoot, "scripts", "publish_ledger_reorder.mjs");
 const artifactHelper = path.join(skillRoot, "tests", "ledger-reorder-artifact-helper.mjs");
-const require = createRequire(import.meta.url);
+const runtimeRoot = path.resolve(path.dirname(process.execPath), "..");
+const require = createRequire(path.join(runtimeRoot, "__codex_bundled_runtime__.cjs"));
 
 async function loadPackage(name) {
   return import(pathToFileURL(require.resolve(name)).href);

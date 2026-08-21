@@ -1,0 +1,159 @@
+{
+  "schemaVersion": 1,
+  "templates": {
+    "current-detail": {
+      "file": "current-detail.xlsx",
+      "sheetName": "本次报销明细",
+      "dataStartRow": 7,
+      "dataStyleRow": 7,
+      "templateRowHeight": 24,
+      "staticMerges": [
+        "A1:F1",
+        "A2:F2",
+        "A3:B3",
+        "C3:D3",
+        "E3:F3",
+        "A4:B4",
+        "C4:D4",
+        "E4:F4",
+        "A5:C5",
+        "D5:F5"
+      ],
+      "outputMergePolicy": {
+        "personGroup": true,
+        "sameDate": true,
+        "expenseGroup": true,
+        "dataAreaDefault": "none"
+      },
+      "outputRowHeightPolicy": {
+        "default": "template",
+        "allowImageLayoutAdjustment": false
+      },
+      "styleRoles": {
+        "title": 1,
+        "subtitle": 2,
+        "summaryLabel": 3,
+        "companySummaryLabel": 4,
+        "feeSummaryLabel": 5,
+        "summaryValue": 6,
+        "companySummaryValue": 7,
+        "feeSummaryValue": 9,
+        "header": 12,
+        "groupLabel": 13,
+        "groupTotal": 14,
+        "date": 15,
+        "text": 16,
+        "amount": 17,
+        "feeTotal": 18,
+        "classification": 19,
+        "settlement": 19,
+        "spacer": 0
+      },
+      "sha256": "73225ce6fc2d90a762b8827804609b553ce4802c18688974afe04cb3a7315ec5"
+    },
+    "screenshot-map": {
+      "file": "screenshot-map.xlsx",
+      "sheetName": "报销明细对应截图表",
+      "dataStartRow": 2,
+      "dataStyleRow": 2,
+      "templateRowHeight": 172.5,
+      "staticMerges": [],
+      "outputMergePolicy": {
+        "personGroup": false,
+        "sameDate": false,
+        "expenseGroup": false,
+        "dataAreaDefault": "none"
+      },
+      "outputRowHeightPolicy": {
+        "default": "template",
+        "allowImageLayoutAdjustment": true
+      },
+      "styleRoles": {
+        "header": 6,
+        "oddDate": 14,
+        "oddText": 15,
+        "oddAmount": 16,
+        "oddNote": 11,
+        "image": 12,
+        "evenDate": 14,
+        "evenText": 15,
+        "evenAmount": 16,
+        "evenNote": 11
+      },
+      "sha256": "a4700529278424e674b110cb0a59b0650263d1ed387db7dcd826beeb8ec5bf71"
+    },
+    "supplement-detail": {
+      "file": "supplement-detail.xlsx",
+      "sheetName": "补报明细",
+      "dataStartRow": 5,
+      "dataStyleRow": 5,
+      "templateRowHeight": 21.95,
+      "staticMerges": [
+        "A1:F1",
+        "A2:F2",
+        "A3:F3"
+      ],
+      "outputMergePolicy": {
+        "personGroup": true,
+        "sameDate": true,
+        "expenseGroup": true,
+        "dataAreaDefault": "none"
+      },
+      "outputRowHeightPolicy": {
+        "default": "template",
+        "allowImageLayoutAdjustment": false
+      },
+      "styleRoles": {
+        "title": 4,
+        "subtitle": 9,
+        "summaryLabel": 13,
+        "companySummaryLabel": 13,
+        "feeSummaryLabel": 13,
+        "summaryValue": 32,
+        "companySummaryValue": 32,
+        "feeSummaryValue": 32,
+        "header": 18,
+        "groupLabel": 23,
+        "groupTotal": 32,
+        "date": 31,
+        "text": 24,
+        "amount": 32,
+        "feeTotal": 32,
+        "classification": 23,
+        "settlement": 23,
+        "spacer": 0
+      },
+      "sha256": "59b6397a60b13cae67dddc5c81293d1339712f25eec33e9b5097c60ed9940ddf"
+    },
+    "ledger-batch-preview": {
+      "file": "ledger-batch-preview.xlsx",
+      "sheetName": "本批总表增量",
+      "dataStartRow": 2,
+      "dataStyleRow": 2,
+      "templateRowHeight": 21.95,
+      "staticMerges": [],
+      "outputMergePolicy": {
+        "personGroup": false,
+        "sameDate": false,
+        "expenseGroup": false,
+        "dataAreaDefault": "none"
+      },
+      "outputRowHeightPolicy": {
+        "default": "template",
+        "allowImageLayoutAdjustment": false
+      },
+      "styleRoles": {
+        "headerDate": 2,
+        "headerText": 3,
+        "headerAmount": 4,
+        "date": 73,
+        "text": 74,
+        "amount": 75,
+        "total": 75,
+        "person": 74,
+        "classification": 74
+      },
+      "sha256": "14d75a6683ae72d221ab404d992b584b141d1c088a445c4ec2e8efe3ecf0d383"
+    }
+  }
+}

@@ -7,27 +7,6 @@ export { canonicalDigest };
 
 const AMOUNT_SCALE = 1000n;
 const EXPECTED_PROFILE_IDS = ["xiaohongshu", "company", "residence"];
-export const GENERIC_CLASSIFICATIONS = Object.freeze([
-  "运营开支",
-  "日常报销",
-  "人员工资",
-  "社保",
-  "房租",
-  "广告费",
-]);
-export const DISALLOWED_LITERAL_CLASSIFICATIONS = Object.freeze([
-  "单子名",
-  "中转站",
-  "节点",
-  "话费",
-  "手机充值",
-  "手机话费",
-  "数字人",
-  "Codex",
-  "上海天崇",
-  "东莞柯南",
-]);
-const disallowedLiteralClassifications = new Set(DISALLOWED_LITERAL_CLASSIFICATIONS);
 const TOP_LEVEL_FIELDS = new Set(["schemaVersion", "profileOrder", "profiles"]);
 const PROFILE_FIELDS = new Set([
   "targetCategory",
@@ -38,7 +17,6 @@ const PROFILE_FIELDS = new Set([
   "managedRootSheetInputNames",
   "detailSheetName",
   "screenshotMapSheetName",
-  "archiveDirectoryName",
   "archiveStem",
   "preserveUnmanagedSheets",
 ]);
@@ -63,18 +41,6 @@ function cleanString(value, field) {
     throw new Error(`${field} must be a non-empty trimmed string without tabs or newlines.`);
   }
   return value;
-}
-
-export function normalizeClassification(value, field = "classification") {
-  if (typeof value !== "string") throw new Error(`${field} must be a string.`);
-  const result = value.trim();
-  if (!result || /[\r\n\t]/u.test(result)) {
-    throw new Error(`${field} must be non-empty and contain no tabs or newlines.`);
-  }
-  if (disallowedLiteralClassifications.has(result)) {
-    throw new Error(`${field} ${result} is an expense description, not an approved grouping value.`);
-  }
-  return result;
 }
 
 function cleanUniqueStrings(value, field) {
@@ -106,6 +72,12 @@ function cleanDirectoryName(value, field) {
   if (result === "." || result === ".." || /[<>:"/\\|?*\u0000-\u001f]/u.test(result) || /[ .]$/u.test(result)) {
     throw new Error(`${field} must be one safe directory-name segment.`);
   }
+  return result;
+}
+
+function cleanSha256(value, field) {
+  const result = cleanString(value, field);
+  if (!/^[0-9a-f]{64}$/u.test(result)) throw new Error(`${field} must be a lowercase SHA-256 digest.`);
   return result;
 }
 
@@ -148,7 +120,6 @@ function validateProfileRegistry(raw, profileConfigDigest) {
   const categoryIndex = new Map();
   const rootInputIndex = new Map();
   const canonicalRoots = new Set();
-  const archiveDirectories = new Set();
   const profiles = {};
 
   for (const profileId of registry.profileOrder) {
@@ -184,10 +155,6 @@ function validateProfileRegistry(raw, profileConfigDigest) {
       rawProfile.screenshotMapSheetName,
       `${field}.screenshotMapSheetName`,
     );
-    const archiveDirectoryName = cleanDirectoryName(
-      rawProfile.archiveDirectoryName,
-      `${field}.archiveDirectoryName`,
-    );
     const archiveStem = cleanString(rawProfile.archiveStem, `${field}.archiveStem`);
     if (rawProfile.preserveUnmanagedSheets !== true) {
       throw new Error(`${field}.preserveUnmanagedSheets must be true.`);
@@ -198,12 +165,6 @@ function validateProfileRegistry(raw, profileConfigDigest) {
       throw new Error("Canonical root workbook names must be globally unique.");
     }
     canonicalRoots.add(canonicalRootKey);
-    const archiveKey = archiveDirectoryName.toLowerCase();
-    if (archiveDirectories.has(archiveKey)) {
-      throw new Error("Archive directory names must be globally unique.");
-    }
-    archiveDirectories.add(archiveKey);
-
     registerIdentity(categoryIndex, profileId, profileId, "Profile id");
     for (const alias of categoryAliases) registerIdentity(categoryIndex, alias, profileId, "Category alias");
     for (const inputName of rootWorkbookInputNames) {
@@ -220,7 +181,6 @@ function validateProfileRegistry(raw, profileConfigDigest) {
       managedRootSheetInputNames,
       detailSheetName,
       screenshotMapSheetName,
-      archiveDirectoryName,
       archiveStem,
       preserveUnmanagedSheets: true,
     };

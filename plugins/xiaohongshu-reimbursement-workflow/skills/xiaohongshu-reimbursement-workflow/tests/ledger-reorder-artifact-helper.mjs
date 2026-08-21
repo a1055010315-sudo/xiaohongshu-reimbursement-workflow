@@ -3,7 +3,8 @@ import path from "node:path";
 import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
 
-const require = createRequire(import.meta.url);
+const runtimeRoot = path.resolve(path.dirname(process.execPath), "..");
+const require = createRequire(path.join(runtimeRoot, "__codex_bundled_runtime__.cjs"));
 
 async function loadArtifactTool() {
   return import(pathToFileURL(require.resolve("@oai/artifact-tool")).href);

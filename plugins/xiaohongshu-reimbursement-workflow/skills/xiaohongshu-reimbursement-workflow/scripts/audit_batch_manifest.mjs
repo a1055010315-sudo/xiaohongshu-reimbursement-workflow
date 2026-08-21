@@ -2,13 +2,11 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
 import crypto from "node:crypto";
-import { fileURLToPath } from "node:url";
 
 import {
   canonicalDigest as digest,
   formatMilliunits as formatAmount,
   loadProfileRegistry,
-  normalizeClassification,
   parseMilliunits as parseAmount,
   resolveProfile,
 } from "./finance_domain.mjs";
@@ -17,7 +15,7 @@ import {
   readStableUtf8JsonFile,
 } from "./workflow_primitives.mjs";
 
-const VALIDATOR_VERSION = "4";
+const VALIDATOR_VERSION = "5";
 const SHA256_RE = /^[0-9a-f]{64}$/;
 const SETTLEMENTS = new Set(["employee_reimbursement", "company_paid_no_reimbursement"]);
 const ADJUSTMENT_TYPES = new Set(["refund", "adjustment"]);
@@ -407,38 +405,13 @@ async function mapWithConcurrency(items, limit, worker) {
   return results;
 }
 
-// Keep the auditor usable when it is copied as a standalone script (for
-// example, the profile-registry isolation test).  The normal plugin path
-// dynamically loads the shared cache; an injected cache always wins and is
-// the preferred path for the workflow's multi-stage run.
-async function loadEvidenceCache() {
-  try {
-    const module = await import("./evidence_cache.mjs");
-    return new module.EvidenceCache({ maxBytes: 25 * 1024 * 1024 });
-  } catch (error) {
-    if (error?.code === "ERR_MODULE_NOT_FOUND" || /Cannot find module|Cannot find the module/iu.test(error?.message ?? "")) {
-      return null;
-    }
-    throw error;
-  }
-}
+const manifestPath = process.argv[2];
+const deferOrdinaryFileVerification = process.argv[3] === "--defer-ordinary-file-verification";
 
-async function readEvidenceWithCache(cache, file, options) {
-  if (!cache) return null;
-  if (typeof cache.readStable !== "function") throw new Error("evidenceCache.readStable must be a function.");
-  const cached = await cache.readStable(file.path, options);
-  if (cached?.sourceSha256 !== options.expectedSha256) {
-    throw new Error(`Manifest file SHA256 does not match: ${file.id}`);
+try {
+  if (!manifestPath || process.argv[4] !== undefined || (process.argv[3] !== undefined && !deferOrdinaryFileVerification)) {
+    throw new Error("Use audit_batch_manifest.mjs <manifest.json> [--defer-ordinary-file-verification].");
   }
-  return cached;
-}
-
-export async function auditBatchManifest(manifestPath, options = {}) {
-  requireObject(options, "audit options");
-  const unknownOption = Object.keys(options).find((key) => key !== "evidenceCache");
-  if (unknownOption) throw new Error(`audit options contains unsupported field ${unknownOption}.`);
-  const injectedEvidenceCache = options.evidenceCache;
-  const evidenceCache = injectedEvidenceCache === undefined ? await loadEvidenceCache() : injectedEvidenceCache;
   const absoluteManifestPath = path.resolve(manifestPath);
   const manifestSnapshot = await readStableUtf8JsonFile(absoluteManifestPath, {
     maxBytes: DEFAULT_STABLE_JSON_MAX_BYTES,
@@ -451,6 +424,9 @@ export async function auditBatchManifest(manifestPath, options = {}) {
   }
 
   const normalizedOperation = normalizeOperation(manifest);
+  if (deferOrdinaryFileVerification && !(manifest.version === 3 && normalizedOperation.mode === "reimbursement-batch")) {
+    throw new Error("Deferred file verification is only valid for manifest v3 ordinary reimbursement.");
+  }
   const rulesVersion = cleanString(manifest.rulesVersion, "manifest.rulesVersion");
   const profileRegistry = manifest.version === 3 && normalizedOperation.mode === "reimbursement-batch"
     ? await loadProfileRegistry()
@@ -459,6 +435,14 @@ export async function auditBatchManifest(manifestPath, options = {}) {
   const rootPath = cleanString(batch.rootPath, "manifest.batch.rootPath");
   const archivePath = cleanString(batch.archivePath, "manifest.batch.archivePath");
   const period = cleanString(batch.period, "manifest.batch.period");
+  let mainPeriod;
+  if (manifest.version === 3 && normalizedOperation.mode === "reimbursement-batch") {
+    const rawMainPeriod = requireObject(batch.mainPeriod, "manifest.batch.mainPeriod");
+    const start = cleanIsoDate(rawMainPeriod.start, "manifest.batch.mainPeriod.start");
+    const end = cleanIsoDate(rawMainPeriod.end, "manifest.batch.mainPeriod.end");
+    if (end < start) throw new Error("manifest.batch.mainPeriod.end must not precede start.");
+    mainPeriod = { start, end };
+  }
   const rawTargetCategory = cleanString(batch.targetCategory, "manifest.batch.targetCategory");
   const targetProfile = profileRegistry ? resolveProfile(rawTargetCategory, profileRegistry) : undefined;
   const targetCategory = targetProfile?.targetCategory ?? rawTargetCategory;
@@ -480,6 +464,7 @@ export async function auditBatchManifest(manifestPath, options = {}) {
     targetCategory,
     reviewRevision,
   };
+  if (mainPeriod) normalizedBatch.mainPeriod = mainPeriod;
   if (batchId !== undefined) normalizedBatch.batchId = batchId;
   if (targetProfile) normalizedBatch.targetProfileId = targetProfile.profileId;
 
@@ -509,6 +494,15 @@ export async function auditBatchManifest(manifestPath, options = {}) {
       }
       normalized.kind = kind;
       normalized.disposition = disposition;
+      if (manifest.version === 3 && disposition === "used") {
+        const usage = cleanString(file.usage, `manifest.files[${index}].usage`);
+        if (!new Set(["voucher", "context"]).has(usage)) {
+          throw new Error(`manifest.files[${index}].usage must be voucher or context.`);
+        }
+        normalized.usage = usage;
+      } else if (file.usage !== undefined) {
+        throw new Error(`manifest.files[${index}].usage is only valid for used v3 materials.`);
+      }
       if (disposition === "excluded") {
         normalized.reason = cleanString(file.reason, `manifest.files[${index}].reason`);
       }
@@ -571,24 +565,13 @@ export async function auditBatchManifest(manifestPath, options = {}) {
   }
 
   const verifiedFiles = await mapWithConcurrency(normalizedFiles, 4, async (file) => {
-    if (evidenceCache && file.role === "material" && file.kind === "image" && file.disposition === "used") {
-      const cached = await readEvidenceWithCache(evidenceCache, file, {
-        sourceId: file.id,
-        kind: "image",
-        expectedSha256: file.sha256,
-        // Audit owns the stable file/hash contract; the artifact stage can
-        // parse these retained bytes without touching the source again.
-        parse: false,
-      });
-      if (cached) {
-        return { ...file, size: cached.size, imageKind: cached.imageKind, width: cached.width, height: cached.height };
-      }
-    }
     const stat = await fsp.stat(file.path);
     if (!stat.isFile()) throw new Error(`Manifest file is not a regular file: ${file.id}`);
-    const actualSha256 = await sha256File(file.path);
-    if (actualSha256 !== file.sha256) {
-      throw new Error(`SHA256 mismatch for ${file.id}: expected ${file.sha256}, actual ${actualSha256}`);
+    if (!deferOrdinaryFileVerification) {
+      const actualSha256 = await sha256File(file.path);
+      if (actualSha256 !== file.sha256) {
+        throw new Error(`SHA256 mismatch for ${file.id}: expected ${file.sha256}, actual ${actualSha256}`);
+      }
     }
     return { ...file, size: stat.size };
   });
@@ -635,12 +618,66 @@ export async function auditBatchManifest(manifestPath, options = {}) {
       const profile = profileRegistry ? resolveProfile(rawCategory, profileRegistry) : undefined;
       const category = profile?.targetCategory ?? rawCategory;
       const classification = manifest.version === 3
-        ? normalizeClassification(transaction.classification, `manifest.transactions[${index}].classification`)
+        ? cleanString(transaction.classification, `manifest.transactions[${index}].classification`)
         : undefined;
-      const amount = parseAmount(transaction.amount, `manifest.transactions[${index}].amount`, {
-        allowNegative: manifest.version >= 2,
-      });
+      let sourceAmount;
+      let reimbursementAmount;
+      let reportingKind;
+      let supplementReason;
+      if (manifest.version === 3) {
+        sourceAmount = parseAmount(
+          transaction.sourceAmount,
+          `manifest.transactions[${index}].sourceAmount`,
+          { allowNegative: true },
+        );
+        reimbursementAmount = parseAmount(
+          transaction.reimbursementAmount,
+          `manifest.transactions[${index}].reimbursementAmount`,
+          { allowNegative: true },
+        );
+        if (transaction.amount !== undefined) {
+          const legacyAmount = parseAmount(transaction.amount, `manifest.transactions[${index}].amount`, {
+            allowNegative: true,
+          });
+          if (legacyAmount !== sourceAmount) {
+            throw new Error(`manifest.transactions[${index}].amount must equal sourceAmount when supplied.`);
+          }
+        }
+        const declaredReportingKind = cleanString(
+          transaction.reportingKind,
+          `manifest.transactions[${index}].reportingKind`,
+        );
+        if (!new Set(["current", "supplement"]).has(declaredReportingKind)) {
+          throw new Error(`manifest.transactions[${index}].reportingKind must be current or supplement.`);
+        }
+        reportingKind = date < mainPeriod.start ? "supplement" : declaredReportingKind;
+        if (date > mainPeriod.end && reportingKind === "current") {
+          throw new Error(`manifest.transactions[${index}] current date is outside mainPeriod.`);
+        }
+        if (reportingKind === "supplement") {
+          supplementReason = cleanString(
+            transaction.supplementReason,
+            `manifest.transactions[${index}].supplementReason`,
+          );
+        } else if (transaction.supplementReason !== undefined) {
+          throw new Error(`manifest.transactions[${index}].supplementReason is only valid for supplements.`);
+        }
+      } else {
+        sourceAmount = parseAmount(transaction.amount, `manifest.transactions[${index}].amount`, {
+          allowNegative: manifest.version >= 2,
+        });
+        reimbursementAmount = sourceAmount;
+      }
+      const amount = sourceAmount;
       const settlement = settlementForTransaction(transaction, index, manifest.version);
+      if (manifest.version === 3) {
+        if (settlement === "company_paid_no_reimbursement" && reimbursementAmount !== 0n) {
+          throw new Error(`manifest.transactions[${index}].reimbursementAmount must be 0 for company_paid_no_reimbursement.`);
+        }
+        if (settlement === "employee_reimbursement" && reimbursementAmount < 0n !== (sourceAmount < 0n)) {
+          throw new Error(`manifest.transactions[${index}] sourceAmount and reimbursementAmount signs must agree.`);
+        }
+      }
       const adjustment = normalizeAdjustment(transaction, index, amount, manifest.version);
       if (!Array.isArray(transaction.evidence)) {
         throw new Error(`manifest.transactions[${index}].evidence must be an array.`);
@@ -700,41 +737,16 @@ export async function auditBatchManifest(manifestPath, options = {}) {
       if (imageEvidence.length > 0 && transaction.missingEvidenceConfirmed === true) {
         throw new Error(`Transaction ${id} cannot have image evidence and missingEvidenceConfirmed together.`);
       }
-      let supplementEvidence = [];
-      if (transaction.supplementEvidence !== undefined) {
-        if (manifest.version !== 3 || !Array.isArray(transaction.supplementEvidence) || transaction.supplementEvidence.length === 0) {
-          throw new Error(`manifest.transactions[${index}].supplementEvidence must be a non-empty array in v3.`);
-        }
-        supplementEvidence = transaction.supplementEvidence.map((value, evidenceIndex) =>
-          cleanString(value, `manifest.transactions[${index}].supplementEvidence[${evidenceIndex}]`),
-        );
-        if (new Set(supplementEvidence).size !== supplementEvidence.length) {
-          throw new Error(`manifest.transactions[${index}].supplementEvidence contains duplicate ids.`);
-        }
-        if (transaction.supplement !== true) {
-          throw new Error(`manifest.transactions[${index}].supplementEvidence requires supplement: true.`);
-        }
-        for (const evidenceId of supplementEvidence) {
-          if (!evidence.includes(evidenceId) || fileById.get(evidenceId)?.kind !== "image") {
-            throw new Error(`Transaction ${id} supplementEvidence must be image ids from its evidence array.`);
-          }
-        }
-        if (!imageEvidence.some((evidenceId) => !supplementEvidence.includes(evidenceId))) {
-          throw new Error(`Transaction ${id} must retain at least one ordinary reimbursement image outside supplementEvidence.`);
-        }
-      }
-      categoryTotals.set(category, (categoryTotals.get(category) ?? 0n) + amount);
-      settlementTotals.set(settlement, (settlementTotals.get(settlement) ?? 0n) + amount);
-      if (settlement === "employee_reimbursement") {
-        categoryRealTotals.set(category, (categoryRealTotals.get(category) ?? 0n) + amount);
-      }
+      categoryTotals.set(category, (categoryTotals.get(category) ?? 0n) + sourceAmount);
+      settlementTotals.set(settlement, (settlementTotals.get(settlement) ?? 0n) + sourceAmount);
+      categoryRealTotals.set(category, (categoryRealTotals.get(category) ?? 0n) + reimbursementAmount);
       const normalized = {
         id,
         date,
         person,
         project,
         label,
-        amount: formatAmount(amount),
+        amount: formatAmount(sourceAmount),
         category,
       };
       if (profile) normalized.profileId = profile.profileId;
@@ -746,8 +758,13 @@ export async function auditBatchManifest(manifestPath, options = {}) {
         normalized.settlement = settlement;
         if (adjustment) normalized.adjustment = adjustment;
       }
+      if (manifest.version === 3) {
+        normalized.sourceAmount = formatAmount(sourceAmount);
+        normalized.reimbursementAmount = formatAmount(reimbursementAmount);
+        normalized.reportingKind = reportingKind;
+        if (supplementReason !== undefined) normalized.supplementReason = supplementReason;
+      }
       normalized.evidence = evidence;
-      if (supplementEvidence.length > 0) normalized.supplementEvidence = supplementEvidence;
       if (sourceRefs !== undefined) normalized.sourceRefs = sourceRefs;
       normalized.missingEvidenceConfirmed = transaction.missingEvidenceConfirmed === true;
       return normalized;
@@ -815,15 +832,32 @@ export async function auditBatchManifest(manifestPath, options = {}) {
       throw new Error("manifest.transactions must contain at least one target-category transaction.");
     }
     const allowNegative = manifest.version >= 2;
-    const expectedFeeTotal = parseAmount(manifest.expectedFeeTotal, "manifest.expectedFeeTotal", { allowNegative });
-    const expectedRealTotal = parseAmount(manifest.expectedRealTotal, "manifest.expectedRealTotal", { allowNegative });
-    if (expectedFeeTotal !== categoryTotals.get(targetCategory)) {
-      throw new Error("Calculated target-category fee total does not match manifest.expectedFeeTotal.");
+    const expectedV3 = manifest.version === 3 ? requireObject(manifest.expected, "manifest.expected") : null;
+    const expectedFeeTotal = parseAmount(
+      expectedV3?.feeTotal ?? manifest.expectedFeeTotal,
+      manifest.version === 3 ? "manifest.expected.feeTotal" : "manifest.expectedFeeTotal",
+      { allowNegative },
+    );
+    const expectedRealTotal = parseAmount(
+      expectedV3?.reimbursementTotal ?? manifest.expectedRealTotal,
+      manifest.version === 3 ? "manifest.expected.reimbursementTotal" : "manifest.expectedRealTotal",
+      { allowNegative },
+    );
+    const calculatedFeeTotal = manifest.version === 3
+      ? [...categoryTotals.values()].reduce((sum, value) => sum + value, 0n)
+      : categoryTotals.get(targetCategory);
+    const calculatedRealTotal = manifest.version === 3
+      ? [...categoryRealTotals.values()].reduce((sum, value) => sum + value, 0n)
+      : (categoryRealTotals.get(targetCategory) ?? 0n);
+    if (expectedFeeTotal !== calculatedFeeTotal) {
+      throw new Error("Calculated fee total does not match the manifest expected fee total.");
     }
-    if (expectedRealTotal !== (categoryRealTotals.get(targetCategory) ?? 0n)) {
-      throw new Error("Calculated target-category real total does not match manifest.expectedRealTotal.");
+    if (expectedRealTotal !== calculatedRealTotal) {
+      throw new Error("Calculated reimbursement total does not match the manifest expected reimbursement total.");
     }
-    const expectedCategoryTotals = requireObject(manifest.expectedCategoryTotals, "manifest.expectedCategoryTotals");
+    const expectedCategoryTotals = manifest.version === 3
+      ? Object.fromEntries([...categoryTotals].map(([category, total]) => [category, formatAmount(total)]))
+      : requireObject(manifest.expectedCategoryTotals, "manifest.expectedCategoryTotals");
     if (Object.keys(expectedCategoryTotals).length !== categoryTotals.size) {
       throw new Error("manifest.expectedCategoryTotals categories do not match calculated categories.");
     }
@@ -852,6 +886,46 @@ export async function auditBatchManifest(manifestPath, options = {}) {
           .map(([category, total]) => [category, formatAmount(total)]),
       ),
     };
+    if (manifest.version === 3) {
+      const allowedExpected = new Set([
+        "transactionCount", "feeTotal", "reimbursementTotal", "companyPaidNoReimbursementTotal",
+        "uniqueMediaCount", "mediaReferenceCount",
+      ]);
+      for (const key of Object.keys(expectedV3)) {
+        if (!allowedExpected.has(key)) throw new Error(`manifest.expected contains unknown field ${key}.`);
+      }
+      for (const key of allowedExpected) {
+        if (!Object.hasOwn(expectedV3, key)) throw new Error(`manifest.expected.${key} is required.`);
+      }
+      if (!Number.isSafeInteger(expectedV3.transactionCount) || expectedV3.transactionCount < 1 || expectedV3.transactionCount !== normalizedTransactions.length) {
+        throw new Error("manifest.expected.transactionCount does not match calculated transactions.");
+      }
+      const companyPaidTotal = settlementTotals.get("company_paid_no_reimbursement") ?? 0n;
+      if (parseAmount(expectedV3.companyPaidNoReimbursementTotal, "manifest.expected.companyPaidNoReimbursementTotal", { allowNegative }) !== companyPaidTotal) {
+        throw new Error("manifest.expected.companyPaidNoReimbursementTotal does not match calculated company-paid amount.");
+      }
+      const usedImageHashes = new Set(
+        normalizedTransactions.flatMap((transaction) => transaction.evidence)
+          .filter((id) => fileById.get(id)?.kind === "image")
+          .map((id) => fileById.get(id).sha256),
+      );
+      const mediaReferenceCount = normalizedTransactions.reduce(
+        (count, transaction) => count + transaction.evidence.filter((id) => fileById.get(id)?.kind === "image").length,
+        0,
+      );
+      for (const [field, actual] of [
+        ["uniqueMediaCount", usedImageHashes.size],
+        ["mediaReferenceCount", mediaReferenceCount],
+      ]) {
+        if (!Number.isSafeInteger(expectedV3[field]) || expectedV3[field] < 0 || expectedV3[field] !== actual) {
+          throw new Error(`manifest.expected.${field} does not match calculated image coverage.`);
+        }
+      }
+      normalizedExpectedTotals.companyPaidNoReimbursementTotal = formatAmount(companyPaidTotal);
+      normalizedExpectedTotals.transactionCount = normalizedTransactions.length;
+      normalizedExpectedTotals.uniqueMediaCount = usedImageHashes.size;
+      normalizedExpectedTotals.mediaReferenceCount = mediaReferenceCount;
+    }
     if (profileRegistry) {
       const transactionCounts = new Map();
       for (const transaction of normalizedTransactions) {
@@ -870,7 +944,6 @@ export async function auditBatchManifest(manifestPath, options = {}) {
           managedRootSheetName: profile.managedRootSheetName,
           detailSheetName: profile.detailSheetName,
           screenshotMapSheetName: profile.screenshotMapSheetName,
-          archiveDirectoryName: profile.archiveDirectoryName,
           archiveStem: profile.archiveStem,
           preserveUnmanagedSheets: profile.preserveUnmanagedSheets,
         };
@@ -880,15 +953,17 @@ export async function auditBatchManifest(manifestPath, options = {}) {
     manifest.transactions !== undefined ||
     manifest.expectedFeeTotal !== undefined ||
     manifest.expectedRealTotal !== undefined ||
-    manifest.expectedCategoryTotals !== undefined
+    manifest.expectedCategoryTotals !== undefined ||
+    manifest.expected !== undefined
   ) {
     throw new Error("ledger-reorder-correction must not contain reimbursement transactions or reimbursement totals.");
   }
 
   const filesForDigest = [...verifiedFiles]
-    .map(({ id, role, path: filePath, sha256, size, current }) => {
+    .map(({ id, role, path: filePath, sha256, size, current, usage }) => {
       const result = { id, role, path: filePath, sha256, size };
       if (current !== undefined) result.current = current;
+      if (usage !== undefined) result.usage = usage;
       return result;
     })
     .sort((a, b) => a.id.localeCompare(b.id));
@@ -901,7 +976,7 @@ export async function auditBatchManifest(manifestPath, options = {}) {
       ...transaction,
       category: normalizedTransactions[index].category,
     }));
-    manifestForDigest.expectedCategoryTotals = normalizedExpectedCategoryInputs;
+    if (manifest.version < 3) manifestForDigest.expectedCategoryTotals = normalizedExpectedCategoryInputs;
   }
   const manifestDigest = digest(manifestForDigest);
   const filesDigest = digest(filesForDigest);
@@ -914,7 +989,6 @@ export async function auditBatchManifest(manifestPath, options = {}) {
   if (manifest.version >= 2) {
     const factTransactions = transactionsForDigest.map(({
       evidence,
-      supplementEvidence,
       missingEvidenceConfirmed,
       sourceRefs,
       ...transaction
@@ -934,12 +1008,11 @@ export async function auditBatchManifest(manifestPath, options = {}) {
     factsDigest = digest(factsPreimage);
     const usedMaterials = verifiedFiles
       .filter((file) => file.role === "material" && file.disposition === "used")
-      .map(({ id, sha256, kind, disposition }) => ({ id, sha256, kind, disposition }))
+      .map(({ id, sha256, kind, disposition, usage }) => ({ id, sha256, kind, disposition, usage }))
       .sort((left, right) => left.id.localeCompare(right.id));
-    const transactionEvidence = transactionsForDigest.map(({ id, evidence, supplementEvidence = [], missingEvidenceConfirmed }) => ({
+    const transactionEvidence = transactionsForDigest.map(({ id, evidence, missingEvidenceConfirmed }) => ({
       transactionId: id,
       evidence,
-      supplementEvidence,
       missingEvidenceConfirmed,
     }));
     evidenceDigest = digest({ usedMaterials, transactionEvidence });
@@ -1031,6 +1104,7 @@ export async function auditBatchManifest(manifestPath, options = {}) {
     batch: normalizedBatch,
     operation: operationForDigest,
     files: verifiedFiles.length,
+    fileVerificationMode: deferOrdinaryFileVerification ? "bound-builders" : "manifest-auditor",
     transactions: normalizedTransactions.length,
   };
   if (manifest.version >= 2) {
@@ -1057,17 +1131,8 @@ export async function auditBatchManifest(manifestPath, options = {}) {
       [...settlementTotals].map(([settlement, total]) => [settlement, formatAmount(total)]),
     );
   }
-  return result;
-}
-
-if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url))) {
-  const manifestPath = process.argv[2];
-  try {
-    if (!manifestPath || process.argv[3] !== undefined) throw new Error("Use audit_batch_manifest.mjs <manifest.json>.");
-    const result = await auditBatchManifest(manifestPath);
-    process.stdout.write(`${JSON.stringify(result)}\n`);
-    process.exitCode = 0;
-  } catch (error) {
-    fail(error instanceof Error ? error.message : String(error));
-  }
+  process.stdout.write(`${JSON.stringify(result)}\n`);
+  process.exitCode = 0;
+} catch (error) {
+  fail(error instanceof Error ? error.message : String(error));
 }

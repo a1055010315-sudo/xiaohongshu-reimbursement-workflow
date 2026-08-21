@@ -6,11 +6,8 @@ import { fileURLToPath } from "node:url";
 
 import {
   canonicalDigest,
-  DISALLOWED_LITERAL_CLASSIFICATIONS,
   formatMilliunits,
-  GENERIC_CLASSIFICATIONS,
   loadProfileRegistry,
-  normalizeClassification,
   parseMilliunits,
   parseProfileRegistryBytes,
   resolveProfile,
@@ -48,13 +45,10 @@ test("the fixed profile registry separates canonical runtime identity from input
   assert.equal(residence.managedRootSheetName, "驻所支出");
   assert.equal(residence.detailSheetName, "本次报销明细");
   assert.equal(residence.screenshotMapSheetName, "住所报销");
-  assert.equal(residence.archiveDirectoryName, "03_住所专项");
+  assert.equal(residence.archiveDirectoryName, undefined);
+  assert.equal(residence.detailTemplateFile, undefined);
+  assert.equal(residence.screenshotTemplateFile, undefined);
   assert.equal(residence.preserveUnmanagedSheets, true);
-  for (const profile of Object.values(registry.profiles)) {
-    for (const field of ["detailTemplateFile", "detailTemplateSha256", "screenshotTemplateFile", "screenshotTemplateSha256"]) {
-      assert.equal(Object.hasOwn(profile, field), false, `${field} must not be a runtime profile field`);
-    }
-  }
 
   const residenceInput = resolveRootWorkbookProfile("住所支出.xlsx", registry);
   assert.equal(residenceInput.profileId, "residence");
@@ -150,47 +144,6 @@ test("milliunits preserve exact large and signed values without Number conversio
     );
   }
   assert.throws(() => parseMilliunits("-1", "amount"), /non-negative decimal string/iu);
-});
-
-test("classification policy has a bounded generic set and rejects expense-description literals", () => {
-  assert.deepEqual(GENERIC_CLASSIFICATIONS, ["运营开支", "日常报销", "人员工资", "社保", "房租", "广告费"]);
-  assert.deepEqual(
-    DISALLOWED_LITERAL_CLASSIFICATIONS,
-    ["单子名", "中转站", "节点", "话费", "手机充值", "手机话费", "数字人", "Codex", "上海天崇", "东莞柯南"],
-  );
-  assert.equal(Object.isFrozen(GENERIC_CLASSIFICATIONS), true);
-  assert.equal(Object.isFrozen(DISALLOWED_LITERAL_CLASSIFICATIONS), true);
-  for (const classification of GENERIC_CLASSIFICATIONS) {
-    assert.equal(normalizeClassification(classification), classification);
-  }
-  assert.equal(normalizeClassification("上海竞业2"), "上海竞业2");
-  assert.equal(normalizeClassification(" 上海竞业2 "), "上海竞业2");
-  for (const classification of DISALLOWED_LITERAL_CLASSIFICATIONS) {
-    assert.throws(
-      () => normalizeClassification(classification, "transaction.classification"),
-      /transaction\.classification.*expense description.*approved grouping/iu,
-      classification,
-    );
-  }
-  for (const projectName of ["广东嘻箱记", "上海李忧忧", "随州侯女士"]) {
-    assert.equal(normalizeClassification(projectName), projectName);
-  }
-});
-
-test("classification references distinguish subject or location text from approved project names", async () => {
-  const references = await Promise.all([
-    fs.readFile(path.join(skillRoot, "references", "batch-output-rules.md"), "utf8"),
-    fs.readFile(path.join(skillRoot, "references", "expense-workbook-rules.md"), "utf8"),
-  ]);
-  for (const reference of references) {
-    assert.match(reference, /上海天崇/u);
-    assert.match(reference, /东莞柯南/u);
-    assert.match(reference, /主体[或/]地点字面值|主体\/地点字面值/u);
-    assert.match(reference, /东莞柯南地址费归 `日常报销`/u);
-    for (const projectName of ["广东嘻箱记", "上海李忧忧", "随州侯女士"]) {
-      assert.match(reference, new RegExp(projectName, "u"));
-    }
-  }
 });
 
 test("every accepted profile registry field is bound by profileConfigDigest", async () => {

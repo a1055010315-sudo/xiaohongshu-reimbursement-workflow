@@ -1,0 +1,364 @@
+{
+  "schemaVersion": 1,
+  "contractId": "xhs-reimbursement-semantic-layout-v1",
+  "baseProfile": "xiaohongshu",
+  "scope": {
+    "applyOnlyToEditableExpenseSheets": true,
+    "excludeProtectedSheets": true
+  },
+  "semanticColumns": {
+    "ledgerRoot": {
+      "A": "date",
+      "B": "project",
+      "C": "amount",
+      "D": "groupTotal",
+      "E": "personOrSubject",
+      "F": "classification"
+    },
+    "currentDetail": {
+      "A": "date",
+      "B": "project",
+      "C": "amount",
+      "D": "groupTotal",
+      "E": "classification",
+      "F": "settlementDisplay"
+    }
+  },
+  "roles": {
+    "title": {
+      "font": {
+        "name": "仿宋",
+        "sizePoints": 14,
+        "bold": true,
+        "colorArgb": "FF000000"
+      },
+      "horizontalAlignment": "center",
+      "verticalAlignment": "middle",
+      "wrapText": true,
+      "shrinkToFit": false,
+      "fillToken": "primary",
+      "borderToken": "none",
+      "rowHeightPoints": 32
+    },
+    "header": {
+      "font": {
+        "name": "仿宋",
+        "sizePoints": 14,
+        "bold": false,
+        "colorArgb": "FF000000"
+      },
+      "horizontalAlignment": "center",
+      "verticalAlignment": "middle",
+      "wrapText": true,
+      "shrinkToFit": false,
+      "fillToken": "primary",
+      "borderToken": "none",
+      "rowHeightPoints": 21.95
+    },
+    "summaryCard": {
+      "font": {
+        "name": "仿宋",
+        "sizePoints": 14,
+        "bold": true,
+        "colorArgb": "FF000000"
+      },
+      "horizontalAlignment": "center",
+      "verticalAlignment": "middle",
+      "wrapText": true,
+      "shrinkToFit": false,
+      "fillToken": "primary",
+      "borderToken": "none",
+      "rowHeightPoints": 28
+    },
+    "personBlockHeader": {
+      "font": {
+        "name": "仿宋",
+        "sizePoints": 14,
+        "bold": true,
+        "colorArgb": "FF000000"
+      },
+      "horizontalAlignment": "center",
+      "verticalAlignment": "middle",
+      "wrapText": true,
+      "shrinkToFit": false,
+      "fillToken": "primary",
+      "borderToken": "none",
+      "rowHeightPoints": 28
+    },
+    "businessCell": {
+      "font": {
+        "name": "仿宋",
+        "sizePoints": 14,
+        "bold": false,
+        "colorArgb": "FF000000"
+      },
+      "horizontalAlignment": "center",
+      "verticalAlignment": "middle",
+      "wrapText": "by-column-policy",
+      "shrinkToFit": false,
+      "fillArgb": "FFFFFFFF",
+      "borderToken": "none",
+      "minimumRowHeightPoints": 30
+    },
+    "mergedBusinessAnchor": {
+      "font": {
+        "name": "仿宋",
+        "sizePoints": 14,
+        "bold": false,
+        "colorArgb": "FF000000"
+      },
+      "horizontalAlignment": "center",
+      "verticalAlignment": "middle",
+      "wrapText": true,
+      "shrinkToFit": false,
+      "fillArgb": "FFFFFFFF",
+      "borderToken": "none"
+    },
+    "narrative": {
+      "font": {
+        "name": "仿宋",
+        "sizePoints": 14,
+        "bold": false,
+        "colorArgb": "FF000000"
+      },
+      "horizontalAlignment": "left",
+      "verticalAlignment": "middle",
+      "wrapText": true,
+      "shrinkToFit": false,
+      "fillArgb": "FFFFFFFF",
+      "borderToken": "none"
+    }
+  },
+  "tokens": {
+    "colors": {
+      "greenPrimaryArgb": "FFB68D01",
+      "bluePrimaryArgb": "FF4472C4",
+      "companyPaidWarningArgb": "FFF4B183",
+      "whiteArgb": "FFFFFFFF",
+      "blackArgb": "FF000000"
+    },
+    "borders": {
+      "grid": {
+        "left": "thin",
+        "right": "thin",
+        "top": "thin",
+        "bottom": "thin",
+        "colorArgb": "FF000000"
+      },
+      "none": {
+        "left": "none",
+        "right": "none",
+        "top": "none",
+        "bottom": "none",
+        "colorArgb": "FF000000"
+      }
+    }
+  },
+  "themeRoles": {
+    "green-base": {
+      "primaryFillArgb": "FFB68D01",
+      "title": "greenPrimaryArgb",
+      "header": "greenPrimaryArgb",
+      "summaryCard": "greenPrimaryArgb",
+      "personBlockHeader": "greenPrimaryArgb",
+      "companyPaidBlockHeader": "companyPaidWarningArgb"
+    },
+    "blue-role-override": {
+      "inherits": "green-base",
+      "overrides": {
+        "primaryFillArgb": "FF4472C4",
+        "title": "bluePrimaryArgb",
+        "header": "bluePrimaryArgb",
+        "summaryCard": "bluePrimaryArgb",
+        "personBlockHeader": "bluePrimaryArgb",
+        "fontColorArgb": "FFFFFFFF"
+      },
+      "unchangedRoles": [
+        "companyPaidBlockHeader",
+        "businessCell",
+        "mergedBusinessAnchor",
+        "narrative"
+      ]
+    }
+  },
+  "numberFormats": {
+    "integer": "0",
+    "ordinaryFraction": "0.00",
+    "explicitThreeDecimals": "0.000",
+    "date": "mm-dd",
+    "groupTotalPolicy": "maximum-explicit-precision-in-group"
+  },
+  "mergeContract": {
+    "businessGroupColumns": [
+      "D",
+      "E",
+      "F"
+    ],
+    "requireIdenticalRangeAcrossBusinessGroupColumns": true,
+    "groupKey": [
+      "personOrSubject",
+      "classification",
+      "rowType",
+      "settlement"
+    ],
+    "dateChangeDoesNotSplitBusinessGroup": true,
+    "singleRowGroupIsNotMerged": true,
+    "groupTotalFormula": "SUM(C{start}:C{end})",
+    "clearNonAnchorValueFormulaRichText": true,
+    "verifyNonAnchorOOXMLIsEmpty": true,
+    "anchorRole": "mergedBusinessAnchor",
+    "forbidCrossing": [
+      "personBlock",
+      "subjectBlock",
+      "classification",
+      "rowType",
+      "settlement",
+      "header",
+      "narrative",
+      "pageBreak"
+    ],
+    "dateColumn": {
+      "column": "A",
+      "allowMergeOnlyForConsecutiveEqualConfirmedDates": true,
+      "independentFromBusinessGroupRange": true
+    },
+    "explicitRowHeightRequired": true,
+    "largeMergePreviewThreshold": {
+      "rowCountGreaterThan": 7,
+      "totalHeightPointsGreaterThan": 210,
+      "action": "render-warning-preview-without-auto-split"
+    }
+  },
+  "layout": {
+    "machineValues": {
+      "fontName": "仿宋",
+      "fontSizePoints": 14,
+      "bodyHorizontalAlignment": "center",
+      "bodyVerticalAlignment": "middle",
+      "recentBusinessFillArgb": "FFFFFFFF",
+      "standardBusinessRowHeightPoints": 30,
+      "rootColumnWidthsAtoF": [
+        17.375,
+        26.625,
+        32.508335,
+        18.375,
+        26.508333,
+        28.508333
+      ]
+    },
+    "columnWidths": {
+      "ledgerRoot": {
+        "A": 17.375,
+        "B": 26.625,
+        "C": 32.508335,
+        "D": 18.375,
+        "E": 26.508333,
+        "F": 28.508333
+      },
+      "currentDetail": {
+        "A": 17.375,
+        "B": 26.625,
+        "C": 32.508335,
+        "D": 18.375,
+        "E": 26.508333,
+        "F": 28.508333
+      }
+    },
+    "columnPolicies": {
+      "ledgerRoot": {
+        "A": {"wrapText": false, "horizontalAlignment": "center"},
+        "B": {"wrapText": true, "horizontalAlignment": "center"},
+        "C": {"wrapText": false, "horizontalAlignment": "center"},
+        "D": {"wrapText": true, "horizontalAlignment": "center"},
+        "E": {"wrapText": false, "horizontalAlignment": "center"},
+        "F": {"wrapText": true, "horizontalAlignment": "center"}
+      },
+      "currentDetail": {
+        "A": {"wrapText": false, "horizontalAlignment": "center"},
+        "B": {"wrapText": true, "horizontalAlignment": "center"},
+        "C": {"wrapText": false, "horizontalAlignment": "center"},
+        "D": {"wrapText": true, "horizontalAlignment": "center"},
+        "E": {"wrapText": true, "horizontalAlignment": "center"},
+        "F": {"wrapText": true, "horizontalAlignment": "center"}
+      }
+    },
+    "rowHeightAlgorithm": {
+      "defaultBusinessRowPoints": 30,
+      "lineHeightPoints": 21,
+      "verticalPaddingPoints": 6,
+      "characterUnits": {
+        "ascii": 1,
+        "cjkOrFullWidth": 2,
+        "explicitNewline": "new-line"
+      },
+      "unitsPerExcelColumnWidth": 1.6,
+      "wrappedLineCount": "sum(max(1,ceil(lineCharacterUnits/floor(columnWidth*1.6))))",
+      "singleCellRequiredHeight": "max(30,wrappedLineCount*21+6)",
+      "mergedBlockRule": "requiredTotal=max(rowCount*30,maxAnchorRequiredHeight); setEachRowHeight=ceil(requiredTotal/rowCount*4)/4"
+    },
+    "requireExplicitColumnWidths": true,
+    "requireExplicitMergedBlockRowHeights": true,
+    "preserveBordersAtGroupBoundaries": true,
+    "freezePaneAndPrintSettingsFollowBaseContract": true,
+    "formalTitleForbiddenTokens": [
+      "候选",
+      "修正版",
+      "待核",
+      "待确认"
+    ],
+    "freezePanes": {
+      "ledgerRoot": {
+        "xiaohongshu": "A2",
+        "company": "A5",
+        "residence": "A5"
+      },
+      "currentDetail": "below-detected-header-row"
+    }
+  },
+  "print": {
+    "orientation": "landscape",
+    "paperSize": "A4",
+    "fitToWidthPages": 1,
+    "fitToHeightPages": 0,
+    "printColumns": "A:F",
+    "horizontalCentered": true,
+    "repeatHeaderRows": "detected-header-rows",
+    "forbidBusinessMergeAcrossManualPageBreak": true
+  },
+  "allowedProfileOverrides": {
+    "xiaohongshu": "green-base",
+    "company": "blue-role-override",
+    "residence": "blue-role-override"
+  },
+  "driftPolicy": {
+    "STYLE_DRIFT": {
+      "examples": [
+        "font",
+        "fill",
+        "border",
+        "role-color"
+      ],
+      "action": "build-repair-candidate-before-ledger-candidate"
+    },
+    "LAYOUT_DRIFT": {
+      "examples": [
+        "column-width",
+        "row-height",
+        "alignment",
+        "merge-topology",
+        "print-setting"
+      ],
+      "action": "block-publish-and-build-repair-candidate"
+    },
+    "STRUCTURE_DRIFT": {
+      "examples": [
+        "missing-column",
+        "inserted-column",
+        "moved-header",
+        "missing-editable-sheet",
+        "ambiguous-sheet"
+      ],
+      "action": "stop-profile-before-evidence-processing"
+    }
+  }
+}

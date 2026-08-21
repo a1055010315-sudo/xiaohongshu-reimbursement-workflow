@@ -5,7 +5,7 @@ import { createRequire } from "node:module";
 import path from "node:path";
 import { TextDecoder } from "node:util";
 
-const BUNDLED_DEPENDENCY_ALLOWLIST = new Set(["jszip", "sax"]);
+const BUNDLED_DEPENDENCY_ALLOWLIST = new Set(["jszip", "sax", "sharp"]);
 const bundledDependencyCache = new Map();
 
 function canonicalize(value) {
