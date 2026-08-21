@@ -11,8 +11,10 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const worktree = path.resolve(here, "..", "..");
 const skillRelative = "plugins/xiaohongshu-reimbursement-workflow/skills/xiaohongshu-reimbursement-workflow";
 const currentSkill = path.join(worktree, ...skillRelative.split("/"));
-const approvedRoot = "C:\\Users\\a1055\\Desktop\\Word和Excel文档\\skill测试\\成品_批准版式_v3_终验";
-const renderer = path.join(approvedRoot, "00_验收证据", "screenshot-map-copy-picture-renderer.ps1");
+const approvedRoot = process.env.XHS_APPROVED_FIXTURE_ROOT?.trim();
+assert.ok(approvedRoot, "Set XHS_APPROVED_FIXTURE_ROOT to the approved synthetic workbook fixture directory.");
+const renderer = process.env.XHS_APPROVED_RENDERER_PATH?.trim()
+  || path.join(approvedRoot, "00_验收证据", "screenshot-map-copy-picture-renderer.ps1");
 const resourceHook = path.join(here, "child-resource-hook.mjs");
 const manualBuilder = path.join(here, "f38a65b-manual-build-fixture.mjs");
 const commit = "f38a65b571a92e42ba57250e306d7b3534a4c26b";

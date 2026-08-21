@@ -12,7 +12,8 @@ const worktree = path.resolve(benchmarkDirectory, "..", "..");
 const skillRoot = path.join(worktree, "plugins", "xiaohongshu-reimbursement-workflow", "skills", "xiaohongshu-reimbursement-workflow");
 const node = process.execPath;
 const resourceHook = path.join(benchmarkDirectory, "child-resource-hook.mjs");
-const approvedRoot = "C:\\Users\\a1055\\Desktop\\Word和Excel文档\\skill测试\\成品_批准版式_v3_终验";
+const approvedRoot = process.env.XHS_APPROVED_FIXTURE_ROOT?.trim();
+assert.ok(approvedRoot, "Set XHS_APPROVED_FIXTURE_ROOT to the approved synthetic workbook fixture directory.");
 const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", "base64");
 const profiles = [
   { id: "xiaohongshu", source: ["01_小红书专项", "小红书支出总表.xlsx"], input: "小红书支出总表.xlsx", canonical: "小红书支出总表.xlsx", category: "小红书报销" },
