@@ -16,9 +16,19 @@
 
 三份正式根表分别为 `小红书支出总表.xlsx`、`公司支出总表.xlsx` 和 `驻所支出.xlsx`。金额使用 BigInt milliunits 计算，工作簿统一显示三位小数。候选关闭后由独立进程重读真实 XLSX/OOXML 审计；发布前后均 fresh 读取并核对 SHA256。
 
-## 安装
+## 版本状态与下载
 
-当前可安装成品以 `dist/xiaohongshu-reimbursement-workflow-0.5.0+codex.20260817004258.zip` 为准。先核对同目录 `.sha256`，再解压到一个新的本地目录，并把该解压目录作为 marketplace 根：
+| 版本 | 状态 | 说明 |
+|---|---|---|
+| `0.5.0+codex.20260819174146` | 用户已确认本机原版可用 | 作为当前性能对比基线。原版含私有回归样例，因此不公开原字节；GitHub 提供删除私有测试并泛化示例的 [`portable1` 脱敏便携包](https://github.com/a1055010315-sudo/xiaohongshu-reimbursement-workflow/releases/tag/v0.5.0-codex.20260819174146-portable1)，运行脚本保持一致，并附 SHA256。 |
+| `0.5.0+codex.20260820094210` | **尚未经过用户业务验收** | 首次加入四个脱敏报销工作簿模板，并区分空白模板结构与成品动态合并/行高。仅作为[模板版预发布包](https://github.com/a1055010315-sudo/xiaohongshu-reimbursement-workflow/releases/tag/v0.5.0-codex.20260820094210)保留，不应取代已验证基线。 |
+| 当前 hardening PR | 开发中 | 增加 Gate 2 全量独立对应复核、候选局部审计、预览可靠性与端到端性能优化；在完整验收前不发布为稳定版。 |
+
+`19174146.portable1` 是隐私脱敏的可迁移运行包，不宣称与含私有测试的本机原版逐字节相同。原版来源证明摘要为 `d070ae296d0606db8a03a5d50f08559eb3a42fccadec7aecbeca20b400ca16b5`，算法为按相对路径排序后，对每项 `relativePath + NUL + SHA256 + NUL + size` 形成清单再计算 SHA256。
+
+从对应 Release 下载命名的插件 ZIP 和 `.sha256`，不要使用 GitHub 自动生成的 “Source code” 压缩包。先核对校验和，再解压到新的本地目录，并把该解压目录作为 marketplace 根：
+
+### 安装
 
 ```bash
 codex plugin marketplace add <解压目录绝对路径> --json
@@ -26,7 +36,7 @@ codex plugin add xiaohongshu-reimbursement-workflow@xiaohongshu-finance --json
 codex plugin list --json
 ```
 
-OpenAI 官方文档支持将本地 marketplace 根目录传给 `codex plugin marketplace add`。安装后必须确认列表中的版本是 `0.5.0+codex.20260817004258`，然后新建 Codex 任务加载 Skill。当前环境只完成了隔离 marketplace/cache 安装与回滚模拟；由于 WindowsApps `codex.exe` 对自动化进程返回 Access Denied，没有声称已执行正式 CLI 安装。
+安装后必须核对插件列表显示为所下载包的明确版本，再新建 Codex 任务加载 Skill。`20094210` 是未测试模板版，除非专门回归模板行为，否则优先使用已确认基线的脱敏便携包。
 
 该版本正式合并到 GitHub `main` 后，同事也可把仓库链接和明确安装要求交给 Codex：
 
