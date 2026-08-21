@@ -1,6 +1,6 @@
 {
   "name": "xiaohongshu-reimbursement-workflow",
-  "version": "0.5.0+codex.20260820094210",
+  "version": "0.5.0+codex.20260821073607",
   "description": "Template-bound Xiaohongshu, company, and residence reimbursement workflow with one-pass evidence binding, batch-local ledger patches, batch-only previews, two approval gates, and recoverable publishing.",
   "author": {
     "name": "a1055010315-sudo",

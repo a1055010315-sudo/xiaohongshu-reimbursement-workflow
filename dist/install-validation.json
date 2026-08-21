@@ -1,12 +1,12 @@
 {
-  "kind": "xiaohongshu-reimbursement-workflow-install-validation-v2",
-  "generatedAt": "2026-08-16T16:28:16.9948248Z",
-  "mode": "isolated-local-marketplace-cache-simulation",
+  "kind": "xiaohongshu-reimbursement-workflow-install-validation-v3",
+  "generatedAt": "2026-08-21T07:43:47.0121796Z",
+  "mode": "isolated-release-zip-extraction-validation",
   "officialStructure": "marketplace -> local plugin -> copied cache",
   "package": {
-    "fileName": "xiaohongshu-reimbursement-workflow-0.5.0+codex.20260816-r2.zip",
-    "size": 280340,
-    "sha256": "7d6eceda4d321259c16f3a0f0729ea82382f7bb1ffe10b0226a5124b75183308"
+    "fileName": "xiaohongshu-reimbursement-workflow-0.5.0+codex.20260821073607.zip",
+    "size": 437608,
+    "sha256": "9c29a2991c17e30ac35eb2bea7bd29f846f166fba93105f5a2df702272584fd0"
   },
   "marketplace": {
     "name": "xiaohongshu-finance",
@@ -16,10 +16,11 @@
   },
   "plugin": {
     "name": "xiaohongshu-reimbursement-workflow",
-    "version": "0.5.0+codex.20260816",
+    "version": "0.5.0+codex.20260821073607",
     "treeDigestAlgorithm": "sha256(sorted relativePath + NUL + fileSha256 + LF)",
-    "treeDigest": "c63dc8d9b2ae36513701522f104dd7fb45e632cc35dab6d560199f0ffed9fc89",
-    "installedTreeDigest": "c63dc8d9b2ae36513701522f104dd7fb45e632cc35dab6d560199f0ffed9fc89"
+    "treeDigest": "48b9243e7b0364693b9e91a4ccaf563825bc06e7889fb52bec2f2aff0c044f3a",
+    "extractedTreeDigest": "48b9243e7b0364693b9e91a4ccaf563825bc06e7889fb52bec2f2aff0c044f3a",
+    "sourceMirrorExact": true
   },
   "activation": {
     "skillNames": [
@@ -30,16 +31,24 @@
     "nodeScriptCount": 25,
     "powerShellScriptCount": 2,
     "approvedTemplateCount": 6,
-    "testsPackaged": 0
+    "testsPackaged": 18,
+    "testSummary": "346 tests: 344 passed, 0 failed, 2 conditional skips"
+  },
+  "performance": {
+    "baselineVersion": "0.5.0+codex.20260819174146",
+    "protocol": "same-host synthetic batch, alternating 7x7 medians; new finalize includes full-correspondence Gate 2",
+    "coldSpeedupPercent": 32.515,
+    "hotSpeedupPercent": 32.081
   },
   "isolation": {
     "temporaryRootRemoved": true,
-    "personalCodexHomeTouched": false,
-    "realFinanceFilesTouched": false,
-    "packageUnchangedAfterRollback": true
+    "personalPluginCacheTouched": false,
+    "marketplaceConfigurationTouched": false,
+    "formalFinanceFilesTouchedByValidation": false,
+    "packageUnchangedAfterVerification": true
   },
   "cli": {
     "executed": false,
-    "reason": "Installed WindowsApps codex.exe returned access denied to the prior automation process."
+    "reason": "Reinstallation was intentionally excluded from this release task."
   }
 }
