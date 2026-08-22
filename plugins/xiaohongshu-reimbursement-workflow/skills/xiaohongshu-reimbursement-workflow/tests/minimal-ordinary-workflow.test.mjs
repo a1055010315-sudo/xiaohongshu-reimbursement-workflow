@@ -12,6 +12,7 @@ import { buildRootWorkbookCandidates } from "../scripts/build_root_workbook_cand
 import { loadProfileRegistry } from "../scripts/finance_domain.mjs";
 import { loadArtifactTemplates } from "../scripts/template_assets.mjs";
 import {
+  auditManifest as auditManifestInSession,
   finalizeReimbursementWorkflow,
   prepareReimbursementWorkflow,
   publishReimbursementWorkflow,
@@ -39,7 +40,7 @@ async function makeBaseline(filePath) {
   zip.file("_rels/.rels", '<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>');
   zip.file("xl/_rels/workbook.xml.rels", '<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>');
   zip.file("xl/workbook.xml", '<?xml version="1.0" encoding="UTF-8"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"><sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets><mc:AlternateContent><mc:Choice Requires="x15"><ignored/></mc:Choice><mc:Fallback/></mc:AlternateContent><definedNames><definedName name="_xlnm.Print_Area" localSheetId="0">\'Sheet1\'!$A$1:$F$4</definedName></definedNames></workbook>');
-  zip.file("xl/styles.xml", '<?xml version="1.0" encoding="UTF-8"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><numFmts count="2"><numFmt numFmtId="164" formatCode="mm-dd"/><numFmt numFmtId="165" formatCode="0.000"/></numFmts><fonts count="1"><font/></fonts><fills count="1"><fill/></fills><borders count="1"><border/></borders><cellStyleXfs count="1"><xf numFmtId="0"/></cellStyleXfs><cellXfs count="5"><xf numFmtId="0"/><xf numFmtId="164"/><xf numFmtId="0"/><xf numFmtId="165"/><xf numFmtId="165"/></cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0"/></cellStyles></styleSheet>');
+  zip.file("xl/styles.xml", '<?xml version="1.0" encoding="UTF-8"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><numFmts count="5"><numFmt numFmtId="164" formatCode="mm-dd"/><numFmt numFmtId="165" formatCode="0.000"/><numFmt numFmtId="166" formatCode="0"/><numFmt numFmtId="167" formatCode="0.0"/><numFmt numFmtId="168" formatCode="0.00"/></numFmts><fonts count="1"><font/></fonts><fills count="1"><fill/></fills><borders count="1"><border/></borders><cellStyleXfs count="1"><xf numFmtId="0"/></cellStyleXfs><cellXfs count="11"><xf numFmtId="0"/><xf numFmtId="164"/><xf numFmtId="0"/><xf numFmtId="165"/><xf numFmtId="165" applyAlignment="1"/><xf numFmtId="166"/><xf numFmtId="167"/><xf numFmtId="168"/><xf numFmtId="166" applyAlignment="1"/><xf numFmtId="167" applyAlignment="1"/><xf numFmtId="168" applyAlignment="1"/></cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0"/></cellStyles></styleSheet>');
   const header = ["日期", "支出明细", "支出金额", "合计", "支出人", "备注"].map((value, index) => tCell(`${String.fromCharCode(65 + index)}1`, 2, value)).join("");
   const row2 = nCell("A2", 1, serial("2031-01-05")) + tCell("B2", 2, "历史甲") + nCell("C2", 3, "1") + nCell("D2", 4, "1") + tCell("E2", 2, "历史人员") + tCell("F2", 2, "历史备注");
   const row4 = nCell("A4", 1, serial("2031-04-01")) + tCell("B4", 2, "历史乙") + nCell("C4", 3, "2") + '<c r="D4" s="4" t="n"><f t="shared" si="0">SUM(C4:C4)</f><v>2</v></c>' + tCell("E4", 2, "历史人员") + tCell("F4", 2, "历史备注") + tCell("G4", 2, "辅助列保留") + nCell("H4", 3, "99");
@@ -145,6 +146,64 @@ async function previewRenderer({ request, requestFileSha256 }) {
   }
   return { kind: "ordinary-reimbursement-preview-response-v2", requestNonce: request.requestNonce, requestFileSha256, bindingDigest: request.bindingDigest, enginePeakWorkingSetBytes: 1_000_000, previews };
 }
+
+test("reused manifest audit session rereads changed bytes and recovers after an ordered validation failure", async () => {
+  const temp = await fs.mkdtemp(path.join(os.tmpdir(), "codex-xhs-manifest-session-"));
+  try {
+    const baseline = await makeBaseline(path.join(temp, "小红书支出总表.xlsx"));
+    const contextImage = await writeFixture(temp, "context.jpg", pngBytes(32, 24));
+    const voucherImage = await writeFixture(temp, "voucher.jpg", pngBytes(40, 30));
+    const manifestPath = path.join(temp, "manifest.json");
+    const base = makeManifest(temp, path.join(temp, "archive"), baseline, contextImage, voucherImage);
+    const writeManifest = async (manifest) => {
+      const bytes = Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`, "utf8");
+      await fs.writeFile(manifestPath, bytes);
+      return { bytes, sha256: sha256Bytes(bytes) };
+    };
+
+    const firstBinding = await writeManifest(base);
+    const first = await auditManifestInSession(manifestPath, firstBinding.sha256);
+    assert.equal(first.manifestFileSha256, firstBinding.sha256);
+    assert.equal(first.fileVerificationMode, "bound-builders");
+
+    const revised = structuredClone(base);
+    revised.batch.reviewRevision = 2;
+    const revisedBinding = await writeManifest(revised);
+    const second = await auditManifestInSession(manifestPath, revisedBinding.sha256);
+    assert.equal(second.manifestFileSha256, revisedBinding.sha256, "the second request must observe the rewritten manifest bytes");
+    assert.notEqual(second.manifestDigest, first.manifestDigest, "a reusable worker must not return cached manifest semantics");
+
+    const invalidFiles = structuredClone(revised);
+    invalidFiles.files[1].path = path.join(temp, "missing-first-context.jpg");
+    invalidFiles.files[2].path = path.join(temp, "missing-second-voucher.jpg");
+    const invalidFileBinding = await writeManifest(invalidFiles);
+    await assert.rejects(
+      auditManifestInSession(manifestPath, invalidFileBinding.sha256),
+      /missing-first-context\.jpg/u,
+      "parallel file checks must settle before returning the first manifest input-order error",
+    );
+
+    const invalid = structuredClone(revised);
+    invalid.transactions[0].sourceOrder = 0;
+    invalid.transactions[1].sourceOrder = 0;
+    const invalidBinding = await writeManifest(invalid);
+    await assert.rejects(
+      auditManifestInSession(manifestPath, invalidBinding.sha256),
+      /manifest\.transactions\[0\]\.sourceOrder must be a positive safe integer/u,
+      "multiple invalid transactions must still select the first input-order error",
+    );
+
+    const recovered = structuredClone(revised);
+    recovered.batch.reviewRevision = 3;
+    const recoveredBinding = await writeManifest(recovered);
+    const third = await auditManifestInSession(manifestPath, recoveredBinding.sha256);
+    assert.equal(third.manifestFileSha256, recoveredBinding.sha256);
+    assert.notEqual(third.manifestDigest, second.manifestDigest, "a failed request must not contaminate the following legal request");
+    assert.equal(third.transactions, 3);
+  } finally {
+    await fs.rm(temp, { recursive: true, force: true });
+  }
+});
 
 test("minimal ordinary workflow uses manifest v3, local ledger patch, batch previews, supplements, and clean archive", async () => {
   const temp = await fs.mkdtemp(path.join(os.tmpdir(), "codex-xhs-minimal-e2e-"));

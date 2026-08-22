@@ -159,29 +159,57 @@ async function assertBoundFile(binding, field) {
   return stable;
 }
 
-export function auditManifest(manifestPath, expectedSha256) {
-  return new Promise((resolve, reject) => {
-    const worker = new Worker(pathToFileURL(MANIFEST_AUDITOR), {
-      execArgv: [],
-      workerData: { kind: "ordinary-manifest-audit-worker-v1", manifestPath, deferOrdinaryFileVerification: true },
-      resourceLimits: { maxOldGenerationSizeMb: 256, maxYoungGenerationSizeMb: 64 },
-    });
-    let done = false;
-    const finish = (operation) => { if (done) return; done = true; clearTimeout(timer); operation(); void worker.terminate(); };
-    const timer = setTimeout(() => finish(() => reject(new Error("manifest audit timed out"))), 60_000);
-    worker.once("message", (message) => finish(() => {
-      try {
-        if (message?.kind !== "ordinary-manifest-audit-result-v1" || message.ok !== true) fail(`manifest audit failed: ${message?.error ?? "invalid worker response"}`);
-        const result = object(message.result, "manifest audit result");
-        if (result.ok !== true || result.manifestFileSha256 !== expectedSha256 || result.fileVerificationMode !== "bound-builders" || !result.reimbursementFactsCertificate) fail("manifest audit result is incomplete or changed.");
-        resolve(result);
-      } catch (auditError) {
-        reject(auditError);
-      }
-    }));
-    worker.once("error", (error) => finish(() => reject(error)));
-    worker.once("exit", (code) => { if (!done) finish(() => reject(new Error(`manifest audit worker exited with code ${code}`))); });
+function createManifestAuditSession() {
+  const worker = new Worker(pathToFileURL(MANIFEST_AUDITOR), {
+    execArgv: [],
+    workerData: { kind: "ordinary-manifest-audit-session-v1" },
+    resourceLimits: { maxOldGenerationSizeMb: 256, maxYoungGenerationSizeMb: 64 },
   });
+  let state = "starting"; let fatalError = null; let pending = null; let nextRequestId = 1; let queue = Promise.resolve();
+  let readyResolve; let readyReject;
+  const ready = new Promise((resolve, reject) => { readyResolve = resolve; readyReject = reject; });
+  void ready.catch(() => {});
+  const failSession = (error) => {
+    if (fatalError) return;
+    fatalError = error instanceof Error ? error : new Error(String(error)); state = "closed";
+    if (pending) { clearTimeout(pending.timer); pending.reject(fatalError); pending = null; }
+    else readyReject(fatalError);
+  };
+  worker.on("message", (message) => {
+    if (state === "starting" && message?.kind === "ordinary-manifest-audit-session-ready-v1") { state = "ready"; readyResolve(); return; }
+    if (state !== "running" || message?.kind !== "ordinary-manifest-audit-session-result-v1" || message.requestId !== pending?.requestId) return failSession(new Error("manifest audit session response protocol is invalid"));
+    const current = pending; pending = null; clearTimeout(current.timer); state = "ready";
+    if (message.ok !== true) current.reject(new Error(`manifest audit failed: ${message.error ?? "unknown worker error"}`));
+    else current.resolve(message.result);
+  });
+  worker.once("error", failSession);
+  worker.once("exit", (code) => { if (state !== "closed") failSession(new Error(`manifest audit session exited with code ${code}`)); });
+  worker.unref();
+  const runOne = async (manifestPath) => {
+    await ready;
+    if (fatalError || state !== "ready") throw fatalError ?? new Error("manifest audit session is unavailable");
+    const requestId = nextRequestId; nextRequestId += 1; state = "running";
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => { failSession(new Error("manifest audit timed out")); void worker.terminate(); }, 60_000);
+      pending = { requestId, resolve, reject, timer };
+      worker.postMessage({ kind: "ordinary-manifest-audit-session-request-v1", requestId, manifestPath, deferOrdinaryFileVerification: true });
+    });
+  };
+  return Object.freeze({
+    run(manifestPath) {
+      const result = queue.then(() => runOne(manifestPath));
+      queue = result.catch(() => {});
+      return result;
+    },
+  });
+}
+
+const manifestAuditSession = createManifestAuditSession();
+
+export async function auditManifest(manifestPath, expectedSha256) {
+  const result = object(await manifestAuditSession.run(manifestPath), "manifest audit result");
+  if (result.ok !== true || result.manifestFileSha256 !== expectedSha256 || result.fileVerificationMode !== "bound-builders" || !result.reimbursementFactsCertificate) fail("manifest audit result is incomplete or changed.");
+  return result;
 }
 
 function aggregateGate(gate, bindings, extra = {}) {
@@ -874,14 +902,19 @@ export async function prepareReimbursementWorkflow(rawRequest, { testHooks } = {
       stateDigest: state.stateDigest,
       affectedProfileIds: state.affectedProfileIds,
       previewEnginePeakWorkingSetBytes: previewBuild.enginePeakWorkingSetBytes,
-      review: presentationBuild.artifacts.map((item) => ({
-        profileId: item.profileId,
-        summary: item.summary.text,
-        detail: { path: item.detail.path, sha256: item.detail.sha256 },
-        screenshot: { path: item.screenshot.path, sha256: item.screenshot.sha256, imageCount: item.screenshot.imageCount },
-        previews: previewBuild.previews.filter((preview) => preview.profileId === item.profileId),
-        evidenceCount: item.evidenceArchive.length,
-      })),
+      review: presentationBuild.artifacts.map((item) => {
+        const root = rootBuild.artifacts.find((artifact) => artifact.profileId === item.profileId);
+        return {
+          profileId: item.profileId,
+          summary: item.summary.text,
+          detail: { path: item.detail.path, sha256: item.detail.sha256 },
+          screenshot: { path: item.screenshot.path, sha256: item.screenshot.sha256, imageCount: item.screenshot.imageCount },
+          candidate: root ? { path: root.candidatePath, sha256: root.candidateSha256, planSha256: root.planSha256 } : null,
+          structuralRepairs: clone(root?.structuralRepairs ?? []),
+          previews: previewBuild.previews.filter((preview) => preview.profileId === item.profileId),
+          evidenceCount: item.evidenceArchive.length,
+        };
+      }),
     });
   } catch (error) {
     if (previewCheckpoint) {
@@ -942,6 +975,7 @@ export async function finalizeReimbursementWorkflow(rawRequest, { testHooks } = 
       correspondence.kind !== FULL_CORRESPONDENCE_AUDIT_KIND
       || canonicalDigest(withoutDigest(correspondence, "reportDigest")) !== correspondence.reportDigest
       || correspondence.status !== "passed"
+      || correspondence.disposition !== "PASSED"
       || correspondence.gate1BindingDigest !== ready.state.gate1.bindingDigest
       || correspondence.independentEvidenceReviewSha256 !== independentEvidenceReviewSha256
     ) fail("full correspondence checkpoint is invalid or bound to another Gate 1/review.");
@@ -984,8 +1018,13 @@ export async function finalizeReimbursementWorkflow(rawRequest, { testHooks } = 
     } catch (error) {
       fail(`full correspondence audit could not complete; Gate 1 remains valid and may be retried: ${error instanceof Error ? error.message : String(error)}`);
     }
+    if (correspondence.disposition === "BLOCKED_RETRYABLE") {
+      const blockingCount = correspondence.blocking?.length ?? 0;
+      fail(`full correspondence audit was blocked by ${blockingCount} retryable condition(s); Gate 1 remains valid and may be retried with corrected review/input.`);
+    }
+    if (!new Set(["PASSED", "SUBSTANTIVE_MISMATCH"]).has(correspondence.disposition)) fail("full correspondence audit returned an invalid disposition; Gate 1 remains valid and may be retried.");
     correspondenceFile = await writeExclusiveJson(correspondencePath, correspondence);
-    if (correspondence.status !== "passed") {
+    if (correspondence.disposition === "SUBSTANTIVE_MISMATCH") {
       const markerCore = {
         kind: "gate1-invalidation-v1",
         gate1BindingDigest: ready.state.gate1.bindingDigest,
@@ -1033,9 +1072,10 @@ export async function finalizeReimbursementWorkflow(rawRequest, { testHooks } = 
         reportDigest: correspondence.reportDigest,
         independentEvidenceReviewDigest: correspondence.independentEvidenceReviewDigest,
         status: correspondence.status,
+        disposition: correspondence.disposition,
         coverage: correspondence.coverage,
         totals: correspondence.totals,
-        issueCounts: Object.fromEntries(["missing", "extra", "mismatches", "duplicate", "unbound"].map((field) => [field, correspondence[field].length])),
+        issueCounts: Object.fromEntries(["missing", "extra", "mismatches", "duplicate", "unbound", "blocking"].map((field) => [field, correspondence[field].length])),
         metrics: correspondence.metrics,
       },
       independentEvidenceReview: {
@@ -1061,23 +1101,28 @@ export async function finalizeReimbursementWorkflow(rawRequest, { testHooks } = 
       affectedProfileIds: state.affectedProfileIds,
       previewEnginePeakWorkingSetBytes: gate2PreviewBuild.enginePeakWorkingSetBytes,
       fullCorrespondenceAudit: clone(state.fullCorrespondenceAudit),
-      review: ready.state.presentationBuild.artifacts.map((item) => ({
-        profileId: item.profileId,
-        summary: item.summary.text,
-        detail: { path: item.detail.path, sha256: item.detail.sha256 },
-        screenshot: { path: item.screenshot.path, sha256: item.screenshot.sha256, imageCount: item.screenshot.imageCount },
-        previews: gate2PreviewBuild.previews.filter((preview) => preview.profileId === item.profileId),
-        evidenceCount: item.evidenceArchive.length,
-        fullCorrespondenceAudit: {
-          path: state.fullCorrespondenceAudit.path,
-          sha256: state.fullCorrespondenceAudit.sha256,
-          reportDigest: state.fullCorrespondenceAudit.reportDigest,
-          status: state.fullCorrespondenceAudit.status,
-          coverage: state.fullCorrespondenceAudit.coverage,
-          totals: state.fullCorrespondenceAudit.totals,
-          issueCounts: state.fullCorrespondenceAudit.issueCounts,
-        },
-      })),
+      review: ready.state.presentationBuild.artifacts.map((item) => {
+        const root = ready.state.rootBuild.artifacts.find((artifact) => artifact.profileId === item.profileId);
+        return {
+          profileId: item.profileId,
+          summary: item.summary.text,
+          detail: { path: item.detail.path, sha256: item.detail.sha256 },
+          screenshot: { path: item.screenshot.path, sha256: item.screenshot.sha256, imageCount: item.screenshot.imageCount },
+          candidate: root ? { path: root.candidatePath, sha256: root.candidateSha256, planSha256: root.planSha256 } : null,
+          structuralRepairs: clone(root?.structuralRepairs ?? []),
+          previews: gate2PreviewBuild.previews.filter((preview) => preview.profileId === item.profileId),
+          evidenceCount: item.evidenceArchive.length,
+          fullCorrespondenceAudit: {
+            path: state.fullCorrespondenceAudit.path,
+            sha256: state.fullCorrespondenceAudit.sha256,
+            reportDigest: state.fullCorrespondenceAudit.reportDigest,
+            status: state.fullCorrespondenceAudit.status,
+            coverage: state.fullCorrespondenceAudit.coverage,
+            totals: state.fullCorrespondenceAudit.totals,
+            issueCounts: state.fullCorrespondenceAudit.issueCounts,
+          },
+        };
+      }),
     });
   } catch (error) {
     const cleanup = await cleanupBound(gate2PreviewBuild.ownedFiles, [gate2PreviewBuild.outputRoot]);

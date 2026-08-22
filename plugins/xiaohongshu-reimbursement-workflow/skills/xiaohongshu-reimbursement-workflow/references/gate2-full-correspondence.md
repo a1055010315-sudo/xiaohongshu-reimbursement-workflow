@@ -6,6 +6,8 @@ Gate 2 必须接收 `independent-evidence-review-v1`。该输入由独立 review
 
 输入还必须包含 `annotationObservations[]`；没有注释时传空数组。每项按原始证据独立记录 `profileId/person/kind/period.start/period.end/amount/sourceRefs`，用于核对 commission、bonus、allowance 等文字说明注释。该数组不能从 manifest、证书或 Gate 1 文字说明反推；证据不足以确认时必须阻塞 Gate 2。
 
+所有交易和注释 `sourceRefs` 都按集合语义核对：先逐元素验证，在原数组上检测重复，再以与 locale 无关的稳定排序比较唯一集合并构造报告。只改变合法元素的输入顺序不得产生 mismatch；缺失、额外、重复、空白、非字符串或未绑定元素仍必须单独报告，不能在建立集合时被吞掉。
+
 第二次视觉读取不得复制、筛选或自动变换 Gate 1 的 OCR、图片识别、业务抽取、manifest 交易、成品表格或预览结果，也不得复用 Gate 1 的媒体字节或解码结果。Gate 2 可以复用来源路径、预期 SHA256 和唯一媒体身份索引，但必须从每个唯一原始媒体 fresh-read 字节并完整 decode 一次；该次读取结果可在本次 Gate 2 内供同一媒体的全部交易引用复用。每一份 Gate 1 归档副本仍按 `resolvedPath + expectedSha256` 单独重读核验，不能因另一归档路径或原图具有同一 SHA 而跳过。独立输入必须有自己的 `independentEvidenceReviewDigest`，并纳入 Gate 2 报告摘要。
 
 独立视觉复核只在 Gate 1 获得有效确认后执行，不得提前加入 `--prepare` 或 Gate 1 渲染热路径。其目的包括发现 Gate 1 的漏读、错读、金额、人员、分类、补报归属、证据对应和展示错误，不能退化为只比较文件哈希或复制 Gate 1 结论。
@@ -50,8 +52,8 @@ Gate 2 输出 `gate2-full-correspondence-v1`，至少包含：
 
 ## 失效与展示
 
-只有 `missing`、`extra`、`duplicate`、`unbound`、`mismatches` 全为空，全部逐项状态通过，并且候选、计划、来源覆盖、本批行区段、独立复核和预览绑定均未变化时，才能生成 Gate 2 binding。
+只有 `missing`、`extra`、`duplicate`、`unbound`、`mismatches` 全为空，全部逐项状态通过，并且候选、计划、来源覆盖、本批行区段、独立复核和预览绑定均未变化时，才能生成 Gate 2 binding；成功报告的 disposition 为 `PASSED`。
 
-Gate 1 工件被成功读取后发现的任一内容 mismatch，都表示用户确认的 Gate 1 材料不再成立：立即使当前 Gate 1 和未完成的 Gate 2 同时失效。修正业务事实或成品后必须重新生成、重新展示并重新获得一个新的 Gate 1，禁止沿用旧确认或只重新运行 Gate 2。独立 review 自身格式/绑定错误、临时权限/I/O 或未知基础设施异常只阻塞并允许重试，不得据此永久判定 Gate 1 内容错误。
+Gate 1 工件被成功读取且完成有效 review 后确认的任一内容 mismatch，都表示用户确认的 Gate 1 材料不再成立：报告 disposition 为 `SUBSTANTIVE_MISMATCH`，立即使当前 Gate 1 和未完成的 Gate 2 同时失效。修正业务事实或成品后必须重新生成、重新展示并重新获得一个新的 Gate 1，禁止沿用旧确认或只重新运行 Gate 2。独立 review 自身格式/绑定错误、missing/extra/duplicate/unbound、字段不完整或内部冲突、临时权限/I/O/解析/机器问题以及未知内部异常的 disposition 为 `BLOCKED_RETRYABLE`，只阻塞并允许绑定不变时修正后重试，不得据此永久判定 Gate 1 内容错误。
 
 若完整预览绑定未变化，Gate 2 可以复用已核验 Gate 1 PNG 字节，界面也可以不重复展示同一组 PNG；但必须向用户展示本次 `gate2-full-correspondence-v1` 报告及 `reportDigest`、新的 Gate 2 binding、候选路径和候选 SHA256。报告属于门禁工件，不进入最终归档。

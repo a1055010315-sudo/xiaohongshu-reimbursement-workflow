@@ -41,6 +41,7 @@ const SaxModule = loadBundledDependency("sax");
 const sax = SaxModule.default ?? SaxModule;
 const STANDARD_STYLE_WINDOW_RADIUS = 32;
 const zipPartByteCaches = new WeakMap();
+let sharedRootAuditSession = null;
 
 const BUILD_REQUEST_KEYS = new Set(["kind", "stagingToken", "reimbursementFactsCertificate", "artifacts"]);
 const ARTIFACT_KEYS = new Set(["profileId", "baselinePath", "baselineSha256", "baselineSize", "candidateRevision"]);
@@ -307,7 +308,7 @@ function scanStructuralPatchIndex(worksheetXml, { captureDates = false } = {}) {
   for (const source of structural.rows) {
     const rowTag = /^<(?:[A-Za-z_][\w.-]*:)?row\b[^>]*>/iu.exec(source.xml)?.[0] ?? source.xml; const rowAttrs = attributes(rowTag);
     const spanStart = /^(\d+):\d+$/u.exec(rowAttrs.get("spans") ?? "")?.[1]; let nextColumn = spanStart ? Number(spanStart) : 1;
-    const row = { number: source.number, ordinal: source.ordinal, explicitCoordinate: source.explicitCoordinate, coordinateSafe: source.coordinateSafe, height: rowAttrs.get("ht") ?? null, hasBusinessPayload: false, dateValue: null, styles: new Map(), nextColumn, hasImplicitCellCoordinate: false };
+    const row = { number: source.number, ordinal: source.ordinal, explicitCoordinate: source.explicitCoordinate, coordinateSafe: source.coordinateSafe, height: rowAttrs.get("ht") ?? null, hasBusinessPayload: false, dateValue: null, styles: new Map(), nextColumn, hasImplicitCellCoordinate: false, xml: source.xml };
     for (const match of source.xml.matchAll(/<(?:[A-Za-z_][\w.-]*:)?c\b[^>]*\/\s*>|<(?:[A-Za-z_][\w.-]*:)?c\b[^>]*>[\s\S]*?<\/(?:[A-Za-z_][\w.-]*:)?c\s*>/giu)) {
       const tag = /^<(?:[A-Za-z_][\w.-]*:)?c\b[^>]*>/iu.exec(match[0])?.[0] ?? match[0]; const cellAttrs = attributes(tag); const coordinate = /^([A-Z]{1,3})([1-9]\d*)$/u.exec(cellAttrs.get("r") ?? "");
       const column = coordinate ? columnNumber(coordinate[1]) : nextColumn; if (!coordinate) row.hasImplicitCellCoordinate = true;
@@ -350,6 +351,28 @@ function splitRange(ref) {
   return { startColumn: columnNumber(match[1]), startRow: Number(match[2]), endColumn: columnNumber(match[3]), endRow: Number(match[4]) };
 }
 
+function expenseGroupAtBoundary(beforeRow, merges) {
+  const hits = merges.map((ref) => ({ ref, ...splitRange(ref) })).filter((range) => range.startColumn <= 6 && range.endColumn >= 4 && range.startRow < beforeRow && beforeRow <= range.endRow);
+  if (hits.length === 0) return null;
+  if (hits.some((range) => range.startColumn !== range.endColumn || range.startColumn < 4 || range.startColumn > 6)) fail(`supplement boundary ${beforeRow} intersects a non-canonical D:F merge.`);
+  const boundaries = new Set(hits.map((range) => `${range.startRow}:${range.endRow}`));
+  if (boundaries.size !== 1) fail(`supplement boundary ${beforeRow} intersects overlapping D:F expense groups.`);
+  const [startRowText, endRowText] = [...boundaries][0].split(":");
+  const startRow = Number(startRowText); const endRow = Number(endRowText);
+  const byColumn = new Map();
+  for (const hit of hits) {
+    if (byColumn.has(hit.startColumn)) fail(`supplement boundary ${beforeRow} has duplicate ${columnName(hit.startColumn)} expense-group merges.`);
+    byColumn.set(hit.startColumn, hit.ref);
+  }
+  if ([4, 5, 6].some((column) => !byColumn.has(column))) fail(`supplement boundary ${beforeRow} requires an aligned D:E:F merge triplet.`);
+  return {
+    groupId: `D${startRow}:F${endRow}`,
+    startRow,
+    endRow,
+    mergeRefs: [4, 5, 6].map((column) => byColumn.get(column)),
+  };
+}
+
 function chooseInsertionRow(transactionDate, rows, merges) {
   const dated = rows.filter((row) => row.date);
   const later = dated.find((row) => row.date > transactionDate);
@@ -358,14 +381,7 @@ function chooseInsertionRow(transactionDate, rows, merges) {
     const same = dated.filter((row) => row.date === transactionDate);
     beforeRow = same.length ? same.at(-1).number + 1 : (rows.at(-1)?.number ?? 1) + 1;
   }
-  for (const ref of merges) {
-    const range = splitRange(ref);
-    if (range.startColumn > 6 || range.endColumn < 4 || !(range.startRow < beforeRow && beforeRow <= range.endRow)) continue;
-    const dates = [...new Set(rows.filter((row) => row.number >= range.startRow && row.number <= range.endRow).map((row) => row.date).filter(Boolean))];
-    if (dates.length > 1 && dates[0] <= transactionDate && transactionDate < dates.at(-1)) fail(`supplement ${transactionDate} would split a local cross-date D:E:F expense group.`);
-    beforeRow = dates.length > 0 && transactionDate < dates[0] ? range.startRow : range.endRow + 1;
-  }
-  return beforeRow;
+  return { beforeRow, expenseGroup: expenseGroupAtBoundary(beforeRow, merges) };
 }
 
 function buildInsertions(transactions, indexedRows, date1904, merges) {
@@ -377,12 +393,15 @@ function buildInsertions(transactions, indexedRows, date1904, merges) {
   const expenseMerges = merges.filter((ref) => { const range = splitRange(ref); return range.startColumn <= 6 && range.endColumn >= 4; });
   const byRow = new Map();
   for (const transaction of [...transactions].sort((left, right) => left.date.localeCompare(right.date) || left.sourceOrder - right.sourceOrder)) {
-    const beforeRow = transaction.reportingKind === "supplement" ? chooseInsertionRow(transaction.date, baselineRows, expenseMerges) : appendRow;
-    if (!byRow.has(beforeRow)) byRow.set(beforeRow, []);
-    byRow.get(beforeRow).push(transaction);
+    const boundary = transaction.reportingKind === "supplement" ? chooseInsertionRow(transaction.date, baselineRows, expenseMerges) : { beforeRow: appendRow, expenseGroup: null };
+    if (!byRow.has(boundary.beforeRow)) byRow.set(boundary.beforeRow, { transactions: [], expenseGroup: boundary.expenseGroup });
+    const entry = byRow.get(boundary.beforeRow);
+    if ((entry.expenseGroup?.groupId ?? null) !== (boundary.expenseGroup?.groupId ?? null)) fail(`supplement boundary ${boundary.beforeRow} has inconsistent expense-group identity.`);
+    entry.transactions.push(transaction);
   }
   return {
-    insertions: [...byRow].sort(([left], [right]) => left - right).map(([beforeRow, items]) => ({ beforeRow, transactions: items.sort((left, right) => left.date.localeCompare(right.date) || left.sourceOrder - right.sourceOrder) })),
+    insertions: [...byRow].sort(([left], [right]) => left - right).map(([beforeRow, entry]) => ({ beforeRow, expenseGroupId: entry.expenseGroup?.groupId ?? null, transactions: entry.transactions.sort((left, right) => left.date.localeCompare(right.date) || left.sourceOrder - right.sourceOrder) })),
+    expenseGroups: new Map([...byRow.values()].filter((entry) => entry.expenseGroup).map((entry) => [entry.expenseGroup.groupId, entry.expenseGroup])),
     appendRow,
     baselineMaterialRowCount: businessRows.length,
     businessTailRow: appendRow - 1,
@@ -416,7 +435,152 @@ function whiteStyleIndexes(stylesXml) {
   return result;
 }
 
-function standardStyleRow(rows, insertionRow, merges, stylesXml) {
+const MONEY_FORMATS = Object.freeze(["0", "0.0", "0.00", "0.000"]);
+
+function createMoneyStyleResolver(stylesXml) {
+  const prefix = "(?:[A-Za-z_][\\w.-]*:)?";
+  const numberFormats = new Map([[1, "0"], [2, "0.00"]]);
+  const numFmtsBlock = new RegExp(`<${prefix}numFmts\\b[^>]*>([\\s\\S]*?)<\\/${prefix}numFmts>`, "iu").exec(stylesXml)?.[1] ?? "";
+  for (const match of numFmtsBlock.matchAll(new RegExp(`<${prefix}numFmt\\b[^>]*\\/\\s*>`, "giu"))) {
+    const attrs = attributes(match[0]);
+    const id = Number(attrs.get("numFmtId"));
+    const code = attrs.get("formatCode");
+    if (Number.isSafeInteger(id) && id >= 0 && typeof code === "string") numberFormats.set(id, unxml(code));
+  }
+  const cellXfsBlock = new RegExp(`<${prefix}cellXfs\\b[^>]*>([\\s\\S]*?)<\\/${prefix}cellXfs>`, "iu").exec(stylesXml)?.[1];
+  if (!cellXfsBlock) fail("baseline styles have no cellXfs collection.");
+  const styles = [];
+  for (const match of cellXfsBlock.matchAll(new RegExp(`<${prefix}xf\\b[^>]*?\\/\\s*>|<${prefix}xf\\b[^>]*>[\\s\\S]*?<\\/${prefix}xf\\s*>`, "giu"))) {
+    const open = new RegExp(`^<${prefix}xf\\b[^>]*>`, "iu").exec(match[0])?.[0] ?? match[0];
+    const attrs = attributes(open);
+    const numFmtId = Number(attrs.get("numFmtId") ?? "0");
+    const visualAttributes = [...attrs]
+      .filter(([name]) => name !== "numFmtId" && name !== "applyNumberFormat")
+      .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0);
+    const body = /\/\s*>$/u.test(open) ? "" : match[0].slice(open.length).replace(new RegExp(`<\\/${prefix}xf\\s*>$`, "iu"), "");
+    styles.push({ format: numberFormats.get(numFmtId) ?? null, visualDigest: canonicalDigest({ attributes: visualAttributes, body }) });
+  }
+  const cache = new Map();
+  return (baseStyle) => {
+    if (!Number.isSafeInteger(baseStyle) || baseStyle < 0 || baseStyle >= styles.length) fail(`money base style ${baseStyle} is invalid.`);
+    if (cache.has(baseStyle)) return cache.get(baseStyle);
+    const visualDigest = styles[baseStyle].visualDigest;
+    const family = MONEY_FORMATS.map((format) => {
+      const index = styles.findIndex((style) => style.visualDigest === visualDigest && style.format === format);
+      if (index < 0) fail(`money style family for base style ${baseStyle} has no exact ${format} format.`);
+      return index;
+    });
+    cache.set(baseStyle, Object.freeze(family));
+    return family;
+  };
+}
+
+function rowCellEntries(rowXml) {
+  const result = [];
+  for (const match of rowXml.matchAll(/<(?:[A-Za-z_][\w.-]*:)?c\b[^>]*?\/\s*>|<(?:[A-Za-z_][\w.-]*:)?c\b[^>]*>[\s\S]*?<\/(?:[A-Za-z_][\w.-]*:)?c\s*>/giu)) {
+    const open = /^<(?:[A-Za-z_][\w.-]*:)?c\b[^>]*>/iu.exec(match[0])?.[0] ?? match[0];
+    const attrs = attributes(open); const coordinate = /^([A-Z]{1,3})([1-9]\d*)$/u.exec(attrs.get("r") ?? "");
+    if (!coordinate) fail("affected expense-group cells require explicit coordinates.");
+    const formula = /<(?:[A-Za-z_][\w.-]*:)?f\b[^>]*>([\s\S]*?)<\/(?:[A-Za-z_][\w.-]*:)?f\s*>/iu.exec(match[0])?.[1] ?? null;
+    const value = /<(?:[A-Za-z_][\w.-]*:)?v\b[^>]*>([\s\S]*?)<\/(?:[A-Za-z_][\w.-]*:)?v\s*>/iu.exec(match[0])?.[1] ?? null;
+    result.push({
+      column: columnNumber(coordinate[1]), row: Number(coordinate[2]), style: Number(attrs.get("s") ?? "0"),
+      xml: match[0], index: match.index, end: match.index + match[0].length,
+      formula: formula === null ? null : unxml(formula), value: value === null ? null : unxml(value),
+      hasPayload: /<(?:[A-Za-z_][\w.-]*:)?(?:v|f|is)\b/iu.test(match[0]),
+    });
+  }
+  return result;
+}
+
+function cloneCellAt(cellXml, column, row) {
+  const coordinate = `${columnName(column)}${row}`;
+  let replaced = false;
+  const result = cellXml.replace(/(\br\s*=\s*")[A-Z]{1,3}[1-9]\d*(")/iu, (whole, prefix, suffix) => { replaced = true; return `${prefix}${coordinate}${suffix}`; });
+  if (!replaced) fail(`expense-group anchor cell ${coordinate} has no explicit coordinate.`);
+  return result;
+}
+
+function replaceRowCells(rowXml, replacements) {
+  const sourceEntries = rowCellEntries(rowXml); const used = new Set(); const output = []; let cursor = 0;
+  for (const entry of sourceEntries) {
+    output.push(rowXml.slice(cursor, entry.index));
+    if (replacements.has(entry.column)) { output.push(replacements.get(entry.column)); used.add(entry.column); }
+    else output.push(entry.xml);
+    cursor = entry.end;
+  }
+  output.push(rowXml.slice(cursor));
+  let result = output.join("");
+  for (const column of [...replacements.keys()].filter((value) => !used.has(value)).sort((left, right) => left - right)) {
+    const later = rowCellEntries(result).find((entry) => entry.column > column);
+    const offset = later?.index ?? result.search(/<\/(?:[A-Za-z_][\w.-]*:)?row\s*>/iu);
+    if (offset < 0) fail("affected expense-group row has no closing row tag.");
+    result = `${result.slice(0, offset)}${replacements.get(column)}${result.slice(offset)}`;
+  }
+  return result;
+}
+
+function buildSplitPlan({ insertions, expenseGroups, indexedRows, stylesXml, resolveMoneyStyle }) {
+  const rowByNumber = new Map(indexedRows.map((row) => [row.number, row]));
+  const repairs = []; const rowOverrides = new Map();
+  for (const group of [...expenseGroups.values()].sort((left, right) => left.startRow - right.startRow || left.endRow - right.endRow)) {
+    const cutRows = [...new Set(insertions.filter((insertion) => insertion.expenseGroupId === group.groupId).map((insertion) => insertion.beforeRow))].sort((left, right) => left - right);
+    if (cutRows.length === 0) continue;
+    if (cutRows.some((cut) => !(group.startRow < cut && cut <= group.endRow))) fail(`${group.groupId} split cut is outside the expense group.`);
+    const rows = [];
+    for (let rowNumber = group.startRow; rowNumber <= group.endRow; rowNumber += 1) {
+      const row = rowByNumber.get(rowNumber); if (!row?.xml) fail(`${group.groupId} affected row ${rowNumber} is missing.`);
+      const cells = rowCellEntries(row.xml); const byColumn = new Map(cells.map((cell) => [cell.column, cell]));
+      const amountCell = byColumn.get(3);
+      if (!amountCell || amountCell.formula !== null || amountCell.value === null) fail(`${group.groupId} C${rowNumber} must be a cached numeric amount.`);
+      const milliunits = parseMilliunits(amountCell.value, `${group.groupId} C${rowNumber}`, { allowNegative: true });
+      if (rowNumber > group.startRow && cells.some((cell) => cell.column >= 4 && cell.column <= 6 && cell.hasPayload)) fail(`${group.groupId} merged child row ${rowNumber} contains D:F payload.`);
+      rows.push({ row, byColumn, milliunits });
+    }
+    const anchor = rows[0].byColumn; const dAnchor = anchor.get(4); const eAnchor = anchor.get(5); const fAnchor = anchor.get(6);
+    if (!dAnchor || !eAnchor || !fAnchor || dAnchor.formula !== `SUM(C${group.startRow}:C${group.endRow})` || dAnchor.value === null) fail(`${group.groupId} D anchor must contain the exact local SUM formula and cache.`);
+    const beforeMilliunits = rows.reduce((sum, row) => sum + row.milliunits, 0n);
+    if (parseMilliunits(dAnchor.value, `${group.groupId} D cache`, { allowNegative: true }) !== beforeMilliunits) fail(`${group.groupId} D cache does not equal the affected local C sum.`);
+    const dStyleFamily = resolveMoneyStyle(dAnchor.style);
+    const boundaries = [group.startRow, ...cutRows, group.endRow + 1]; const fragments = [];
+    for (let index = 0; index + 1 < boundaries.length; index += 1) {
+      const originalStartRow = boundaries[index]; const originalEndRow = boundaries[index + 1] - 1;
+      if (originalEndRow < originalStartRow) fail(`${group.groupId} split produced an empty historical fragment.`);
+      const candidateStartRow = originalStartRow + insertionShift(originalStartRow, insertions);
+      const candidateEndRow = originalEndRow + insertionShift(originalEndRow, insertions);
+      const cachedMilliunits = rows.slice(originalStartRow - group.startRow, originalEndRow - group.startRow + 1).reduce((sum, row) => sum + row.milliunits, 0n);
+      const cachedTotal = formatMilliunits(cachedMilliunits); const style = renderMoneyStyle(dStyleFamily, cachedTotal);
+      const mergeRefs = candidateEndRow > candidateStartRow ? [4, 5, 6].map((column) => `${columnName(column)}${candidateStartRow}:${columnName(column)}${candidateEndRow}`) : [];
+      const replacements = new Map([
+        [4, fCell(`D${candidateStartRow}`, style, `SUM(C${candidateStartRow}:C${candidateEndRow})`, cachedTotal, /^<((?:[A-Za-z_][\w.-]*:)?)row\b/iu.exec(rows[originalStartRow - group.startRow].row.xml)?.[1] ?? "")],
+        [5, cloneCellAt(eAnchor.xml, 5, candidateStartRow)],
+        [6, cloneCellAt(fAnchor.xml, 6, candidateStartRow)],
+      ]);
+      const shifted = shiftOriginalRow(rows[originalStartRow - group.startRow].row, insertions).xml;
+      rowOverrides.set(originalStartRow, replaceRowCells(shifted, replacements));
+      fragments.push({ originalStartRow, originalEndRow, candidateStartRow, candidateEndRow, formula: `SUM(C${candidateStartRow}:C${candidateEndRow})`, cachedTotal, style, mergeRefs });
+    }
+    const afterMilliunits = fragments.reduce((sum, fragment) => sum + parseMilliunits(fragment.cachedTotal, `${group.groupId} fragment total`, { allowNegative: true }), 0n);
+    if (afterMilliunits !== beforeMilliunits) fail(`${group.groupId} split does not conserve its historical total.`);
+    const causeDates = [...new Set(insertions.filter((insertion) => insertion.expenseGroupId === group.groupId).flatMap((insertion) => insertion.transactions.map((item) => item.date)))].sort();
+    const body = {
+      groupId: group.groupId, originalRange: group.groupId, originalMergeRefs: group.mergeRefs, cutRows, causeDates,
+      beforeTotal: formatMilliunits(beforeMilliunits), afterTotals: fragments.map((fragment) => fragment.cachedTotal), fragments,
+      affectedRange: { startRow: group.startRow, endRow: group.endRow, rangeAddress: `C${group.startRow}:F${group.endRow}` },
+    };
+    repairs.push({ ...body, repairDigest: canonicalDigest(body) });
+  }
+  const affectedRanges = repairs.map((repair) => repair.affectedRange);
+  const body = { kind: "root-workbook-local-split-plan-v1", repairs, affectedRanges };
+  return { ...body, planDigest: canonicalDigest(body), rowOverrides };
+}
+
+function emptySplitPlanBinding() {
+  const body = { kind: "root-workbook-local-split-plan-v1", repairs: [], affectedRanges: [] };
+  return { ...body, planDigest: canonicalDigest(body) };
+}
+
+function standardStyleRow(rows, insertionRow, merges, stylesXml, resolveMoneyStyle = createMoneyStyleResolver(stylesXml)) {
   const white = whiteStyleIndexes(stylesXml);
   const intersectsBusinessMerge = (row) => merges.some((ref) => {
     const range = splitRange(ref);
@@ -426,8 +590,10 @@ function standardStyleRow(rows, insertionRow, merges, stylesXml) {
   const candidates = localRows.map((row) => ({ row, cells: row.styles })).filter(({ row, cells }) => Array.from({ length: 6 }, (_, index) => cells.get(index + 1)).every((style) => style !== undefined && white.has(style)) && row.height !== null && !intersectsBusinessMerge(row));
   const selected = candidates.sort((left, right) => Math.abs(left.row.number - insertionRow) - Math.abs(right.row.number - insertionRow) || right.row.number - left.row.number)[0];
   if (!selected) fail(`no whole white standard data row is available near insertion row ${insertionRow}.`);
+  const baseStyles = Object.fromEntries(Array.from({ length: 6 }, (_, index) => [index + 1, selected.cells.get(index + 1)]));
   return {
-    styles: Object.fromEntries(Array.from({ length: 6 }, (_, index) => [index + 1, selected.cells.get(index + 1)])),
+    styles: { ...baseStyles, 3: resolveMoneyStyle(baseStyles[3]), 4: resolveMoneyStyle(baseStyles[4]) },
+    baseStyles,
     height: selected.row.height,
     sourceRow: selected.row.number,
     sourceOrdinal: selected.row.ordinal,
@@ -469,7 +635,7 @@ const ROOT_BATCH_MERGE_POLICY = Object.freeze({ sameDate: true, expenseGroup: tr
 function renderBatchRows(transactions, firstRow, styles, height, date1904, prefix = "", mergePolicy = ROOT_BATCH_MERGE_POLICY) {
   const dateStarts = new Map(runs(transactions, (item) => item.date).map((run) => [run.start, run]));
   const groupStarts = new Map(runs(transactions, (item) => JSON.stringify([item.person, item.classification, item.settlement])).map((run) => [run.start, run]));
-  const rows = []; const merges = []; const batchRows = [];
+  const rows = []; const merges = []; const batchRows = []; const previewTransactions = []; let previewGroupKey = null;
   for (const [index, transaction] of transactions.entries()) {
     const row = firstRow + index; const cells = [];
     const dateRun = dateStarts.get(index);
@@ -478,6 +644,7 @@ function renderBatchRows(transactions, firstRow, styles, height, date1904, prefi
     const groupRun = groupStarts.get(index);
     if (groupRun) {
       const endRow = row + groupRun.end - groupRun.start;
+      previewGroupKey = `${row}:${endRow}`;
       const total = transactions.slice(groupRun.start, groupRun.end + 1).reduce((sum, item) => sum + item.milliunits, 0n);
       const cachedTotal = formatMilliunits(total);
       cells.push(fCell(`D${row}`, renderMoneyStyle(styles[4], cachedTotal), `SUM(C${row}:C${endRow})`, cachedTotal, prefix), tCell(`E${row}`, styles[5], transaction.person, prefix), tCell(`F${row}`, styles[6], transaction.classification, prefix));
@@ -485,8 +652,9 @@ function renderBatchRows(transactions, firstRow, styles, height, date1904, prefi
     }
     rows.push(`<${prefix}row r="${row}" ht="${xml(height)}" customHeight="1">${cells.join("")}</${prefix}row>`);
     batchRows.push({ transactionId: transaction.id, row, fingerprint: canonicalDigest({ transactionId: transaction.id, row, date: transaction.date, project: transaction.project, amount: transaction.amount, person: transaction.person, classification: transaction.classification }) });
+    previewTransactions.push({ ...transaction, settlement: `candidate-group-${previewGroupKey}` });
   }
-  return { rows, merges, batchRows };
+  return { rows, merges, batchRows, previewTransactions };
 }
 
 function insertionShift(row, insertions) { return insertions.reduce((count, insertion) => count + (insertion.beforeRow <= row ? insertion.transactions.length : 0), 0); }
@@ -533,20 +701,43 @@ function shiftWorksheetReferences(worksheetXml, insertions, sheetName) {
 
 function shiftOriginalRow(row, insertions) {
   const newNumber = row.number + insertionShift(row.number, insertions);
-  let result = row.xml.replace(/^(<(?:[A-Za-z_][\w.-]*:)?row\b[^>]*\br\s*=\s*")[1-9]\d*(")/u, `$1${newNumber}$2`);
-  result = result.replace(/(<(?:[A-Za-z_][\w.-]*:)?c\b[^>]*\br\s*=\s*")([A-Z]{1,3})([1-9]\d*)(")/gu, (whole, prefix, column, rowText, suffix) => `${prefix}${column}${Number(rowText) + insertionShift(Number(rowText), insertions)}${suffix}`);
-  result = result.replace(/(<(?:[A-Za-z_][\w.-]*:)?f\b[^>]*>)([\s\S]*?)(<\/(?:[A-Za-z_][\w.-]*:)?f>)/gu, (whole, open, formula, close) => `${open}${shiftFormula(formula, insertions)}${close}`);
-  return { number: newNumber, xml: result };
+  let rowCoordinateReplacementCount = 0; let cellCoordinateCount = 0; let formulaBodyShiftCount = 0;
+  const cellElementCount = [...row.xml.matchAll(/<(?:[A-Za-z_][\w.-]*:)?c\b/giu)].length;
+  const formulaCount = [...row.xml.matchAll(/<(?:[A-Za-z_][\w.-]*:)?f\b/giu)].length;
+  let result = row.xml.replace(/^(<(?:[A-Za-z_][\w.-]*:)?row\b[^>]*\br\s*=\s*")[1-9]\d*(")/u, (whole, prefix, suffix) => { rowCoordinateReplacementCount += 1; return `${prefix}${newNumber}${suffix}`; });
+  result = result.replace(/(<(?:[A-Za-z_][\w.-]*:)?c\b[^>]*\br\s*=\s*")([A-Z]{1,3})([1-9]\d*)(")/gu, (whole, prefix, column, rowText, suffix) => { cellCoordinateCount += 1; return `${prefix}${column}${Number(rowText) + insertionShift(Number(rowText), insertions)}${suffix}`; });
+  result = result.replace(/(<(?:[A-Za-z_][\w.-]*:)?f\b[^>]*>)([\s\S]*?)(<\/(?:[A-Za-z_][\w.-]*:)?f>)/gu, (whole, open, formula, close) => { formulaBodyShiftCount += 1; return `${open}${shiftFormula(formula, insertions)}${close}`; });
+  if (rowCoordinateReplacementCount !== 1 || cellCoordinateCount !== cellElementCount || formulaBodyShiftCount > formulaCount) fail(`historical row ${row.number} could not prove its complete construction-side coordinate transform.`);
+  return {
+    number: newNumber,
+    xml: result,
+    constructionProof: { kind: "shifted-row-construction-proof-v1", sourceRow: row.number, candidateRow: newNumber, rowCoordinateReplacementCount, cellCoordinateCount, formulaCount, formulaBodyShiftCount },
+  };
 }
 
-function shiftMerge(ref, insertions) {
+function splitMergeReplacements(ref, splitPlan) {
+  for (const repair of splitPlan?.repairs ?? []) {
+    const index = repair.originalMergeRefs.indexOf(ref);
+    if (index < 0) continue;
+    const column = index + 4;
+    return repair.fragments.flatMap((fragment) => fragment.candidateEndRow > fragment.candidateStartRow
+      ? [`${columnName(column)}${fragment.candidateStartRow}:${columnName(column)}${fragment.candidateEndRow}`]
+      : []);
+  }
+  return null;
+}
+
+function shiftMerge(ref, insertions, splitPlan = null) {
+  const replacements = splitMergeReplacements(ref, splitPlan);
+  if (replacements) return replacements;
   const range = splitRange(ref);
   for (const insertion of insertions) if (range.startRow < insertion.beforeRow && insertion.beforeRow <= range.endRow) fail(`local insertion would split existing merge ${ref}.`);
-  return `${columnName(range.startColumn)}${range.startRow + insertionShift(range.startRow, insertions)}:${columnName(range.endColumn)}${range.endRow + insertionShift(range.endRow, insertions)}`;
+  return [`${columnName(range.startColumn)}${range.startRow + insertionShift(range.startRow, insertions)}:${columnName(range.endColumn)}${range.endRow + insertionShift(range.endRow, insertions)}`];
 }
 
-function patchMergeCells(worksheetXml, existingRefs, newRefs, insertions, worksheetPrefix) {
-  const shiftedExisting = existingRefs.map((ref) => shiftMerge(ref, insertions));
+function patchMergeCells(worksheetXml, existingRefs, newRefs, insertions, worksheetPrefix, splitPlan = null) {
+  const shiftedByExisting = existingRefs.map((ref) => shiftMerge(ref, insertions, splitPlan));
+  const shiftedExisting = shiftedByExisting.flat();
   const allRefs = [...shiftedExisting, ...newRefs];
   const blockPattern = /<((?:[A-Za-z_][\w.-]*:)?)mergeCells\b([^>]*)>([\s\S]*?)<\/\1mergeCells\s*>/iu;
   const match = blockPattern.exec(worksheetXml);
@@ -557,8 +748,11 @@ function patchMergeCells(worksheetXml, existingRefs, newRefs, insertions, worksh
   }
   let existingIndex = 0;
   const shiftedBody = match[3].replace(/<(?:[A-Za-z_][\w.-]*:)?mergeCell\b[^>]*\bref\s*=\s*"([A-Z]{1,3}[1-9]\d*:[A-Z]{1,3}[1-9]\d*)"[^>]*\/\s*>/giu, (tag) => {
-    const replacement = shiftedExisting[existingIndex++];
-    return replacement ? tag.replace(/(\bref\s*=\s*")[^"]+(")/iu, `$1${replacement}$2`) : tag;
+    const replacements = shiftedByExisting[existingIndex++] ?? [];
+    const prefix = /^<((?:[A-Za-z_][\w.-]*:)?)mergeCell\b/iu.exec(tag)?.[1] ?? worksheetPrefix;
+    return replacements.map((replacement, index) => index === 0
+      ? tag.replace(/(\bref\s*=\s*")[^"]+(")/iu, `$1${replacement}$2`)
+      : `<${prefix}mergeCell ref="${replacement}"/>`).join("");
   });
   if (existingIndex !== existingRefs.length) fail("managed worksheet merge index differs from mergeCells content.");
   const openingAttributes = /\bcount\s*=\s*"[^"]*"/iu.test(match[2]) ? match[2].replace(/\bcount\s*=\s*"[^"]*"/iu, `count="${allRefs.length}"`) : `${match[2]} count="${allRefs.length}"`;
@@ -686,13 +880,13 @@ function verifyAppendBoundaryTransform(beforeXml, afterXml, batchRowXmlByRow, ba
   return { ...facts, factsDigest: canonicalDigest(facts) };
 }
 
-function verifySupplementSuffixTransform(beforeXml, afterXml, insertions, batchRows, batchMergeRefs, { maxRow, sheetName, beforeStructural = null, afterStructural = null } = {}) {
+function verifySupplementSuffixTransform(beforeXml, afterXml, insertions, batchRows, batchMergeRefs, { maxRow, sheetName, beforeStructural = null, afterStructural = null, splitPlan = null } = {}) {
   const before = beforeStructural ?? locateSheetDataRows(beforeXml); const after = afterStructural ?? locateSheetDataRows(afterXml); const batchNumbers = new Set(batchRows.map((item) => item.row));
   const actualBatchRows = after.rows.filter((row) => batchNumbers.has(row.number));
   if (actualBatchRows.length !== batchNumbers.size || new Set(actualBatchRows.map((row) => row.number)).size !== batchNumbers.size) fail("candidate batch row coordinates are missing or duplicate.");
   const historical = after.rows.filter((row) => !batchNumbers.has(row.number));
   if (historical.length !== before.rows.length) fail("candidate historical row count differs outside the batch.");
-  const firstAffectedIndex = before.rows.findIndex((row) => insertionShift(row.number, insertions) > 0);
+  const firstAffectedIndex = before.rows.findIndex((row) => insertionShift(row.number, insertions) > 0 || splitPlan?.rowOverrides?.has(row.number));
   const preservedPrefixCount = firstAffectedIndex < 0 ? before.rows.length : firstAffectedIndex;
   for (let index = 0; index < preservedPrefixCount; index += 1) {
     if (historical[index].number !== before.rows[index].number || historical[index].xml !== before.rows[index].xml) fail(`historical prefix row ${before.rows[index].number} changed before the first supplement boundary.`);
@@ -701,7 +895,27 @@ function verifySupplementSuffixTransform(beforeXml, afterXml, insertions, batchR
   for (let index = preservedPrefixCount; index < before.rows.length; index += 1) {
     const baselineRow = before.rows[index];
     const candidateRow = historical[index]; const rowShift = insertionShift(baselineRow.number, insertions);
-    if (rowShift <= 0) fail(`supplement affected suffix row ${baselineRow.number} has no coordinate shift.`);
+    const repairedRow = splitPlan?.rowOverrides?.get(baselineRow.number);
+    if (rowShift <= 0 && !repairedRow) fail(`supplement affected suffix row ${baselineRow.number} has no coordinate shift or local repair.`);
+    if (repairedRow) {
+      if (candidateRow.xml !== repairedRow) fail(`historical expense-group anchor row ${baselineRow.number} differs from its local split plan.`);
+      const proof = candidateRow.constructionProof;
+      if (proof?.kind === "repaired-row-construction-proof-v1") {
+        if (proof.sourceRow !== baselineRow.number || proof.candidateRow !== candidateRow.number || proof.candidateRow !== baselineRow.number + rowShift) fail(`historical expense-group anchor row ${baselineRow.number} construction proof differs.`);
+        cellCoordinateCount += proof.cellCoordinateCount; formulaCount += proof.formulaCount;
+      } else {
+        const repairedDescriptor = rowCoordinateDescriptor(repairedRow);
+        cellCoordinateCount += repairedDescriptor.cells.length; formulaCount += repairedDescriptor.formulas.length;
+      }
+      shiftedRowCount += Number(rowShift > 0);
+      continue;
+    }
+    const proof = candidateRow.constructionProof;
+    if (proof?.kind === "shifted-row-construction-proof-v1") {
+      if (proof.sourceRow !== baselineRow.number || proof.candidateRow !== candidateRow.number || proof.candidateRow !== baselineRow.number + rowShift || proof.rowCoordinateReplacementCount !== 1 || proof.formulaBodyShiftCount > proof.formulaCount) fail(`historical row ${baselineRow.number} construction proof differs.`);
+      cellCoordinateCount += proof.cellCoordinateCount; formulaCount += proof.formulaCount; shiftedRowCount += 1;
+      continue;
+    }
     const baselineDescriptor = rowCoordinateDescriptor(baselineRow.xml); const candidateDescriptor = rowCoordinateDescriptor(candidateRow.xml);
     if (baselineDescriptor.rowTagShape !== candidateDescriptor.rowTagShape) fail(`historical row ${baselineRow.number} attributes changed outside its coordinate.`);
     const expectedRow = baselineDescriptor.explicitRow === null ? null : String(Number(baselineDescriptor.explicitRow) + rowShift);
@@ -734,7 +948,7 @@ function verifySupplementSuffixTransform(beforeXml, afterXml, insertions, batchR
     const candidateFormula = afterFormulas[index]; const expectedBody = formula.body === null ? formula.body : shiftFormula(formula.body, insertions);
     if (formula.prefix !== candidateFormula.prefix || formula.name !== candidateFormula.name || formula.attributes !== candidateFormula.attributes || candidateFormula.body !== expectedBody) fail(`candidate worksheet rule formula ${index + 1} differs.`);
   }
-  const expectedMerges = [...scanMergeRefs(beforeXml).map((ref) => shiftMerge(ref, insertions)), ...batchMergeRefs];
+  const expectedMerges = [...scanMergeRefs(beforeXml).flatMap((ref) => shiftMerge(ref, insertions, splitPlan)), ...batchMergeRefs];
   const candidateMerges = scanMergeRefs(afterXml);
   if (canonicalDigest(candidateMerges) !== canonicalDigest(expectedMerges)) fail("candidate merge coordinate transform differs.");
   const expectedDimension = dimensionReference(updateDimension(beforeXml, maxRow));
@@ -778,19 +992,22 @@ function patchWorksheet(worksheetXml, transactions, date1904, stylesXml, sheetNa
   const bounds = patchIndex.structural;
   const insertionPlan = buildInsertions(transactions, indexed.rows, date1904, indexed.mergeRefs);
   const insertions = insertionPlan.insertions;
-  const renderedInsertions = new Map(); const batchRowXmlByRow = new Map(); const allBatchRows = []; const newMerges = []; const transformInsertions = []; let priorCount = 0; let styleRowsInspected = 0; let appendBoundary = null;
+  const resolveMoneyStyle = createMoneyStyleResolver(stylesXml);
+  const splitPlan = buildSplitPlan({ insertions, expenseGroups: insertionPlan.expenseGroups, indexedRows: indexed.rows, stylesXml, resolveMoneyStyle });
+  const { rowOverrides: _splitRowOverrides, ...splitPlanBinding } = splitPlan;
+  const renderedInsertions = new Map(); const batchRowXmlByRow = new Map(); const allBatchRows = []; const previewTransactions = []; const newMerges = []; const transformInsertions = []; let priorCount = 0; let styleRowsInspected = 0; let appendBoundary = null;
   for (const insertion of insertions) {
     const firstRow = insertion.beforeRow + priorCount;
-    const standard = standardStyleRow(indexed.rows, insertion.beforeRow, indexed.mergeRefs, stylesXml);
+    const standard = standardStyleRow(indexed.rows, insertion.beforeRow, indexed.mergeRefs, stylesXml, resolveMoneyStyle);
     const rendered = renderBatchRows(insertion.transactions, firstRow, standard.styles, standard.height, date1904, bounds.prefix);
-    renderedInsertions.set(insertion.beforeRow, rendered); allBatchRows.push(...rendered.batchRows); newMerges.push(...rendered.merges); priorCount += insertion.transactions.length;
+    renderedInsertions.set(insertion.beforeRow, rendered); allBatchRows.push(...rendered.batchRows); previewTransactions.push(...rendered.previewTransactions); newMerges.push(...rendered.merges); priorCount += insertion.transactions.length;
     const styleWitness = captureDates ? null : structuralRowWitness(patchIndex.structural.rows[standard.sourceOrdinal]);
-    transformInsertions.push({ beforeRow: insertion.beforeRow, rowCount: insertion.transactions.length, candidateStartRow: firstRow, candidateEndRow: firstRow + insertion.transactions.length - 1, transactionIds: insertion.transactions.map((item) => item.id), styleSource: { row: standard.sourceRow, height: standard.height, styles: standard.styles, witness: styleWitness } });
+    transformInsertions.push({ beforeRow: insertion.beforeRow, rowCount: insertion.transactions.length, candidateStartRow: firstRow, candidateEndRow: firstRow + insertion.transactions.length - 1, transactionIds: insertion.transactions.map((item) => item.id), styleSource: { row: standard.sourceRow, height: standard.height, baseStyles: standard.baseStyles, styles: standard.styles, witness: styleWitness } });
     for (const [index, batchRow] of rendered.batchRows.entries()) batchRowXmlByRow.set(batchRow.row, rendered.rows[index]);
     styleRowsInspected += standard.inspectedRowCount;
   }
-  const rewrittenHistoricalRows = captureDates ? indexed.rows.filter((row) => insertionShift(row.number, insertions) > 0) : [];
-  let changed; let baselineStructural = patchIndex.structural;
+  const rewrittenHistoricalRows = captureDates ? indexed.rows.filter((row) => insertionShift(row.number, insertions) > 0 || splitPlan.rowOverrides.has(row.number)) : [];
+  let changed; let baselineStructural = patchIndex.structural; let candidateStructural = null;
   if (rewrittenHistoricalRows.length === 0) {
     const appended = insertions.flatMap((insertion) => renderedInsertions.get(insertion.beforeRow).rows).join("");
     const lastBusinessOrdinal = Math.max(-1, ...indexed.rows.filter((row) => row.number === insertionPlan.businessTailRow && row.hasBusinessPayload).map((row) => row.ordinal));
@@ -810,18 +1027,30 @@ function patchWorksheet(worksheetXml, transactions, date1904, stylesXml, sheetNa
     for (const row of indexed.rows) if (insertionShift(row.number, insertions) > 0 && (!row.explicitCoordinate || !row.coordinateSafe || row.hasImplicitCellCoordinate)) fail(`supplement cannot safely shift coordinate-implicit row ${row.number}.`);
     const affectedNumbers = indexed.rows.filter((row) => insertionShift(row.number, insertions) > 0).map((row) => row.number);
     if (affectedNumbers.some((row, index) => index > 0 && row <= affectedNumbers[index - 1])) fail("supplement affected suffix has duplicate or out-of-order row coordinates.");
-    const output = [worksheetXml.slice(0, structural.innerStart)]; let cursor = structural.innerStart; const pending = [...insertions];
+    const output = [worksheetXml.slice(0, structural.innerStart)]; const candidateRows = []; let cursor = structural.innerStart; const pending = [...insertions];
+    const appendRendered = (rendered) => {
+      output.push(...rendered.rows);
+      for (const [index, batchRow] of rendered.batchRows.entries()) candidateRows.push({ number: batchRow.row, xml: rendered.rows[index], explicitCoordinate: true });
+    };
     for (const row of structural.rows) {
       output.push(worksheetXml.slice(cursor, row.start));
-      while (pending.length && pending[0].beforeRow <= row.number) output.push(...renderedInsertions.get(pending.shift().beforeRow).rows);
-      output.push(shiftOriginalRow(row, insertions).xml); cursor = row.end;
+      while (pending.length && pending[0].beforeRow <= row.number) appendRendered(renderedInsertions.get(pending.shift().beforeRow));
+      const repaired = splitPlan.rowOverrides.get(row.number); const rowShift = insertionShift(row.number, insertions);
+      const repairedDescriptor = repaired ? rowCoordinateDescriptor(repaired) : null;
+      const candidateRow = repaired
+        ? { number: row.number + rowShift, xml: repaired, explicitCoordinate: true, constructionProof: { kind: "repaired-row-construction-proof-v1", sourceRow: row.number, candidateRow: row.number + rowShift, cellCoordinateCount: repairedDescriptor.cells.length, formulaCount: repairedDescriptor.formulas.length } }
+        : rowShift === 0
+          ? { number: row.number, xml: row.xml, explicitCoordinate: row.explicitCoordinate }
+          : { ...shiftOriginalRow(row, insertions), explicitCoordinate: row.explicitCoordinate };
+      output.push(candidateRow.xml); candidateRows.push(candidateRow); cursor = row.end;
     }
     output.push(worksheetXml.slice(cursor, structural.innerEnd));
-    while (pending.length) output.push(...renderedInsertions.get(pending.shift().beforeRow).rows);
+    while (pending.length) appendRendered(renderedInsertions.get(pending.shift().beforeRow));
     output.push(worksheetXml.slice(structural.innerEnd)); changed = output.join("");
     changed = shiftWorksheetReferences(changed, insertions, sheetName);
+    candidateStructural = { rows: candidateRows };
   }
-  changed = patchMergeCells(changed, indexed.mergeRefs, newMerges, captureDates ? insertions : [], bounds.prefix);
+  changed = patchMergeCells(changed, indexed.mergeRefs, newMerges, captureDates ? insertions : [], bounds.prefix, splitPlan);
   const maxRow = Math.max(1, ...indexed.rows.filter((row) => row.hasBusinessPayload).map((row) => row.number + insertionShift(row.number, insertions)), ...allBatchRows.map((item) => item.row));
   changed = updateDimension(changed, maxRow);
   const localIndexDigest = canonicalDigest({
@@ -835,20 +1064,21 @@ function patchWorksheet(worksheetXml, transactions, date1904, stylesXml, sheetNa
     batchAmount: formatMilliunits(transactions.reduce((sum, item) => sum + item.milliunits, 0n)), localIndexDigest,
     locality: {
       indexMode: insertionPlan.requiresDateIndex ? "a-date-and-df-merge" : "append-tail-only", indexParser: insertionPlan.requiresDateIndex ? "bundled-sax" : "namespace-agnostic-structural", standardStyleWindowRadius: STANDARD_STYLE_WINDOW_RADIUS,
-      baselineStructuralRowCount: indexed.rows.length, historicalBusinessValueReadCount: 0, styleRowsInspected,
+      baselineStructuralRowCount: indexed.rows.length, historicalBusinessValueReadCount: 0, globalHistoricalBusinessScanCount: 0, affectedHistoricalRanges: splitPlan.affectedRanges, affectedHistoricalCellReadCount: splitPlan.repairs.reduce((count, repair) => count + (repair.affectedRange.endRow - repair.affectedRange.startRow + 1) + 3, 0), styleRowsInspected,
       rewrittenHistoricalRowCount: rewrittenHistoricalRows.length, preservedHistoricalRowCount: indexed.rows.length - rewrittenHistoricalRows.length,
     },
   };
   const coordinateTransform = captureDates
-    ? verifySupplementSuffixTransform(worksheetXml, changed, insertions, allBatchRows, newMerges, { maxRow, sheetName, beforeStructural: baselineStructural })
+    ? verifySupplementSuffixTransform(worksheetXml, changed, insertions, allBatchRows, newMerges, { maxRow, sheetName, beforeStructural: baselineStructural, afterStructural: candidateStructural, splitPlan })
     : verifyAppendBoundaryTransform(worksheetXml, changed, batchRowXmlByRow, newMerges, maxRow, appendBoundary);
   const transformBody = {
     kind: "root-workbook-local-coordinate-transform-v1", indexMode: projectionBody.locality.indexMode, date1904, appendRow: insertionPlan.appendRow,
-    businessTailRow: insertionPlan.businessTailRow, maxRow, insertions: transformInsertions, batchMergeRefs: newMerges, appendBoundary, coordinateTransform,
+    businessTailRow: insertionPlan.businessTailRow, maxRow, insertions: transformInsertions, batchMergeRefs: newMerges, appendBoundary, splitPlan: splitPlanBinding, coordinateTransform,
   };
   return {
     xml: changed, maxRow, projection: { ...projectionBody, batchProjectionDigest: canonicalDigest(projectionBody) }, batchRowXmlByRow, batchMergeRefs: newMerges,
-    transform: { ...transformBody, transformDigest: canonicalDigest(transformBody) },
+    transform: { ...transformBody, transformDigest: canonicalDigest(transformBody) }, structuralRepairs: splitPlan.repairs,
+    previewTransactions: previewTransactions.map((item, index) => ({ ...item, sourceOrder: index + 1 })),
   };
 }
 
@@ -862,6 +1092,45 @@ function centralEntryFacts(zip) {
     if (!compressionMethod) fail(`ZIP compression metadata is unavailable for ${name}.`);
     entries.push({ name, crc32: (crc32 >>> 0).toString(16).padStart(8, "0"), size, compressedSize, compressionMethod });
   }
+  return { partCount: entries.length, factsDigest: canonicalDigest(entries), inventoryDigest: canonicalDigest(entries.map((entry) => entry.name)), entries };
+}
+
+export function parseBoundedZipCentralFacts(bytes) {
+  if (!Buffer.isBuffer(bytes) || bytes.length < 22 || bytes.length > MAX_STABLE_BINARY_BYTES) fail("candidate ZIP bytes are outside the bounded central-directory parser limits.");
+  const minimumEocd = Math.max(0, bytes.length - 65_557); let eocdOffset = -1;
+  for (let offset = bytes.length - 22; offset >= minimumEocd; offset -= 1) {
+    if (bytes.readUInt32LE(offset) !== 0x06054b50) continue;
+    const commentLength = bytes.readUInt16LE(offset + 20);
+    if (offset + 22 + commentLength === bytes.length) { eocdOffset = offset; break; }
+  }
+  if (eocdOffset < 0) fail("candidate ZIP has no bounded end-of-central-directory record.");
+  const disk = bytes.readUInt16LE(eocdOffset + 4); const centralDisk = bytes.readUInt16LE(eocdOffset + 6);
+  const diskEntries = bytes.readUInt16LE(eocdOffset + 8); const totalEntries = bytes.readUInt16LE(eocdOffset + 10);
+  const centralSize = bytes.readUInt32LE(eocdOffset + 12); const centralOffset = bytes.readUInt32LE(eocdOffset + 16);
+  if (disk !== 0 || centralDisk !== 0 || diskEntries !== totalEntries) fail("candidate ZIP central directory must be single-disk and complete.");
+  if (totalEntries === 0xffff || centralSize === 0xffffffff || centralOffset === 0xffffffff) fail("candidate ZIP64 central metadata is outside the bounded parser contract.");
+  if (totalEntries > 100_000 || centralOffset + centralSize > eocdOffset || centralOffset + centralSize > bytes.length) fail("candidate ZIP central directory bounds are invalid.");
+  const decoder = new TextDecoder("utf-8", { fatal: true }); const entries = []; const seen = new Set(); let cursor = centralOffset;
+  for (let index = 0; index < totalEntries; index += 1) {
+    if (cursor + 46 > centralOffset + centralSize || bytes.readUInt32LE(cursor) !== 0x02014b50) fail("candidate ZIP central entry is truncated or malformed.");
+    const flags = bytes.readUInt16LE(cursor + 8); const method = bytes.readUInt16LE(cursor + 10); const crc32 = bytes.readUInt32LE(cursor + 16);
+    const compressedSize = bytes.readUInt32LE(cursor + 20); const size = bytes.readUInt32LE(cursor + 24);
+    const nameLength = bytes.readUInt16LE(cursor + 28); const extraLength = bytes.readUInt16LE(cursor + 30); const commentLength = bytes.readUInt16LE(cursor + 32);
+    const diskStart = bytes.readUInt16LE(cursor + 34); const localOffset = bytes.readUInt32LE(cursor + 42); const end = cursor + 46 + nameLength + extraLength + commentLength;
+    if (end > centralOffset + centralSize || diskStart !== 0 || size === 0xffffffff || compressedSize === 0xffffffff || localOffset === 0xffffffff) fail("candidate ZIP central entry exceeds the bounded non-ZIP64 contract.");
+    if ((flags & 0x0001) !== 0 || !new Set([0, 8]).has(method)) fail("candidate ZIP central entry uses unsupported encryption or compression.");
+    let name;
+    try { name = decoder.decode(bytes.subarray(cursor + 46, cursor + 46 + nameLength)); } catch (error) { fail("candidate ZIP central entry name is not valid UTF-8.", error); }
+    if (!name || name.includes("\0") || name.includes("\\") || seen.has(name)) fail("candidate ZIP central entry name is empty, unsafe, or duplicate.");
+    seen.add(name);
+    if (!name.endsWith("/")) {
+      const methodBytes = Buffer.allocUnsafe(2); methodBytes.writeUInt16LE(method);
+      entries.push({ name, crc32: crc32.toString(16).padStart(8, "0"), size, compressedSize, compressionMethod: methodBytes.toString("hex") });
+    }
+    cursor = end;
+  }
+  if (cursor !== centralOffset + centralSize) fail("candidate ZIP central directory size or entry count differs.");
+  entries.sort((left, right) => left.name < right.name ? -1 : left.name > right.name ? 1 : 0);
   return { partCount: entries.length, factsDigest: canonicalDigest(entries), inventoryDigest: canonicalDigest(entries.map((entry) => entry.name)), entries };
 }
 
@@ -1004,13 +1273,12 @@ async function buildCandidateCore(artifact, certificate, stagingRoot, { onOwned,
   const candidate = await writeExclusive(path.join(stagingRoot, `.${artifact.profileId}.${crypto.randomBytes(10).toString("hex")}.candidate.tmp.xlsx`), candidateBytes);
   onOwned?.(candidate);
   if (testHooks?.afterCandidateWritten) await testHooks.afterCandidateWritten({ profileId: artifact.profileId, candidate: { ...candidate } });
-  const candidateZip = await JSZip.loadAsync(candidateBytes, { createFolders: false }); const candidateFacts = centralEntryFacts(candidateZip);
+  const candidateFacts = parseBoundedZipCentralFacts(candidateBytes);
   trace.push(["candidate-central", performance.now() - traceStarted]);
   const untouched = compareUnchangedEntries(baselineFacts, candidateFacts, new Set([managed.worksheetPart, managed.workbookPart]));
   const localPatchCertificate = createLocalPatchCertificate({ artifact, baselineStable: stable, candidate, managed, updatedWorkbookXml, patch, baselineFacts, candidateFacts, untouched });
-  const previewTransactions = projectCandidateBatchRows(patch.xml, patch.projection, managed.date1904, patch);
   if (process.env.XHS_CANDIDATE_TRACE === "1") process.stderr.write(`candidate-build-core-trace ${JSON.stringify([...trace, ["complete", performance.now() - traceStarted]])}\n`);
-  return { artifact, candidate, localPatchCertificate, previewInput: { transactions: previewTransactions, date1904: managed.date1904 } };
+  return { artifact, candidate, localPatchCertificate, structuralRepairs: patch.structuralRepairs, previewInput: { transactions: patch.previewTransactions, date1904: managed.date1904 } };
 }
 
 async function buildCandidatePreview(item, stagingRoot, { onOwned, testHooks } = {}) {
@@ -1090,7 +1358,9 @@ function auditCurrentAppendPatch({ baselineXml, candidateXml, transactions, date
   const tailXml = witnessedRowXml(baselineXml, transformBinding.appendBoundary.tail, "current append tail");
   if (!localRowStyleFacts(tailXml, transformBinding.businessTailRow).hasBusinessPayload) fail("current append tail witness has no A:F payload.");
   const styleSource = insertion.styleSource; const styleXml = witnessedRowXml(baselineXml, styleSource.witness, "current append style source"); const styleFacts = localRowStyleFacts(styleXml, styleSource.row);
-  if (styleSource.witness.number !== styleSource.row || Math.abs(styleSource.row - insertion.beforeRow) > STANDARD_STYLE_WINDOW_RADIUS || styleFacts.height !== styleSource.height || canonicalDigest(Object.fromEntries(styleFacts.styles)) !== canonicalDigest(styleSource.styles) || !styleFacts.hasBusinessPayload) fail("current append style witness differs.");
+  const baseStyles = Object.fromEntries(styleFacts.styles); const resolveMoneyStyle = createMoneyStyleResolver(stylesXml);
+  const resolvedStyles = { ...baseStyles, 3: resolveMoneyStyle(baseStyles[3]), 4: resolveMoneyStyle(baseStyles[4]) };
+  if (styleSource.witness.number !== styleSource.row || Math.abs(styleSource.row - insertion.beforeRow) > STANDARD_STYLE_WINDOW_RADIUS || styleFacts.height !== styleSource.height || canonicalDigest(baseStyles) !== canonicalDigest(styleSource.baseStyles) || canonicalDigest(resolvedStyles) !== canonicalDigest(styleSource.styles) || !styleFacts.hasBusinessPayload) fail("current append style witness differs.");
   const white = whiteStyleIndexes(stylesXml);
   if (!Array.from({ length: 6 }, (_, index) => styleFacts.styles.get(index + 1)).every((style) => style !== undefined && white.has(style))) fail("current append style witness is not a whole white row.");
   for (const ref of scanMergeRefs(baselineXml)) { const range = splitRange(ref); if (range.startColumn <= 6 && range.endColumn >= 1 && range.startRow <= styleSource.row && styleSource.row <= range.endRow) fail("current append style witness intersects a business merge."); }
@@ -1105,8 +1375,8 @@ function auditCurrentAppendPatch({ baselineXml, candidateXml, transactions, date
   const coordinateTransform = verifyAppendBoundaryTransform(baselineXml, candidateXml, expectedRows, rendered.merges, transformBinding.maxRow, transformBinding.appendBoundary);
   const transformBody = {
     kind: "root-workbook-local-coordinate-transform-v1", indexMode: "append-tail-only", date1904, appendRow: transformBinding.appendRow,
-    businessTailRow: transformBinding.businessTailRow, maxRow: transformBinding.maxRow, insertions: [{ ...insertion, styleSource: { row: styleSource.row, height: styleFacts.height, styles: Object.fromEntries(styleFacts.styles), witness: styleSource.witness } }],
-    batchMergeRefs: rendered.merges, appendBoundary: transformBinding.appendBoundary, coordinateTransform,
+    businessTailRow: transformBinding.businessTailRow, maxRow: transformBinding.maxRow, insertions: [{ ...insertion, styleSource: { row: styleSource.row, height: styleFacts.height, baseStyles, styles: resolvedStyles, witness: styleSource.witness } }],
+    batchMergeRefs: rendered.merges, appendBoundary: transformBinding.appendBoundary, splitPlan: emptySplitPlanBinding(), coordinateTransform,
   };
   const transform = { ...transformBody, transformDigest: canonicalDigest(transformBody) };
   if (canonicalDigest(transform) !== canonicalDigest(transformBinding) || transform.transformDigest !== certificate.transformDigest) fail("current append transform differs from its local boundary audit.");
@@ -1130,13 +1400,16 @@ function auditLocalWorksheetPatch({ baselineXml, candidateXml, transactions, dat
   detailTrace.push(["baseline-index", performance.now() - detailTraceStarted]);
   const bounds = currentIndex?.structural ?? locateSheetData(baselineXml);
   const insertionPlan = buildInsertions(transactions, indexed.rows, date1904, indexed.mergeRefs); const insertions = insertionPlan.insertions;
+  const resolveMoneyStyle = createMoneyStyleResolver(stylesXml);
+  const splitPlan = buildSplitPlan({ insertions, expenseGroups: insertionPlan.expenseGroups, indexedRows: indexed.rows, stylesXml, resolveMoneyStyle });
+  const { rowOverrides: _splitRowOverrides, ...splitPlanBinding } = splitPlan;
   const allBatchRows = []; const batchMergeRefs = []; const expectedRows = new Map(); const transformInsertions = []; let priorCount = 0; let styleRowsInspected = 0;
   for (const insertion of insertions) {
-    const firstRow = insertion.beforeRow + priorCount; const standard = standardStyleRow(indexed.rows, insertion.beforeRow, indexed.mergeRefs, stylesXml);
+    const firstRow = insertion.beforeRow + priorCount; const standard = standardStyleRow(indexed.rows, insertion.beforeRow, indexed.mergeRefs, stylesXml, resolveMoneyStyle);
     const rendered = renderBatchRows(insertion.transactions, firstRow, standard.styles, standard.height, date1904, bounds.prefix);
     for (const [index, batchRow] of rendered.batchRows.entries()) expectedRows.set(batchRow.row, rendered.rows[index]);
     allBatchRows.push(...rendered.batchRows); batchMergeRefs.push(...rendered.merges);
-    transformInsertions.push({ beforeRow: insertion.beforeRow, rowCount: insertion.transactions.length, candidateStartRow: firstRow, candidateEndRow: firstRow + insertion.transactions.length - 1, transactionIds: insertion.transactions.map((item) => item.id), styleSource: { row: standard.sourceRow, height: standard.height, styles: standard.styles, witness: null } });
+    transformInsertions.push({ beforeRow: insertion.beforeRow, rowCount: insertion.transactions.length, candidateStartRow: firstRow, candidateEndRow: firstRow + insertion.transactions.length - 1, transactionIds: insertion.transactions.map((item) => item.id), styleSource: { row: standard.sourceRow, height: standard.height, baseStyles: standard.baseStyles, styles: standard.styles, witness: null } });
     priorCount += insertion.transactions.length; styleRowsInspected += standard.inspectedRowCount;
   }
   detailTrace.push(["batch-render", performance.now() - detailTraceStarted]);
@@ -1147,7 +1420,7 @@ function auditLocalWorksheetPatch({ baselineXml, candidateXml, transactions, dat
   }
   for (const [row, expectedXml] of expectedRows) if (actualRows.get(row) !== expectedXml) fail(`candidate batch row ${row} differs from its independently rendered batch row.`);
   detailTrace.push(["candidate-index", performance.now() - detailTraceStarted]);
-  const rewrittenHistoricalRowCount = captureDates ? indexed.rows.filter((row) => insertionShift(row.number, insertions) > 0).length : 0;
+  const rewrittenHistoricalRowCount = captureDates ? indexed.rows.filter((row) => insertionShift(row.number, insertions) > 0 || splitPlan.rowOverrides.has(row.number)).length : 0;
   const localIndexDigest = canonicalDigest({
     mode: insertionPlan.requiresDateIndex ? "a-date-and-df-merge" : "append-tail-only",
     rows: indexed.rows.map((row) => ({ row: row.number, hasBusinessPayload: row.hasBusinessPayload, dateValue: captureDates ? row.dateValue : null })),
@@ -1159,18 +1432,18 @@ function auditLocalWorksheetPatch({ baselineXml, candidateXml, transactions, dat
     batchAmount: formatMilliunits(transactions.reduce((sum, item) => sum + item.milliunits, 0n)), localIndexDigest,
     locality: {
       indexMode: insertionPlan.requiresDateIndex ? "a-date-and-df-merge" : "append-tail-only", indexParser: insertionPlan.requiresDateIndex ? "bundled-sax" : "namespace-agnostic-structural", standardStyleWindowRadius: STANDARD_STYLE_WINDOW_RADIUS,
-      baselineStructuralRowCount: indexed.rows.length, historicalBusinessValueReadCount: 0, styleRowsInspected,
+      baselineStructuralRowCount: indexed.rows.length, historicalBusinessValueReadCount: 0, globalHistoricalBusinessScanCount: 0, affectedHistoricalRanges: splitPlan.affectedRanges, affectedHistoricalCellReadCount: splitPlan.repairs.reduce((count, repair) => count + (repair.affectedRange.endRow - repair.affectedRange.startRow + 1) + 3, 0), styleRowsInspected,
       rewrittenHistoricalRowCount, preservedHistoricalRowCount: indexed.rows.length - rewrittenHistoricalRowCount,
     },
   };
   const projection = { ...projectionBody, batchProjectionDigest: canonicalDigest(projectionBody) };
   if (canonicalDigest(projection) !== canonicalDigest(certificate.projection)) fail("candidate local patch projection differs from its independently audited projection.");
   const maxRow = Math.max(1, ...indexed.rows.filter((row) => row.hasBusinessPayload).map((row) => row.number + insertionShift(row.number, insertions)), ...allBatchRows.map((item) => item.row));
-  const coordinateTransform = verifySupplementSuffixTransform(baselineXml, candidateXml, insertions, allBatchRows, batchMergeRefs, { maxRow, sheetName, beforeStructural: indexed.structural, afterStructural: candidateStructural });
+  const coordinateTransform = verifySupplementSuffixTransform(baselineXml, candidateXml, insertions, allBatchRows, batchMergeRefs, { maxRow, sheetName, beforeStructural: indexed.structural, afterStructural: candidateStructural, splitPlan });
   detailTrace.push(["coordinate-transform", performance.now() - detailTraceStarted]);
   const transformBody = {
     kind: "root-workbook-local-coordinate-transform-v1", indexMode: projection.locality.indexMode, date1904, appendRow: insertionPlan.appendRow,
-    businessTailRow: insertionPlan.businessTailRow, maxRow, insertions: transformInsertions, batchMergeRefs, appendBoundary: null, coordinateTransform,
+    businessTailRow: insertionPlan.businessTailRow, maxRow, insertions: transformInsertions, batchMergeRefs, appendBoundary: null, splitPlan: splitPlanBinding, coordinateTransform,
   };
   const transform = { ...transformBody, transformDigest: canonicalDigest(transformBody) };
   if (canonicalDigest(transform) !== canonicalDigest(certificate.transform) || transform.transformDigest !== certificate.transformDigest) fail("candidate coordinate transform differs from its independently audited transform.");
@@ -1294,7 +1567,7 @@ export function prestartRootWorkbookAuditWorker({ timeoutMs = DEFAULT_WORKER_TIM
     workerData: { kind: "root-workbook-audit-thread-session-v1" },
     resourceLimits: { maxOldGenerationSizeMb: 256, maxYoungGenerationSizeMb: 64 },
   });
-  let state = "starting"; let timer; let readyResolve; let readyReject; let runResolve; let runReject;
+  let state = "starting"; let timer; let readyResolve; let readyReject; let pending = null; let queue = Promise.resolve();
   const ready = new Promise((resolve, reject) => { readyResolve = resolve; readyReject = reject; });
   // A build failure may terminate the session before the candidate path exists.
   // Keep that lifecycle rejection observed even when no audit request is sent.
@@ -1303,7 +1576,8 @@ export function prestartRootWorkbookAuditWorker({ timeoutMs = DEFAULT_WORKER_TIM
     if (state === "closed") return;
     const prior = state; state = "closed"; clearTimeout(timer);
     if (prior === "starting") readyReject(error);
-    else if (prior === "running") runReject(error);
+    else if (prior === "running") pending?.reject(error);
+    pending = null;
     void worker.terminate();
   };
   timer = setTimeout(() => closeWithError(new Error("audit worker startup timed out")), timeoutMs);
@@ -1312,40 +1586,51 @@ export function prestartRootWorkbookAuditWorker({ timeoutMs = DEFAULT_WORKER_TIM
       if (message?.kind !== "root-workbook-audit-thread-ready-v1") return closeWithError(new Error("audit worker startup protocol is invalid"));
       clearTimeout(timer); state = "ready"; readyResolve(); return;
     }
-    if (state !== "running" || message?.kind !== "root-workbook-audit-thread-result-v1") return closeWithError(new Error("audit worker response protocol is invalid"));
-    clearTimeout(timer); state = "closed";
-    if (!message.ok) runReject(new Error(`audit worker failed: ${message.error ?? "unknown error"}`));
+    if (state !== "running" || message?.kind !== "root-workbook-audit-thread-result-v1" || !pending) return closeWithError(new Error("audit worker response protocol is invalid"));
+    const current = pending; pending = null; clearTimeout(timer); state = "ready";
+    if (!message.ok) current.reject(new Error(`audit worker failed: ${message.error ?? "unknown error"}`));
     else {
       const out = `${JSON.stringify(message.response)}\n`;
-      if (Buffer.byteLength(out) > stdoutMaxBytes) runReject(new Error("audit worker stdout exceeded its bounded limit"));
-      else runResolve({ ...message.response, rawStdout: out });
+      if (Buffer.byteLength(out) > stdoutMaxBytes) { current.reject(new Error("audit worker stdout exceeded its bounded limit")); closeWithError(new Error("audit worker stdout exceeded its bounded limit")); }
+      else current.resolve({ ...message.response, rawStdout: out });
     }
-    void worker.terminate();
   });
   worker.once("error", (error) => closeWithError(error));
   worker.once("exit", (code) => { if (state !== "closed") closeWithError(new Error(`audit worker exited with code ${code}`)); });
+  worker.unref();
+  const runOne = async ({ requestPath, requestBody, requestFileSha256, requestNonce } = {}) => {
+    await ready;
+    if (state !== "ready") fail("prestarted audit worker is unavailable.");
+    const absoluteRequest = requestBody ? null : path.resolve(text(requestPath, "worker requestPath")); sha(requestFileSha256, "worker requestFileSha256"); if (!TOKEN_RE.test(requestNonce ?? "")) fail("worker requestNonce is invalid.");
+    if (requestBody && sha256Bytes(jsonBytes(requestBody)) !== requestFileSha256) fail("in-memory audit request SHA differs.");
+    state = "running";
+    return new Promise((resolve, reject) => {
+      pending = { resolve, reject };
+      timer = setTimeout(() => closeWithError(new Error("audit worker timed out")), timeoutMs);
+      worker.postMessage({ kind: "root-workbook-audit-thread-request-v1", request: { requestPath: absoluteRequest, requestBody: requestBody ? clone(requestBody) : null, requestFileSha256, requestNonce } });
+    });
+  };
   return Object.freeze({
     ready,
-    async run({ requestPath, requestBody, requestFileSha256, requestNonce } = {}) {
-      await ready;
-      if (state !== "ready") fail("prestarted audit worker is unavailable.");
-      const absoluteRequest = requestBody ? null : path.resolve(text(requestPath, "worker requestPath")); sha(requestFileSha256, "worker requestFileSha256"); if (!TOKEN_RE.test(requestNonce ?? "")) fail("worker requestNonce is invalid.");
-      if (requestBody && sha256Bytes(jsonBytes(requestBody)) !== requestFileSha256) fail("in-memory audit request SHA differs.");
-      state = "running";
-      return new Promise((resolve, reject) => {
-        runResolve = resolve; runReject = reject;
-        timer = setTimeout(() => closeWithError(new Error("audit worker timed out")), timeoutMs);
-        worker.postMessage({ kind: "root-workbook-audit-thread-request-v1", request: { requestPath: absoluteRequest, requestBody: requestBody ? clone(requestBody) : null, requestFileSha256, requestNonce } });
-      });
+    run(options) {
+      const result = queue.then(() => runOne(options));
+      queue = result.catch(() => {});
+      return result;
     },
     async terminate() {
       if (state === "closed") return;
       const prior = state; state = "closed"; clearTimeout(timer);
       if (prior === "starting") readyReject(new Error("audit worker terminated before startup completed"));
-      else if (prior === "running") runReject(new Error("audit worker terminated before the audit completed"));
+      else if (prior === "running") pending?.reject(new Error("audit worker terminated before the audit completed"));
+      pending = null;
       await worker.terminate();
     },
   });
+}
+
+function getSharedRootAuditSession() {
+  if (!sharedRootAuditSession) sharedRootAuditSession = prestartRootWorkbookAuditWorker();
+  return sharedRootAuditSession;
 }
 
 async function cleanupOwned(owned, stagingRoot) {
@@ -1361,10 +1646,11 @@ function planFilename(profile, revision) { return `${profile.archiveStem}_候选
 export async function buildRootWorkbookCandidates(request, { testHooks } = {}) {
   const registry = await loadProfileRegistry(); const checked = validateBuildRequest(clone(request), registry); const stagingRoot = path.join(path.resolve(os.tmpdir()), `${STAGING_PREFIX}${checked.stagingToken}`); const owned = []; let auditSession = null;
   try {
+    if (!testHooks?.runRootWorkbookAuditWorker && !sharedRootAuditSession) auditSession = getSharedRootAuditSession();
     await fs.mkdir(stagingRoot, { recursive: false });
     const marker = await writeExclusive(path.join(stagingRoot, ".codex-xhs-owner.json"), jsonBytes({ kind: "root-workbook-staging-owner-v2", stagingToken: checked.stagingToken, pid: process.pid })); owned.push(marker);
     if (!testHooks?.runRootWorkbookAuditWorker) {
-      auditSession = prestartRootWorkbookAuditWorker();
+      auditSession ??= getSharedRootAuditSession();
       if (testHooks?.afterAuditWorkerPrestarted) await testHooks.afterAuditWorkerPrestarted();
     }
     const builtSet = await mapSettledLimit(checked.artifacts, 3, (artifact) => buildCandidateCore(artifact, checked.certificate, stagingRoot, { onOwned: (entry) => owned.push(entry), testHooks })); const builtCores = builtSet.settled.map((entry) => entry.value);
@@ -1393,13 +1679,12 @@ export async function buildRootWorkbookCandidates(request, { testHooks } = {}) {
       if (candidateOwnedIndex < 0) fail(`owned candidate is missing before commit for ${item.artifact.profileId}.`);
       await fs.rename(item.candidate.path, final.path);
       owned[candidateOwnedIndex] = final;
-      const planBody = { kind: "root-workbook-local-increment-plan-v2", requiresGate1Binding: true, profile: audit.profile, manifest: audit.manifest, baseline: audit.baseline, candidate: { path: final.path, sha256: final.sha256, size: final.size, factsDigest: audit.candidate.factsDigest }, preview: item.preview, transitionDigest: audit.transitionDigest, localPatchCertificate: item.localPatchCertificate, audit, candidateRevision: item.artifact.candidateRevision, stagingOwnership: { token: checked.stagingToken, ownerMarkerSha256: marker.sha256 } };
+      const planBody = { kind: "root-workbook-local-increment-plan-v2", requiresGate1Binding: true, profile: audit.profile, manifest: audit.manifest, baseline: audit.baseline, candidate: { path: final.path, sha256: final.sha256, size: final.size, factsDigest: audit.candidate.factsDigest }, preview: item.preview, transitionDigest: audit.transitionDigest, localPatchCertificate: item.localPatchCertificate, structuralRepairs: clone(item.structuralRepairs), audit, candidateRevision: item.artifact.candidateRevision, stagingOwnership: { token: checked.stagingToken, ownerMarkerSha256: marker.sha256 } };
       const plan = { ...planBody, planDigest: canonicalDigest(planBody) }; const planEntry = await writeExclusive(path.join(stagingRoot, planFilename(item.artifact.profile, item.artifact.candidateRevision)), jsonBytes(plan)); owned.push(planEntry);
-      committed.push({ profileId: item.artifact.profileId, candidateRevision: item.artifact.candidateRevision, candidatePath: final.path, candidateSha256: final.sha256, candidateSize: final.size, candidateFactsDigest: audit.candidate.factsDigest, localPatchCertificate: item.localPatchCertificate, previewPath: item.preview.path, previewSha256: item.preview.sha256, previewSize: item.preview.size, previewSheetName: item.preview.sheetName, previewRangeAddress: item.preview.rangeAddress, previewEndRow: item.preview.endRow, planPath: planEntry.path, planSha256: planEntry.sha256, planSize: planEntry.size, planDigest: plan.planDigest, audit });
+      committed.push({ profileId: item.artifact.profileId, candidateRevision: item.artifact.candidateRevision, candidatePath: final.path, candidateSha256: final.sha256, candidateSize: final.size, candidateFactsDigest: audit.candidate.factsDigest, localPatchCertificate: item.localPatchCertificate, structuralRepairs: clone(item.structuralRepairs), previewPath: item.preview.path, previewSha256: item.preview.sha256, previewSize: item.preview.size, previewSheetName: item.preview.sheetName, previewRangeAddress: item.preview.rangeAddress, previewEndRow: item.preview.endRow, planPath: planEntry.path, planSha256: planEntry.sha256, planSize: planEntry.size, planDigest: plan.planDigest, audit });
     }
     return deepFreeze({ kind: ROOT_WORKBOOK_BUILD_RESULT_KIND, requiresGate1Binding: true, stagingRoot, stagingToken: checked.stagingToken, requestDigest: workerRequest.requestDigest, requestFileSha256, auditBatchDigest: canonicalDigest(auditBatch), artifacts: committed, ownedFiles: owned.map((item) => ({ path: item.path, sha256: item.sha256, size: item.size })) });
   } catch (reason) {
-    if (auditSession) await auditSession.terminate().catch(() => {});
     const cleanup = await cleanupOwned(owned, stagingRoot); const message = reason instanceof Error ? reason.message : String(reason);
     if (cleanup.preserved.length || cleanup.failures.length) fail(`${message}; cleanup incomplete: ${[...cleanup.preserved, ...cleanup.failures.map((item) => item.path)].join(", ")}`);
     throw reason;
@@ -1412,8 +1697,13 @@ async function executeAuditWorker({ requestPath: rawRequestPath, requestBody, re
   if (snapshot.sha256 !== expectedSha) fail("audit request file SHA differs.");
   const request = validateAuditRequest(snapshot.value); if (request.requestNonce !== expectedNonce) fail("audit request nonce differs.");
   const registry = preloadedRegistry ?? await loadProfileRegistry(); const certificate = validateCertificate(request.reimbursementFactsCertificate, registry); const expectedOrder = registry.profileOrder.filter((profileId) => request.profiles.some((item) => item.profileId === profileId)); if (canonicalDigest(expectedOrder) !== canonicalDigest(request.profiles.map((item) => item.profileId))) fail("audit profiles are outside registry order.");
-  const settled = await mapSettledLimit(request.profiles, 3, (profile) => auditOne(profile, certificate, registry));
-  return { kind: ROOT_WORKBOOK_AUDIT_BATCH_KIND, requestDigest: request.requestDigest, requestFileSha256: snapshot.sha256, requestNonce: request.requestNonce, audits: settled.settled.map((entry) => entry.value) };
+  const settled = await Promise.all(request.profiles.map(async (profile) => {
+    try { return { status: "fulfilled", value: await auditOne(profile, certificate, registry) }; }
+    catch (reason) { return { status: "rejected", reason }; }
+  }));
+  const firstFailure = settled.find((entry) => entry.status === "rejected");
+  if (firstFailure) throw firstFailure.reason;
+  return { kind: ROOT_WORKBOOK_AUDIT_BATCH_KIND, requestDigest: request.requestDigest, requestFileSha256: snapshot.sha256, requestNonce: request.requestNonce, audits: settled.map((entry) => entry.value) };
 }
 
 async function auditWorkerMain(args) {
@@ -1430,15 +1720,17 @@ async function main() {
 if (!isMainThread && workerData?.kind === "root-workbook-audit-thread-session-v1") {
   loadProfileRegistry().then((registry) => {
     parentPort.postMessage({ kind: "root-workbook-audit-thread-ready-v1" });
-    parentPort.once("message", (message) => {
-      if (message?.kind !== "root-workbook-audit-thread-request-v1") {
+    let running = false;
+    parentPort.on("message", (message) => {
+      if (running || message?.kind !== "root-workbook-audit-thread-request-v1") {
         parentPort.postMessage({ kind: "root-workbook-audit-thread-result-v1", ok: false, error: "audit worker request protocol is invalid" });
         return;
       }
+      running = true;
       executeAuditWorker(message.request, registry).then(
         (response) => parentPort.postMessage({ kind: "root-workbook-audit-thread-result-v1", ok: true, response }),
         (error) => parentPort.postMessage({ kind: "root-workbook-audit-thread-result-v1", ok: false, error: error instanceof Error ? error.message : String(error) }),
-      );
+      ).finally(() => { running = false; });
     });
   }, (error) => parentPort.postMessage({ kind: "root-workbook-audit-thread-result-v1", ok: false, error: error instanceof Error ? error.message : String(error) }));
 } else if (!isMainThread && workerData?.kind === "root-workbook-audit-thread-v1") {
@@ -1446,3 +1738,5 @@ if (!isMainThread && workerData?.kind === "root-workbook-audit-thread-session-v1
 } else if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
   main().catch((error) => { process.stderr.write(`${JSON.stringify({ error: error instanceof Error ? error.message : String(error) })}\n`); process.exitCode = 1; });
 }
+
+if (isMainThread && process.argv[2] !== "--audit-worker") getSharedRootAuditSession();

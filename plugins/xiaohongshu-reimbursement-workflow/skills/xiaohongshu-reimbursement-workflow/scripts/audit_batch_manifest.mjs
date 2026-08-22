@@ -478,28 +478,29 @@ async function sha256File(filePath) {
 }
 
 async function mapWithConcurrency(items, limit, worker) {
-  const results = new Array(items.length);
+  const settled = new Array(items.length);
   let next = 0;
   async function run() {
     while (true) {
       const index = next;
       next += 1;
       if (index >= items.length) return;
-      results[index] = await worker(items[index], index);
+      try {
+        settled[index] = { status: "fulfilled", value: await worker(items[index], index) };
+      } catch (reason) {
+        settled[index] = { status: "rejected", reason };
+      }
     }
   }
   await Promise.all(Array.from({ length: Math.min(limit, items.length) }, run));
-  return results;
+  const firstFailure = settled.find((entry) => entry?.status === "rejected");
+  if (firstFailure) throw firstFailure.reason;
+  return settled.map((entry) => entry.value);
 }
 
-const manifestWorker = !isMainThread && workerData?.kind === "ordinary-manifest-audit-worker-v1";
-const manifestPath = manifestWorker ? workerData.manifestPath : process.argv[2];
-const deferOrdinaryFileVerification = manifestWorker ? workerData.deferOrdinaryFileVerification === true : process.argv[3] === "--defer-ordinary-file-verification";
-
-try {
-  if (!manifestPath || (!manifestWorker && (process.argv[4] !== undefined || (process.argv[3] !== undefined && !deferOrdinaryFileVerification)))) {
-    throw new Error("Use audit_batch_manifest.mjs <manifest.json> [--defer-ordinary-file-verification].");
-  }
+export async function auditBatchManifestFile(manifestPath, { deferOrdinaryFileVerification = false } = {}) {
+ try {
+  if (!manifestPath) throw new Error("manifest path is required.");
   const absoluteManifestPath = path.resolve(manifestPath);
   const manifestSnapshot = await readStableUtf8JsonFile(absoluteManifestPath, {
     maxBytes: DEFAULT_STABLE_JSON_MAX_BYTES,
@@ -1230,9 +1231,43 @@ try {
       [...settlementTotals].map(([settlement, total]) => [settlement, formatAmount(total)]),
     );
   }
-  if (manifestWorker) parentPort.postMessage({ kind: "ordinary-manifest-audit-result-v1", ok: true, result });
-  else { process.stdout.write(`${JSON.stringify(result)}\n`); process.exitCode = 0; }
-} catch (error) {
-  if (manifestWorker) parentPort.postMessage({ kind: "ordinary-manifest-audit-result-v1", ok: false, error: error instanceof Error ? error.message : String(error) });
-  else fail(error instanceof Error ? error.message : String(error));
+  return result;
+ } catch (error) {
+  throw error;
+ }
+}
+
+const oneShotWorker = !isMainThread && workerData?.kind === "ordinary-manifest-audit-worker-v1";
+const sessionWorker = !isMainThread && workerData?.kind === "ordinary-manifest-audit-session-v1";
+
+if (sessionWorker) {
+  let running = false;
+  parentPort.on("message", async (message) => {
+    if (running || message?.kind !== "ordinary-manifest-audit-session-request-v1" || !Number.isSafeInteger(message.requestId) || message.requestId < 1) {
+      parentPort.postMessage({ kind: "ordinary-manifest-audit-session-result-v1", requestId: message?.requestId ?? null, ok: false, error: "manifest audit session request is invalid or concurrent" });
+      return;
+    }
+    running = true;
+    try {
+      const result = await auditBatchManifestFile(message.manifestPath, { deferOrdinaryFileVerification: message.deferOrdinaryFileVerification === true });
+      parentPort.postMessage({ kind: "ordinary-manifest-audit-session-result-v1", requestId: message.requestId, ok: true, result });
+    } catch (error) {
+      parentPort.postMessage({ kind: "ordinary-manifest-audit-session-result-v1", requestId: message.requestId, ok: false, error: error instanceof Error ? error.message : String(error) });
+    } finally {
+      running = false;
+    }
+  });
+  parentPort.postMessage({ kind: "ordinary-manifest-audit-session-ready-v1" });
+} else {
+  const manifestPath = oneShotWorker ? workerData.manifestPath : process.argv[2];
+  const deferOrdinaryFileVerification = oneShotWorker ? workerData.deferOrdinaryFileVerification === true : process.argv[3] === "--defer-ordinary-file-verification";
+  try {
+    if (!oneShotWorker && (process.argv[4] !== undefined || (process.argv[3] !== undefined && !deferOrdinaryFileVerification))) throw new Error("Use audit_batch_manifest.mjs <manifest.json> [--defer-ordinary-file-verification].");
+    const result = await auditBatchManifestFile(manifestPath, { deferOrdinaryFileVerification });
+    if (oneShotWorker) parentPort.postMessage({ kind: "ordinary-manifest-audit-result-v1", ok: true, result });
+    else { process.stdout.write(`${JSON.stringify(result)}\n`); process.exitCode = 0; }
+  } catch (error) {
+    if (oneShotWorker) parentPort.postMessage({ kind: "ordinary-manifest-audit-result-v1", ok: false, error: error instanceof Error ? error.message : String(error) });
+    else fail(error instanceof Error ? error.message : String(error));
+  }
 }

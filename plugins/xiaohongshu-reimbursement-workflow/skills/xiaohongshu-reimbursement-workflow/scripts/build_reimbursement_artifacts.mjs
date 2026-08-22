@@ -904,18 +904,44 @@ async function loadEvidence(manifest) {
     }
   }
   const jobs = [...jobsBySha256.values()];
-  const loaded = await mapSettledInInputOrder(jobs, 3, async (job) => {
-    const stable = await readStableBinaryFile(job.filePath, { maxBytes: MAX_IMAGE_BYTES });
-    if (stable.sha256 !== job.expectedSha256) fail(`evidence ${job.evidenceId} SHA changed after manifest audit.`);
-    const bytes = copyStableBinaryBytes(stable);
-    let metadata = imageMetadataCache.get(stable.sha256);
-    if (job.requiresImageDecode && !metadata) {
-      metadata = await inspectEvidenceImage(bytes, `evidence ${job.evidenceId}`);
-      imageMetadataCache.set(stable.sha256, metadata);
+  let decodeActive = 0; const decodeQueue = [];
+  const pumpDecodeQueue = () => {
+    while (decodeActive < 2 && decodeQueue.length > 0) {
+      const task = decodeQueue.shift(); decodeActive += 1;
+      Promise.resolve().then(task.operation).then(task.resolve, task.reject).finally(() => { decodeActive -= 1; pumpDecodeQueue(); });
     }
-    return { stable, bytes, metadata };
-  });
-  const loadedBySha256 = new Map(jobs.map((job, index) => [job.expectedSha256, loaded.settled[index].value]));
+  };
+  const scheduleDecode = (operation) => new Promise((resolve, reject) => { decodeQueue.push({ operation, resolve, reject }); pumpDecodeQueue(); });
+  const decodeTasks = new Array(jobs.length);
+  let loaded; let readFailure;
+  try {
+    loaded = await mapSettledLimit(jobs, 3, async (job, index) => {
+      const stable = await readStableBinaryFile(job.filePath, { maxBytes: MAX_IMAGE_BYTES });
+      if (stable.sha256 !== job.expectedSha256) fail(`evidence ${job.evidenceId} SHA changed after manifest audit.`);
+      const bytes = copyStableBinaryBytes(stable);
+      const cachedMetadata = imageMetadataCache.get(stable.sha256);
+      if (job.requiresImageDecode) {
+        decodeTasks[index] = cachedMetadata
+          ? Promise.resolve({ status: "fulfilled", value: cachedMetadata })
+          : scheduleDecode(() => inspectEvidenceImage(bytes, `evidence ${job.evidenceId}`)).then(
+              (metadata) => { imageMetadataCache.set(stable.sha256, metadata); return { status: "fulfilled", value: metadata }; },
+              (reason) => ({ status: "rejected", reason }),
+            );
+      }
+      return { stable, bytes };
+    });
+  } catch (error) {
+    readFailure = error;
+    loaded = error?.settledDetails;
+  }
+  const decodeResults = await Promise.all(Array.from({ length: jobs.length }, (_, index) => decodeTasks[index] ?? Promise.resolve({ status: "fulfilled", value: undefined })));
+  const failures = [];
+  for (const [index, entry] of (loaded?.settled ?? []).entries()) if (entry?.status === "rejected") failures.push({ index, reason: entry.reason });
+  for (const [index, entry] of decodeResults.entries()) if (entry.status === "rejected") failures.push({ index, reason: entry.reason });
+  failures.sort((left, right) => left.index - right.index);
+  if (failures.length > 0) throw failures[0].reason;
+  if (readFailure) throw readFailure;
+  const loadedBySha256 = new Map(jobs.map((job, index) => [job.expectedSha256, { ...loaded.settled[index].value, metadata: decodeResults[index].value }]));
   for (const { raw, filePath, expectedSha256 } of bindings) {
     const { stable, bytes, metadata } = loadedBySha256.get(expectedSha256);
     if (raw.kind === "image") {
@@ -1022,10 +1048,15 @@ export async function buildReimbursementArtifacts(rawRequest, { testHooks } = {}
       const detailPath = path.join(stagingRoot, `${safePeriod}_${profile.targetCategory}_本次报销明细${supplements.suffix}.xlsx`);
       const screenshotPath = path.join(stagingRoot, `${safePeriod}_${profile.targetCategory}_报销明细对应截图表${supplements.suffix}.xlsx`);
       const summaryPath = path.join(stagingRoot, `${safePeriod}_${profile.targetCategory}_报销文字说明${supplements.suffix}.txt`);
-      const detailState = await writeWorkbook(detailPath, profile.detailSheetName, detail, testHooks?.beforeArtifactWorkbookValidation ? (binding) => testHooks.beforeArtifactWorkbookValidation({ ...binding, profileId, role: "detail" }) : undefined);
-      owned.push({ path: detailPath, ...detailState });
-      const screenshotState = await writeWorkbook(screenshotPath, profile.screenshotMapSheetName, screenshot, testHooks?.beforeArtifactWorkbookValidation ? (binding) => testHooks.beforeArtifactWorkbookValidation({ ...binding, profileId, role: "screenshot" }) : undefined);
-      owned.push({ path: screenshotPath, ...screenshotState });
+      const workbookWrites = await Promise.allSettled([
+        writeWorkbook(detailPath, profile.detailSheetName, detail, testHooks?.beforeArtifactWorkbookValidation ? (binding) => testHooks.beforeArtifactWorkbookValidation({ ...binding, profileId, role: "detail" }) : undefined),
+        writeWorkbook(screenshotPath, profile.screenshotMapSheetName, screenshot, testHooks?.beforeArtifactWorkbookValidation ? (binding) => testHooks.beforeArtifactWorkbookValidation({ ...binding, profileId, role: "screenshot" }) : undefined),
+      ]);
+      const workbookPaths = [detailPath, screenshotPath];
+      for (const [index, settled] of workbookWrites.entries()) if (settled.status === "fulfilled") owned.push({ path: workbookPaths[index], ...settled.value });
+      const workbookFailure = workbookWrites.find((settled) => settled.status === "rejected");
+      if (workbookFailure) throw workbookFailure.reason;
+      const [detailState, screenshotState] = workbookWrites.map((settled) => settled.value);
       const evidenceIds = [...new Set(selected.flatMap((item) => item.evidence))]
         .filter((id) => evidence.get(id)?.kind === "image")
         .filter((id, index, values) => values.findIndex((other) => evidence.get(other).sha256 === evidence.get(id).sha256) === index);

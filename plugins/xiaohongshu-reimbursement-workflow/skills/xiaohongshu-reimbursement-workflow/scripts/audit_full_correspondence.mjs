@@ -23,8 +23,10 @@ const SOURCE_CONCURRENCY = 4;
 const JSZipModule = loadBundledDependency("jszip");
 const JSZip = JSZipModule.default ?? JSZipModule;
 
+class CorrespondenceValidationError extends Error {}
+
 function fail(message) {
-  throw new Error(`Full Correspondence Auditor ${message}`);
+  throw new CorrespondenceValidationError(`Full Correspondence Auditor ${message}`);
 }
 
 function isRetryableInfrastructureError(error) {
@@ -95,8 +97,23 @@ function sum(items, selector) {
   return items.reduce((total, item) => total + selector(item), 0n);
 }
 
+function stableTextCompare(left, right) {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
+function normalizeSourceRefs(values, field, onDuplicate = null) {
+  const original = array(values, field).map((value, index) => text(value, `${field}[${index}]`));
+  const seen = new Set(); const duplicates = [];
+  for (const value of original) {
+    if (seen.has(value)) duplicates.push(value);
+    else seen.add(value);
+  }
+  if (duplicates.length > 0) onDuplicate?.([...new Set(duplicates)].sort(stableTextCompare));
+  return { original, sorted: [...seen].sort(stableTextCompare), duplicates };
+}
+
 function sortedUnique(values) {
-  return [...new Set(values)].sort((left, right) => left.localeCompare(right, "en"));
+  return normalizeSourceRefs(values, "internal stable text set").sorted;
 }
 
 function uniqueMap(items, keySelector, add, code, artifact) {
@@ -125,12 +142,13 @@ function serialToIso(raw, date1904) {
 }
 
 function issueStore() {
-  const result = { missing: [], extra: [], mismatches: [], duplicate: [], unbound: [] };
+  const result = { missing: [], extra: [], mismatches: [], duplicate: [], unbound: [], blocking: [] };
   const add = (kind, code, detail = {}) => {
     if (!Object.hasOwn(result, kind)) fail(`internal issue kind ${kind} is invalid.`);
     result[kind].push({ code, ...detail });
   };
-  return { result, add };
+  const block = (code, detail = {}) => add("blocking", code, detail);
+  return { result, add, block };
 }
 
 function publicValue(value) {
@@ -138,6 +156,17 @@ function publicValue(value) {
   if (Array.isArray(value)) return value.map(publicValue);
   if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([key, child]) => [key, publicValue(child)]));
   return value;
+}
+
+function sortIssues(issues) {
+  const fields = ["code", "profileId", "transactionId", "sourceRef", "evidenceId", "fileId", "artifact", "location", "field", "annotationIndex"];
+  for (const items of Object.values(issues)) items.sort((left, right) => {
+    for (const field of fields) {
+      const compared = stableTextCompare(String(left[field] ?? ""), String(right[field] ?? ""));
+      if (compared !== 0) return compared;
+    }
+    return stableTextCompare(JSON.stringify(publicValue(left)), JSON.stringify(publicValue(right)));
+  });
 }
 
 function compare(add, actual, expected, detail) {
@@ -226,15 +255,15 @@ function normalizeObservedFact(fact, field) {
 function normalizeAnnotationObservation(annotation, field) {
   exact(annotation, new Set(["profileId", "person", "kind", "period", "amount", "sourceRefs"]), field);
   exact(annotation.period, new Set(["start", "end"]), `${field}.period`);
-  const sourceRefs = array(annotation.sourceRefs, `${field}.sourceRefs`).map((value, index) => text(value, `${field}.sourceRefs[${index}]`));
-  if (sourceRefs.length === 0 || new Set(sourceRefs).size !== sourceRefs.length) fail(`${field}.sourceRefs must be a non-empty unique array.`);
+  const normalizedSourceRefs = normalizeSourceRefs(annotation.sourceRefs, `${field}.sourceRefs`);
+  if (normalizedSourceRefs.original.length === 0 || normalizedSourceRefs.duplicates.length > 0) fail(`${field}.sourceRefs must be a non-empty unique array.`);
   return {
     profileId: text(annotation.profileId, `${field}.profileId`),
     person: text(annotation.person, `${field}.person`),
     kind: text(annotation.kind, `${field}.kind`),
     period: { start: text(annotation.period.start, `${field}.period.start`), end: text(annotation.period.end, `${field}.period.end`) },
     amount: amount(asAmount(annotation.amount, `${field}.amount`)),
-    sourceRefs: [...sourceRefs].sort(),
+    sourceRefs: normalizedSourceRefs.sorted,
   };
 }
 
@@ -512,7 +541,10 @@ function bindTransactions(manifest, certificate, add, registry) {
     rawById.set(id, raw);
   }
   const sourceRefBindings = uniqueMap(array(certificate.sourceCoveragePreimage.transactionSourceRefs, "certificate.sourceCoveragePreimage.transactionSourceRefs"), (item) => item.transactionId, add, "source-coverage-transaction-duplicate", "transactionSourceRefs");
-  const sourceRefsByTransaction = new Map([...sourceRefBindings].map(([transactionId, item]) => [transactionId, item.sourceRefs]));
+  const sourceRefsByTransaction = new Map([...sourceRefBindings].map(([transactionId, item]) => {
+    const normalized = normalizeSourceRefs(item.sourceRefs, `certificate sourceRefs for ${transactionId}`, (duplicates) => add("duplicate", "source-coverage-source-ref-duplicate", { transactionId, artifact: "certificate", duplicates }));
+    return [transactionId, normalized.sorted];
+  }));
   const result = [];
   const certificateTransactionIds = new Set();
   for (const [index, fact] of array(certificate.factsPreimage.transactions, "certificate.factsPreimage.transactions").entries()) {
@@ -558,8 +590,8 @@ function bindTransactions(manifest, certificate, add, registry) {
       supplementReason: raw.supplementReason ?? null,
     };
     compare(add, actualRaw, expectedRaw, { code: "manifest-certificate-transaction-mismatch", transactionId: fact.id, artifact: "manifest", location: `transactions[${index}]` });
-    compare(add, raw.sourceRefs, sourceRefsByTransaction.get(fact.id), { code: "manifest-source-refs-mismatch", transactionId: fact.id, artifact: "manifest", location: `transactions[${index}].sourceRefs` });
-    if (new Set(raw.sourceRefs).size !== raw.sourceRefs.length) add("duplicate", "manifest-transaction-source-ref-duplicate", { transactionId: fact.id, artifact: "manifest", location: `transactions[${index}].sourceRefs` });
+    const rawSourceRefs = normalizeSourceRefs(raw.sourceRefs, `manifest.transactions[${index}].sourceRefs`, (duplicates) => add("duplicate", "manifest-transaction-source-ref-duplicate", { transactionId: fact.id, artifact: "manifest", location: `transactions[${index}].sourceRefs`, duplicates }));
+    compare(add, rawSourceRefs.sorted, sourceRefsByTransaction.get(fact.id), { code: "manifest-source-refs-mismatch", transactionId: fact.id, artifact: "manifest", location: `transactions[${index}].sourceRefs` });
     const evidence = array(raw.evidence, `${fact.id}.evidence`).map((value, evidenceIndex) => text(value, `${fact.id}.evidence[${evidenceIndex}]`));
     if (new Set(evidence).size !== evidence.length) add("duplicate", "manifest-transaction-evidence-duplicate", { transactionId: fact.id, artifact: "manifest", location: `transactions[${index}].evidence` });
     const hasImage = evidence.some((id) => rawFileById.get(id)?.kind === "image");
@@ -571,7 +603,7 @@ function bindTransactions(manifest, certificate, add, registry) {
       sourceMilliunits: asAmount(sourceAmount, `${fact.id}.sourceAmount`),
       reimbursementMilliunits: asAmount(reimbursementAmount, `${fact.id}.reimbursementAmount`),
       evidence,
-      sourceRefs: array(sourceRefsByTransaction.get(fact.id), `${fact.id}.sourceRefs`).map((value, sourceRefIndex) => text(value, `${fact.id}.sourceRefs[${sourceRefIndex}]`)),
+      sourceRefs: normalizeSourceRefs(sourceRefsByTransaction.get(fact.id), `${fact.id}.sourceRefs`).sorted,
       missingEvidenceConfirmed: raw.missingEvidenceConfirmed === true,
     });
   }
@@ -617,8 +649,17 @@ function sourceBindings(manifest, certificate, transactions, add) {
 }
 
 function validateSummaryAnnotations(manifest, certificate, transactionsById, add) {
-  const annotations = array(certificate.factsPreimage.summaryAnnotations, "certificate.factsPreimage.summaryAnnotations");
-  compare(add, manifest.batch.summaryAnnotations ?? [], annotations, { code: "manifest-summary-annotations-mismatch", artifact: "manifest", location: "batch.summaryAnnotations" });
+  const normalizeProjection = (annotation, field, artifact, annotationIndex) => {
+    const normalized = clone(object(annotation, field));
+    const sourceRefs = normalizeSourceRefs(normalized.sourceRefs, `${field}.sourceRefs`, (duplicates) => add("duplicate", "summary-annotation-source-ref-duplicate", { annotationIndex, artifact, location: field, duplicates }));
+    normalized.sourceRefs = sourceRefs.sorted;
+    return normalized;
+  };
+  const annotations = array(certificate.factsPreimage.summaryAnnotations, "certificate.factsPreimage.summaryAnnotations")
+    .map((annotation, index) => normalizeProjection(annotation, `certificate.factsPreimage.summaryAnnotations[${index}]`, "certificate", index));
+  const manifestAnnotations = array(manifest.batch.summaryAnnotations ?? [], "manifest.batch.summaryAnnotations")
+    .map((annotation, index) => normalizeProjection(annotation, `manifest.batch.summaryAnnotations[${index}]`, "manifest", index));
+  compare(add, manifestAnnotations, annotations, { code: "manifest-summary-annotations-mismatch", artifact: "manifest", location: "batch.summaryAnnotations" });
   const usedTransactions = new Set();
   const results = [];
   for (const [index, annotation] of annotations.entries()) {
@@ -634,7 +675,7 @@ function validateSummaryAnnotations(manifest, certificate, transactionsById, add
     else {
       for (const transaction of selected) compare(add, { profileId: transaction.profileId, person: transaction.person, settlement: transaction.settlement }, { profileId: annotation.profileId, person: annotation.person, settlement: "employee_reimbursement" }, { code: "summary-annotation-transaction-binding-mismatch", annotationIndex: index, transactionId: transaction.id, artifact: "summary-annotation", location });
       compare(add, annotation.amount, amount(sum(selected, (item) => item.reimbursementMilliunits)), { code: "summary-annotation-amount-mismatch", annotationIndex: index, artifact: "summary-annotation", location });
-      compare(add, [...annotation.sourceRefs].sort(), sortedUnique(selected.flatMap((item) => item.sourceRefs)), { code: "summary-annotation-source-refs-mismatch", annotationIndex: index, artifact: "summary-annotation", location });
+      compare(add, annotation.sourceRefs, sortedUnique(selected.flatMap((item) => item.sourceRefs)), { code: "summary-annotation-source-refs-mismatch", annotationIndex: index, artifact: "summary-annotation", location });
     }
     if (!new Set(["commission", "bonus", "allowance"]).has(annotation.kind)) add("mismatches", "summary-annotation-kind-mismatch", { annotationIndex: index, artifact: "summary-annotation", location, actual: annotation.kind });
     results.push({ annotationIndex: index, ...clone(annotation), independentReviewMatched: false });
@@ -642,7 +683,10 @@ function validateSummaryAnnotations(manifest, certificate, transactionsById, add
   return { annotations, results };
 }
 
-function validateReview(review, state, sourceByRef, transactions, annotations, annotationResults, add) {
+function validateReview(review, state, sourceByRef, transactions, annotations, annotationResults, add, block) {
+  let reviewBlocked = false;
+  const blockReview = (code, detail = {}) => { reviewBlocked = true; block(code, detail); };
+  const pendingSemanticComparisons = [];
   exact(review, new Set(["kind", "reviewerRunId", "gate1BindingDigest", "sourceCoverageDigest", "independence", "observations", "annotationObservations"]), "independent evidence review");
   if (review.kind !== INDEPENDENT_EVIDENCE_REVIEW_KIND) fail("independent evidence review kind is unsupported.");
   text(review.reviewerRunId, "independent evidence review reviewerRunId");
@@ -653,7 +697,10 @@ function validateReview(review, state, sourceByRef, transactions, annotations, a
   for (const [index, observation] of array(review.observations, "independent evidence review observations").entries()) {
     exact(observation, new Set(["sourceRef", "fileId", "sourceSha256", "mediaKind", "width", "height", "facts"]), `observations[${index}]`);
     const sourceRef = text(observation.sourceRef, `observations[${index}].sourceRef`);
-    if (observations.has(sourceRef)) add("duplicate", "independent-review-source-ref-duplicate", { sourceRef, artifact: "independent-evidence-review", location: `observations[${index}]` });
+    if (observations.has(sourceRef)) {
+      blockReview("independent-review-source-ref-duplicate", { sourceRef, artifact: "independent-evidence-review", location: `observations[${index}]` });
+      continue;
+    }
     const normalized = {
       sourceRef,
       fileId: text(observation.fileId, `observations[${index}].fileId`),
@@ -678,16 +725,16 @@ function validateReview(review, state, sourceByRef, transactions, annotations, a
     const source = sourceByRef.get(sourceRef);
     const observation = observations.get(sourceRef);
     if (!observation) {
-      add("missing", "independent-review-observation-missing", { sourceRef, fileId: source?.file.id, artifact: "independent-evidence-review" });
+      blockReview("independent-review-observation-missing", { sourceRef, fileId: source?.file.id, artifact: "independent-evidence-review" });
       continue;
     }
     if (source) {
-      compare(add, { fileId: observation.fileId, sourceSha256: observation.sourceSha256 }, { fileId: source.file.id, sourceSha256: source.file.sha256 }, { code: "independent-review-source-binding-mismatch", sourceRef, artifact: "independent-evidence-review" });
+      if (canonicalDigest({ fileId: observation.fileId, sourceSha256: observation.sourceSha256 }) !== canonicalDigest({ fileId: source.file.id, sourceSha256: source.file.sha256 })) blockReview("independent-review-source-binding-mismatch", { sourceRef, artifact: "independent-evidence-review", expected: { fileId: source.file.id, sourceSha256: source.file.sha256 }, actual: { fileId: observation.fileId, sourceSha256: observation.sourceSha256 } });
     }
     for (const fact of observation.facts) {
       const transaction = transactionById.get(fact.transactionId);
       if (!transaction || !expectedTransactions.has(fact.transactionId)) {
-        add("unbound", "independent-review-fact-transaction-unbound", { sourceRef, transactionId: fact.transactionId, fileId: source?.file.id, artifact: "independent-evidence-review" });
+        blockReview("independent-review-fact-transaction-unbound", { sourceRef, transactionId: fact.transactionId, fileId: source?.file.id, artifact: "independent-evidence-review" });
         continue;
       }
       if (!aggregated.has(fact.transactionId)) aggregated.set(fact.transactionId, new Map());
@@ -698,9 +745,9 @@ function validateReview(review, state, sourceByRef, transactions, annotations, a
       }
     }
   }
-  for (const sourceRef of observations.keys()) if (!expectedByRef.has(sourceRef)) add("extra", "independent-review-observation-extra", { sourceRef, artifact: "independent-evidence-review" });
+  for (const sourceRef of observations.keys()) if (!expectedByRef.has(sourceRef)) blockReview("independent-review-observation-extra", { sourceRef, artifact: "independent-evidence-review" });
   for (const [index, annotation] of annotationObservations.entries()) for (const sourceRef of annotation.sourceRefs) {
-    if (!expectedByRef.has(sourceRef)) add("unbound", "independent-review-annotation-source-ref-unbound", { annotationObservationIndex: index, sourceRef, artifact: "independent-evidence-review" });
+    if (!expectedByRef.has(sourceRef)) blockReview("independent-review-annotation-source-ref-unbound", { annotationObservationIndex: index, sourceRef, artifact: "independent-evidence-review" });
   }
   const unusedAnnotationObservations = new Set(annotationObservations.map((_, index) => index));
   for (const [annotationIndex, annotation] of annotations.entries()) {
@@ -712,17 +759,22 @@ function validateReview(review, state, sourceByRef, transactions, annotations, a
       amount: annotation.amount,
       sourceRefs: annotation.sourceRefs,
     }, `summaryAnnotations[${annotationIndex}] projection`);
-    const expectedDigest = canonicalDigest(expected);
-    const matchIndex = [...unusedAnnotationObservations].find((index) => canonicalDigest(annotationObservations[index]) === expectedDigest);
-    if (matchIndex === undefined) {
-      add("missing", "independent-review-summary-annotation-missing", { annotationIndex, artifact: "independent-evidence-review", expected });
+    const identityDigest = canonicalDigest(without(expected, "amount"));
+    const matchIndexes = [...unusedAnnotationObservations].filter((index) => canonicalDigest(without(annotationObservations[index], "amount")) === identityDigest);
+    if (matchIndexes.length === 0) {
+      blockReview("independent-review-summary-annotation-missing", { annotationIndex, artifact: "independent-evidence-review", expected: without(expected, "amount") });
+    } else if (matchIndexes.length > 1) {
+      blockReview("independent-review-summary-annotation-ambiguous", { annotationIndex, artifact: "independent-evidence-review", matchIndexes });
     } else {
+      const matchIndex = matchIndexes[0];
       unusedAnnotationObservations.delete(matchIndex);
-      annotationResults[annotationIndex].independentReviewMatched = true;
       annotationResults[annotationIndex].observedFacts = clone(annotationObservations[matchIndex]);
+      const amountMatches = annotationObservations[matchIndex].amount === expected.amount;
+      annotationResults[annotationIndex].independentReviewMatched = amountMatches;
+      if (!amountMatches) pendingSemanticComparisons.push({ actual: annotationObservations[matchIndex].amount, expected: expected.amount, detail: { code: "independent-review-summary-annotation-amount-mismatch", annotationIndex, artifact: "independent-evidence-review" } });
     }
   }
-  for (const annotationObservationIndex of unusedAnnotationObservations) add("extra", "independent-review-summary-annotation-extra", {
+  for (const annotationObservationIndex of unusedAnnotationObservations) blockReview("independent-review-summary-annotation-extra", {
     annotationObservationIndex,
     artifact: "independent-evidence-review",
     actual: clone(annotationObservations[annotationObservationIndex]),
@@ -731,11 +783,12 @@ function validateReview(review, state, sourceByRef, transactions, annotations, a
     const fields = aggregated.get(transaction.id) ?? new Map();
     for (const field of ["date", "person", "project", "sourceAmount"]) {
       const values = [...(fields.get(field) ?? [])];
-      if (values.length === 0) add("missing", "independent-review-transaction-field-missing", { transactionId: transaction.id, field, artifact: "independent-evidence-review" });
-      else if (values.length > 1) add("mismatches", "independent-review-transaction-field-conflict", { transactionId: transaction.id, field, artifact: "independent-evidence-review", actual: values.sort() });
-      else compare(add, values[0], transaction[field], { code: "independent-visual-observation-mismatch", transactionId: transaction.id, field, artifact: "independent-evidence-review" });
+      if (values.length === 0) blockReview("independent-review-transaction-field-missing", { transactionId: transaction.id, field, artifact: "independent-evidence-review" });
+      else if (values.length > 1) blockReview("independent-review-transaction-field-conflict", { transactionId: transaction.id, field, artifact: "independent-evidence-review", actual: values.sort(stableTextCompare) });
+      else pendingSemanticComparisons.push({ actual: values[0], expected: transaction[field], detail: { code: "independent-visual-observation-mismatch", transactionId: transaction.id, field, artifact: "independent-evidence-review" } });
     }
   }
+  if (!reviewBlocked) for (const comparison of pendingSemanticComparisons) compare(add, comparison.actual, comparison.expected, comparison.detail);
   return observations;
 }
 
@@ -744,22 +797,21 @@ async function freshReviewSources(sourceByRef, usedMediaFiles, observations, add
   for (const binding of sourceByRef.values()) if (!unique.has(binding.file.sha256)) unique.set(binding.file.sha256, binding.file);
   for (const file of usedMediaFiles) if (!unique.has(file.sha256)) unique.set(file.sha256, file);
   const settled = await mapSettledLimit([...unique.values()], SOURCE_CONCURRENCY, async (file) => {
-    try {
-      await hooks?.beforeSourceRead?.(clone(file));
-      const stable = await readStableBinaryFile(file.path, { maxBytes: MAX_SOURCE_BYTES });
-      metrics.uniqueSourceReadCount += 1;
-      if (stable.sha256 !== file.sha256) return { file, error: "source SHA changed after Gate 1" };
-      let image = null;
-      if (file.kind === "image") {
-        metrics.uniqueMediaReadCount += 1;
+    await hooks?.beforeSourceRead?.(clone(file));
+    const stable = await readStableBinaryFile(file.path, { maxBytes: MAX_SOURCE_BYTES });
+    metrics.uniqueSourceReadCount += 1;
+    if (stable.sha256 !== file.sha256) return { file, error: "source SHA changed after Gate 1" };
+    let image = null;
+    if (file.kind === "image") {
+      metrics.uniqueMediaReadCount += 1;
+      try {
         image = await inspectEvidenceImage(copyStableBinaryBytes(stable), `independent source ${file.id}`);
         metrics.uniqueMediaDecodeCount += 1;
+      } catch (error) {
+        return { file, error: `source full decode failed: ${error instanceof Error ? error.message : String(error)}` };
       }
-      return { file, image };
-    } catch (error) {
-      if (isRetryableInfrastructureError(error)) throw error;
-      return { file, error: error instanceof Error ? error.message : String(error) };
     }
+    return { file, image };
   });
   const results = new Map(settled.settled.map((entry) => [entry.value.file.sha256, entry.value]));
   for (const [sourceRef, binding] of sourceByRef) {
@@ -1156,7 +1208,7 @@ export async function auditFullCorrespondence(rawInput, { hooks } = {}) {
     sourceReadConcurrency: SOURCE_CONCURRENCY,
     transactionCount: 0,
   };
-  const { result: issues, add } = issueStore();
+  const { result: issues, add, block } = issueStore();
   compare(add, state.previewBuild.previewDigest, canonicalDigest(without(state.previewBuild, "previewDigest", "ownedFiles")), { code: "gate1-preview-set-digest-mismatch", artifact: "gate1-preview" });
   const registry = await loadProfileRegistry();
   const summaryTemplate = await loadTextTemplateAsset("summary-text");
@@ -1172,7 +1224,7 @@ export async function auditFullCorrespondence(rawInput, { hooks } = {}) {
 
   const reviewSnapshot = suppliedReview;
   const review = object(reviewSnapshot.value, "independent evidence review");
-  const observations = validateReview(review, state, sourceByRef, transactions, summaryAnnotations, annotationResults, add);
+  const observations = validateReview(review, state, sourceByRef, transactions, summaryAnnotations, annotationResults, add, block);
   // Fresh source verification and Gate 1 artifact loading are independent inputs
   // to this one Gate 2 audit. Start the fresh reads now, but join them before any
   // artifact validation so the original source-first error and issue ordering is
@@ -1332,7 +1384,8 @@ export async function auditFullCorrespondence(rawInput, { hooks } = {}) {
       for (const transaction of profileTransactions) markTransactionCheck(transactionResults, transaction.id, "evidence", { archiveCount: presentation.evidenceArchive.length });
     } catch (error) {
       if (isRetryableInfrastructureError(error)) throw error;
-      add("mismatches", "artifact-parse-or-validation-failure", { profileId, artifact: "gate1-deliverables", actual: error instanceof Error ? error.message : String(error) });
+      if (error instanceof CorrespondenceValidationError) add("mismatches", "artifact-parse-or-validation-failure", { profileId, artifact: "gate1-deliverables", actual: error.message });
+      else block("artifact-audit-internal-failure", { profileId, artifact: "gate1-deliverables", actual: error instanceof Error ? error.message : String(error) });
     }
     const profileIssueCounts = Object.fromEntries(Object.entries(issues).map(([key, value]) => [key, value.length - issueCountsBefore[key]]));
     const body = {
@@ -1362,14 +1415,17 @@ export async function auditFullCorrespondence(rawInput, { hooks } = {}) {
         sourceSha256: file.sha256,
         sourceRefs: transaction.sourceRefs.filter((sourceRef) => sourceByRef.get(sourceRef)?.file.id === evidenceId),
       };
-    }));
+    })).sort((left, right) => (transactionsById.get(left.transactionId)?.sourceOrder ?? 0) - (transactionsById.get(right.transactionId)?.sourceOrder ?? 0) || left.evidenceIndex - right.evidenceIndex || stableTextCompare(left.evidenceId, right.evidenceId));
   const archiveEntries = state.presentationBuild.artifacts.flatMap((artifact) => artifact.evidenceArchive.map((entry) => ({ profileId: artifact.profileId, ...entry })));
   const mediaBySha = Map.groupBy(usedMediaFiles, (file) => file.sha256);
   for (const omission of hooks?.omitTransactionCheckStages ?? []) {
-    transactionResults.get(omission.transactionId)?.checkedStages.delete(omission.stage);
+    const transaction = transactionResults.get(omission.transactionId);
+    transaction?.checkedStages.delete(omission.stage);
+    if (transaction?.requiredStages.includes(omission.stage)) block("required-transaction-stage-incomplete", { transactionId: omission.transactionId, profileId: transaction.profileId, artifact: omission.stage, stage: omission.stage });
   }
+  sortIssues(issues);
   const allIssues = Object.values(issues).flat();
-  const mediaResults = [...mediaBySha].map(([sourceSha256, mediaFiles]) => {
+  const mediaResults = [...mediaBySha].sort(([left], [right]) => stableTextCompare(left, right)).map(([sourceSha256, mediaFiles]) => {
     const fileIds = sortedUnique(mediaFiles.map((item) => item.id));
     const sourceRefs = sortedUnique([...sourceByRef].filter(([, binding]) => binding.file.sha256 === sourceSha256).map(([sourceRef]) => sourceRef));
     const references = mediaReferences.filter((item) => item.sourceSha256 === sourceSha256);
@@ -1393,9 +1449,10 @@ export async function auditFullCorrespondence(rawInput, { hooks } = {}) {
     };
   });
   const allIssueCount = Object.values(issues).reduce((total, items) => total + items.length, 0);
+  const blockingIssueCount = issues.blocking.length;
   const knownSourceRefs = new Set(transactions.flatMap((transaction) => transaction.sourceRefs));
   const knownEvidenceIds = new Set(transactions.flatMap((transaction) => transaction.evidence));
-  const publicTransactionResults = [...transactionResults.values()].map((item) => {
+  const publicTransactionResults = [...transactionResults.values()].sort((left, right) => (transactionsById.get(left.transactionId)?.sourceOrder ?? 0) - (transactionsById.get(right.transactionId)?.sourceOrder ?? 0) || stableTextCompare(left.transactionId, right.transactionId)).map((item) => {
     const checks = Object.fromEntries(TRANSACTION_CHECK_STAGES.map((stage) => {
       const required = item.requiredStages.includes(stage);
       const checked = item.checkedStages.has(stage);
@@ -1451,6 +1508,7 @@ export async function auditFullCorrespondence(rawInput, { hooks } = {}) {
     && publicAnnotationResults.every((item) => item.status === "matched")
     && profileAudits.every((item) => item.status === "passed")
     && publicSupplementResults.every((item) => item.status === "matched");
+  const disposition = allCorrespondenceMatched ? "PASSED" : blockingIssueCount > 0 ? "BLOCKED_RETRYABLE" : "SUBSTANTIVE_MISMATCH";
   const body = {
     kind: FULL_CORRESPONDENCE_AUDIT_KIND,
     gate1BindingDigest: state.gate1.bindingDigest,
@@ -1489,7 +1547,8 @@ export async function auditFullCorrespondence(rawInput, { hooks } = {}) {
     annotationResults: publicAnnotationResults,
     ...issues,
     metrics,
-    status: allCorrespondenceMatched ? "passed" : "failed",
+    disposition,
+    status: disposition === "PASSED" ? "passed" : disposition === "BLOCKED_RETRYABLE" ? "blocked" : "failed",
   };
   return Object.freeze({ ...body, reportDigest: canonicalDigest(body) });
 }

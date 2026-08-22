@@ -41,7 +41,7 @@ async function makeBaseline(filePath) {
   zip.file("_rels/.rels", '<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>');
   zip.file("xl/_rels/workbook.xml.rels", '<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/><Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings" Target="sharedStrings.xml"/></Relationships>');
   zip.file("xl/workbook.xml", '<?xml version="1.0" encoding="UTF-8"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets><definedNames><definedName name="_xlnm.Print_Area" localSheetId="0">\'Sheet1\'!$A$1:$F$2</definedName></definedNames></workbook>');
-  zip.file("xl/styles.xml", '<?xml version="1.0" encoding="UTF-8"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><numFmts count="2"><numFmt numFmtId="164" formatCode="mm-dd"/><numFmt numFmtId="165" formatCode="0.000"/></numFmts><fonts count="1"><font/></fonts><fills count="1"><fill><patternFill patternType="none"/></fill></fills><borders count="1"><border/></borders><cellStyleXfs count="1"><xf numFmtId="0"/></cellStyleXfs><cellXfs count="5"><xf numFmtId="0"/><xf numFmtId="164"/><xf numFmtId="0"/><xf numFmtId="165"/><xf numFmtId="165"/></cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0"/></cellStyles></styleSheet>');
+  zip.file("xl/styles.xml", '<?xml version="1.0" encoding="UTF-8"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><numFmts count="3"><numFmt numFmtId="164" formatCode="mm-dd"/><numFmt numFmtId="165" formatCode="0.000"/><numFmt numFmtId="166" formatCode="0.0"/></numFmts><fonts count="1"><font/></fonts><fills count="1"><fill><patternFill patternType="none"/></fill></fills><borders count="1"><border/></borders><cellStyleXfs count="1"><xf numFmtId="0"/></cellStyleXfs><cellXfs count="8"><xf numFmtId="0"/><xf numFmtId="164"/><xf numFmtId="0"/><xf numFmtId="165"/><xf numFmtId="165"/><xf numFmtId="1"/><xf numFmtId="166"/><xf numFmtId="2"/></cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0"/></cellStyles></styleSheet>');
   const header = ["日期", "支出明细", "支出金额", "合计", "支出人", "备注"].map((value, index) => tCell(`${String.fromCharCode(65 + index)}1`, 2, value)).join("");
   const prior = nCell("A2", 1, serial("2034-12-20")) + '<c r="B2" s="2" t="s"><v>0</v></c>' + nCell("C2", 3, "2.15") + '<c r="D2" s="4" t="n"><f>SUM(C2:C2)</f><v>2.15</v></c>' + tCell("E2", 2, "合成历史主体") + tCell("F2", 2, "历史分类");
   zip.file("xl/worksheets/sheet1.xml", `<?xml version="1.0" encoding="UTF-8"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><dimension ref="A1:F2"/><sheetData><row r="1" ht="22" customHeight="1">${header}</row><row r="2" ht="22" customHeight="1">${prior}</row></sheetData></worksheet>`);
@@ -370,6 +370,49 @@ test("Gate 2 performs one cached full-correspondence pass and exposes its report
   }
 });
 
+test("Gate 2 treats transaction and annotation sourceRefs as validated stable sets", async () => {
+  const temp = await fs.mkdtemp(path.join(os.tmpdir(), "codex-xhs-gate2-source-ref-set-"));
+  let workflowRoot;
+  try {
+    const fixture = await prepareFixture(temp, { mutateManifest: (manifest) => {
+      manifest.transactions[1].sourceRefs = ["UNIT-B", "UNIT-A"];
+      manifest.batch.summaryAnnotations = [{
+        profileId: "xiaohongshu",
+        person: "合成人员乙",
+        kind: "bonus",
+        period: { start: "2035-03-08", end: "2035-03-08" },
+        amount: "8.21",
+        transactionIds: ["SYN-002"],
+        sourceRefs: ["UNIT-B", "UNIT-A"],
+      }];
+      return manifest;
+    } });
+    workflowRoot = fixture.workflowRoot;
+    const review = reviewFor(fixture.gate1, fixture.firstImage, fixture.secondImage);
+    review.annotationObservations = [{
+      profileId: "xiaohongshu",
+      person: "合成人员乙",
+      kind: "bonus",
+      period: { start: "2035-03-08", end: "2035-03-08" },
+      amount: "8.21",
+      sourceRefs: ["UNIT-A", "UNIT-B"],
+    }];
+    const reviewFile = await writeJson(path.join(temp, "permuted-source-ref-review.json"), review);
+    const gate2 = await finalizeReimbursementWorkflow({ statePath: fixture.gate1.statePath, expectedGate1BindingDigest: fixture.gate1.gate1BindingDigest, approvalText: "本次报销通过无误", independentEvidenceReviewPath: reviewFile.path, independentEvidenceReviewSha256: reviewFile.sha256 });
+    const report = JSON.parse(await fs.readFile(gate2.fullCorrespondenceAudit.path, "utf8"));
+    assert.equal(report.disposition, "PASSED");
+    assert.equal(report.mismatches.some((item) => item.code === "manifest-source-refs-mismatch" || item.code === "manifest-summary-annotations-mismatch"), false);
+    assert.deepEqual(report.transactionResults.find((item) => item.transactionId === "SYN-002").sourceRefs, ["UNIT-A", "UNIT-B"]);
+    assert.deepEqual(report.annotationResults[0].sourceRefs, ["UNIT-A", "UNIT-B"]);
+    assert.equal(report.coverage.sourceRefCount, 3);
+    assert.equal(report.metrics.uniqueSourceReadCount, 2);
+    assert.equal(report.metrics.uniqueMediaDecodeCount, 2);
+  } finally {
+    if (workflowRoot) await fs.rm(workflowRoot, { recursive: true, force: true });
+    await fs.rm(temp, { recursive: true, force: true });
+  }
+});
+
 test("Gate 2 overlaps fresh source decode with Gate 1 artifact loading while retaining both audits", async () => {
   const temp = await fs.mkdtemp(path.join(os.tmpdir(), "codex-xhs-gate2-read-overlap-"));
   let workflowRoot;
@@ -450,19 +493,18 @@ test("Gate 2 cannot pass when a required transaction correspondence stage was no
     const fixture = await prepareFixture(temp);
     workflowRoot = fixture.workflowRoot;
     const reviewFile = await writeJson(path.join(temp, "required-stage-review.json"), reviewFor(fixture.gate1, fixture.firstImage, fixture.secondImage));
-    await assert.rejects(() => finalizeReimbursementWorkflow({
+    const request = {
       statePath: fixture.gate1.statePath,
       expectedGate1BindingDigest: fixture.gate1.gate1BindingDigest,
       approvalText: "本次报销通过无误",
       independentEvidenceReviewPath: reviewFile.path,
       independentEvidenceReviewSha256: reviewFile.sha256,
-    }, { testHooks: { fullCorrespondenceHooks: { omitTransactionCheckStages: [{ transactionId: "SYN-001", stage: "evidence" }] } } }), /permanently invalid/u);
-    const report = JSON.parse(await fs.readFile(path.join(workflowRoot, "gate2-full-correspondence.json"), "utf8"));
-    assert.equal(report.status, "failed");
-    assert.equal(report.missing.length + report.extra.length + report.mismatches.length + report.duplicate.length + report.unbound.length, 0, "the final status must not depend on issue-array count alone");
-    const transaction = report.transactionResults.find((item) => item.transactionId === "SYN-001");
-    assert.equal(transaction.checks.evidence.status, "not-checked");
-    assert.equal(transaction.status, "failed");
+    };
+    await assert.rejects(() => finalizeReimbursementWorkflow(request, { testHooks: { fullCorrespondenceHooks: { omitTransactionCheckStages: [{ transactionId: "SYN-001", stage: "evidence" }] } } }), /Gate 1 remains valid|retry/iu);
+    await assert.rejects(fs.access(path.join(workflowRoot, "gate1-invalidation.json")), /ENOENT/u);
+    await assert.rejects(fs.access(path.join(workflowRoot, "gate2-full-correspondence.json")), /ENOENT/u);
+    const retried = await finalizeReimbursementWorkflow(request);
+    assert.equal(retried.status, "ready-for-gate-2");
   } finally {
     if (workflowRoot) await fs.rm(workflowRoot, { recursive: true, force: true });
     await fs.rm(temp, { recursive: true, force: true });
@@ -589,8 +631,10 @@ test("Gate 2 rejects a summary annotation not confirmed by the independent sourc
     }), /permanently invalid/u);
     const report = JSON.parse(await fs.readFile(path.join(workflowRoot, "gate2-full-correspondence.json"), "utf8"));
     assert.equal(report.annotationResults[0].status, "failed");
-    assert.equal(report.missing.some((item) => item.code === "independent-review-summary-annotation-missing"), true);
-    assert.equal(report.extra.some((item) => item.code === "independent-review-summary-annotation-extra"), true);
+    assert.equal(report.disposition, "SUBSTANTIVE_MISMATCH");
+    assert.equal(report.mismatches.some((item) => item.code === "independent-review-summary-annotation-amount-mismatch"), true);
+    assert.equal(report.missing.some((item) => item.code === "independent-review-summary-annotation-missing"), false);
+    assert.equal(report.extra.some((item) => item.code === "independent-review-summary-annotation-extra"), false);
     assert.equal(JSON.parse(await fs.readFile(path.join(workflowRoot, "gate1-invalidation.json"), "utf8")).kind, "gate1-invalidation-v1");
   } finally {
     if (workflowRoot) await fs.rm(workflowRoot, { recursive: true, force: true });
@@ -638,9 +682,13 @@ for (const conflict of [false, true]) test(`independent visual observations ${co
       const gate2 = await finalizeReimbursementWorkflow(request);
       assert.equal(gate2.fullCorrespondenceAudit.status, "passed");
     } else {
-      await assert.rejects(() => finalizeReimbursementWorkflow(request), /permanently invalid/u);
-      const report = JSON.parse(await fs.readFile(path.join(workflowRoot, "gate2-full-correspondence.json"), "utf8"));
-      assert.equal(report.mismatches.some((item) => item.code === "independent-review-transaction-field-conflict" && item.transactionId === "SYN-002"), true);
+      await assert.rejects(() => finalizeReimbursementWorkflow(request), /Gate 1 remains valid|retry/iu);
+      await assert.rejects(fs.access(path.join(workflowRoot, "gate1-invalidation.json")), /ENOENT/u);
+      await assert.rejects(fs.access(path.join(workflowRoot, "gate2-full-correspondence.json")), /ENOENT/u);
+      review.observations[0].facts[1].sourceAmount = "8.21";
+      const corrected = await writeJson(path.join(temp, "corrected-partial-observations.json"), review);
+      const retried = await finalizeReimbursementWorkflow({ ...request, independentEvidenceReviewPath: corrected.path, independentEvidenceReviewSha256: corrected.sha256 });
+      assert.equal(retried.status, "ready-for-gate-2");
     }
   } finally {
     if (workflowRoot) await fs.rm(workflowRoot, { recursive: true, force: true });
@@ -841,6 +889,48 @@ test("a transient Gate 2 infrastructure error preserves Gate 1 for retry", async
         return true;
       },
     );
+    await assert.rejects(fs.access(path.join(workflowRoot, "gate1-invalidation.json")), /ENOENT/u);
+    await assert.rejects(fs.access(path.join(workflowRoot, "gate2-full-correspondence.json")), /ENOENT/u);
+    const retried = await finalizeReimbursementWorkflow(request);
+    assert.equal(retried.status, "ready-for-gate-2");
+  } finally {
+    if (workflowRoot) await fs.rm(workflowRoot, { recursive: true, force: true });
+    await fs.rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("duplicate independent-review observations block Gate 2 without invalidating Gate 1", async () => {
+  const temp = await fs.mkdtemp(path.join(os.tmpdir(), "codex-xhs-gate2-duplicate-review-"));
+  let workflowRoot;
+  try {
+    const fixture = await prepareFixture(temp);
+    workflowRoot = fixture.workflowRoot;
+    const review = reviewFor(fixture.gate1, fixture.firstImage, fixture.secondImage);
+    review.observations.push(structuredClone(review.observations[0]));
+    const duplicateReview = await writeJson(path.join(temp, "duplicate-review.json"), review);
+    const request = { statePath: fixture.gate1.statePath, expectedGate1BindingDigest: fixture.gate1.gate1BindingDigest, approvalText: "本次报销通过无误", independentEvidenceReviewPath: duplicateReview.path, independentEvidenceReviewSha256: duplicateReview.sha256 };
+    await assert.rejects(() => finalizeReimbursementWorkflow(request), /Gate 1 remains valid|retry/iu);
+    await assert.rejects(fs.access(path.join(workflowRoot, "gate1-invalidation.json")), /ENOENT/u);
+    await assert.rejects(fs.access(path.join(workflowRoot, "gate2-full-correspondence.json")), /ENOENT/u);
+    review.observations.pop();
+    const corrected = await writeJson(path.join(temp, "deduplicated-review.json"), review);
+    const retried = await finalizeReimbursementWorkflow({ ...request, independentEvidenceReviewPath: corrected.path, independentEvidenceReviewSha256: corrected.sha256 });
+    assert.equal(retried.status, "ready-for-gate-2");
+  } finally {
+    if (workflowRoot) await fs.rm(workflowRoot, { recursive: true, force: true });
+    await fs.rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("unknown Gate 2 internal artifact exceptions default to retryable blocking", async () => {
+  const temp = await fs.mkdtemp(path.join(os.tmpdir(), "codex-xhs-gate2-unknown-internal-"));
+  let workflowRoot;
+  try {
+    const fixture = await prepareFixture(temp);
+    workflowRoot = fixture.workflowRoot;
+    const reviewFile = await writeJson(path.join(temp, "unknown-internal-review.json"), reviewFor(fixture.gate1, fixture.firstImage, fixture.secondImage));
+    const request = { statePath: fixture.gate1.statePath, expectedGate1BindingDigest: fixture.gate1.gate1BindingDigest, approvalText: "本次报销通过无误", independentEvidenceReviewPath: reviewFile.path, independentEvidenceReviewSha256: reviewFile.sha256 };
+    await assert.rejects(() => finalizeReimbursementWorkflow(request, { testHooks: { fullCorrespondenceHooks: { beforeArtifactLoad: () => { throw new Error("synthetic unknown artifact exception"); } } } }), /Gate 1 remains valid|retry/iu);
     await assert.rejects(fs.access(path.join(workflowRoot, "gate1-invalidation.json")), /ENOENT/u);
     await assert.rejects(fs.access(path.join(workflowRoot, "gate2-full-correspondence.json")), /ENOENT/u);
     const retried = await finalizeReimbursementWorkflow(request);

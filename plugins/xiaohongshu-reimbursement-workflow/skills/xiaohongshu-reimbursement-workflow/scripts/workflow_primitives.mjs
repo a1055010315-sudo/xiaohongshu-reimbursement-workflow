@@ -218,33 +218,31 @@ async function inspectRegularPath(filePath, label) {
   const parsed = path.parse(filePath);
   const relative = path.relative(parsed.root, filePath);
   let current = parsed.root;
+  const componentPaths = [];
   for (const segment of relative.split(path.sep).filter(Boolean)) {
     current = path.join(current, segment);
-    let componentStats;
-    try {
-      componentStats = await fs.lstat(current);
-    } catch (error) {
-      throw stableInputError("could not inspect the input path", error, label);
-    }
+    componentPaths.push(current);
+  }
+  const componentResults = [];
+  for (let offset = 0; offset < componentPaths.length; offset += 2) {
+    componentResults.push(...await Promise.allSettled(componentPaths.slice(offset, offset + 2).map((componentPath) => fs.lstat(componentPath))));
+  }
+  const componentFailure = componentResults.find((result) => result.status === "rejected");
+  if (componentFailure) throw stableInputError("could not inspect the input path", componentFailure.reason, label);
+  for (const result of componentResults) {
+    const componentStats = result.value;
     if (componentStats.isSymbolicLink()) {
       throw stableInputError("must not traverse a symbolic link or reparse point", undefined, label);
     }
   }
-  let linkStats;
-  try {
-    linkStats = await fs.lstat(filePath);
-  } catch (error) {
-    throw stableInputError("could not inspect the input path", error, label);
-  }
+  const [linkResult, canonicalResult] = await Promise.allSettled([fs.lstat(filePath), fs.realpath(filePath)]);
+  if (linkResult.status === "rejected") throw stableInputError("could not inspect the input path", linkResult.reason, label);
+  const linkStats = linkResult.value;
   if (linkStats.isSymbolicLink() || !linkStats.isFile()) {
     throw stableInputError("must be a non-symlink regular file", undefined, label);
   }
-  let canonicalPath;
-  try {
-    canonicalPath = await fs.realpath(filePath);
-  } catch (error) {
-    throw stableInputError("could not resolve the input path", error, label);
-  }
+  if (canonicalResult.status === "rejected") throw stableInputError("could not resolve the input path", canonicalResult.reason, label);
+  const canonicalPath = canonicalResult.value;
   if (comparablePath(canonicalPath) !== comparablePath(filePath)) {
     throw stableInputError("canonical path differs from the requested path", undefined, label);
   }

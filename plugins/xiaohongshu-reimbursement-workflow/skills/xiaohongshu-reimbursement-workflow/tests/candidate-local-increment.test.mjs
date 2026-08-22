@@ -10,7 +10,7 @@ import { loadProfileRegistry } from "../scripts/finance_domain.mjs";
 import { canonicalDigest, loadBundledDependency, sha256Bytes } from "../scripts/workflow_primitives.mjs";
 
 const candidateBuilderUrl = process.env.XHS_CANDIDATE_BUILDER_UNDER_TEST ? pathToFileURL(path.resolve(process.env.XHS_CANDIDATE_BUILDER_UNDER_TEST)).href : new URL("../scripts/build_root_workbook_candidate.mjs", import.meta.url).href;
-const { ROOT_WORKBOOK_AUDIT_REQUEST_KIND, buildRootWorkbookCandidates, computeRootWorkbookAuditRequestDigest, runRootWorkbookAuditWorker } = await import(candidateBuilderUrl);
+const { ROOT_WORKBOOK_AUDIT_REQUEST_KIND, buildRootWorkbookCandidates, computeRootWorkbookAuditRequestDigest, parseBoundedZipCentralFacts, prestartRootWorkbookAuditWorker, runRootWorkbookAuditWorker } = await import(candidateBuilderUrl);
 
 const JSZipModule = loadBundledDependency("jszip");
 const JSZip = JSZipModule.default ?? JSZipModule;
@@ -24,7 +24,7 @@ function nCell(ref, style, value) { return `<x:c r="${ref}" s="${style}" t="n"><
 
 function stylesXml({ prefix = "x:", explicitWhite = false } = {}) {
   const fillId = explicitWhite ? 1 : 0;
-  return `<?xml version="1.0" encoding="UTF-8"?><${prefix}styleSheet xmlns:${prefix.slice(0, -1)}="${MAIN_NS}"><${prefix}fonts count="1"><${prefix}font/></${prefix}fonts><${prefix}fills count="${explicitWhite ? 2 : 1}"><${prefix}fill/>${explicitWhite ? `<${prefix}fill><${prefix}patternFill patternType="solid"><${prefix}fgColor rgb="FFFFFFFF"/><${prefix}bgColor indexed="64"/></${prefix}patternFill></${prefix}fill>` : ""}</${prefix}fills><${prefix}borders count="1"><${prefix}border/></${prefix}borders><${prefix}cellStyleXfs count="1"><${prefix}xf numFmtId="0"/></${prefix}cellStyleXfs><${prefix}cellXfs count="5"><${prefix}xf numFmtId="0" fillId="0"/><${prefix}xf numFmtId="14" fillId="${fillId}"/><${prefix}xf numFmtId="0" fillId="${fillId}"/><${prefix}xf numFmtId="165" fillId="${fillId}"/><${prefix}xf numFmtId="165" fillId="${fillId}"/></${prefix}cellXfs><${prefix}cellStyles count="1"><${prefix}cellStyle name="Normal" xfId="0"/></${prefix}cellStyles></${prefix}styleSheet>`;
+  return `<?xml version="1.0" encoding="UTF-8"?><${prefix}styleSheet xmlns:${prefix.slice(0, -1)}="${MAIN_NS}"><${prefix}numFmts count="2"><${prefix}numFmt numFmtId="165" formatCode="0.0"/><${prefix}numFmt numFmtId="166" formatCode="0.000"/></${prefix}numFmts><${prefix}fonts count="1"><${prefix}font/></${prefix}fonts><${prefix}fills count="${explicitWhite ? 2 : 1}"><${prefix}fill/>${explicitWhite ? `<${prefix}fill><${prefix}patternFill patternType="solid"><${prefix}fgColor rgb="FFFFFFFF"/><${prefix}bgColor indexed="64"/></${prefix}patternFill></${prefix}fill>` : ""}</${prefix}fills><${prefix}borders count="1"><${prefix}border/></${prefix}borders><${prefix}cellStyleXfs count="1"><${prefix}xf numFmtId="0"/></${prefix}cellStyleXfs><${prefix}cellXfs count="8"><${prefix}xf numFmtId="0" fillId="0"/><${prefix}xf numFmtId="14" fillId="${fillId}"/><${prefix}xf numFmtId="0" fillId="${fillId}"/><${prefix}xf numFmtId="1" fillId="${fillId}" applyNumberFormat="1"/><${prefix}xf numFmtId="1" fillId="${fillId}"/><${prefix}xf numFmtId="165" fillId="${fillId}" applyNumberFormat="1"/><${prefix}xf numFmtId="2" fillId="${fillId}" applyNumberFormat="1"/><${prefix}xf numFmtId="166" fillId="${fillId}" applyNumberFormat="1"/></${prefix}cellXfs><${prefix}cellStyles count="1"><${prefix}cellStyle name="Normal" xfId="0"/></${prefix}cellStyles></${prefix}styleSheet>`;
 }
 
 async function writeWorkbook(filePath, { rows, merges = [], tail = "", worksheetPrefix = "x:", dimensionEndRow = rows.length, printEndRow = rows.length, styles = stylesXml(), sheetName = "Sheet1" }) {
@@ -51,6 +51,10 @@ function dataRow(row, { date = "2032-01-01", project = `历史-${row}`, amount =
   const sharedFormula = row === 2 ? `<x:f t="shared" si="0">SUM(C${row}:C${row})</x:f>` : '<x:f t="shared" si="0"/>';
   const formula = formulaText !== null ? `<x:c r="D${row}" s="4" t="n"><x:f>${escaped(formulaText)}</x:f><x:v>${amount}</x:v></x:c>` : shared ? `<x:c r="D${row}" s="4" t="n">${sharedFormula}<x:v>${amount}</x:v></x:c>` : nCell(`D${row}`, 4, amount);
   return `<x:row r="${row}" ht="24" customHeight="1">${nCell(`A${row}`, 1, dateSerial(date))}${tCell(`B${row}`, 2, project)}${nCell(`C${row}`, 3, amount)}${formula}${tCell(`E${row}`, 2, person)}${tCell(`F${row}`, 2, classification)}${tCell(`G${row}`, 2, sentinel)}${nCell(`H${row}`, 3, row)}</x:row>`;
+}
+
+function splitGroupTailRow(row, { date, project, amount, sentinel = `sentinel-${row}` }) {
+  return `<x:row r="${row}" ht="24" customHeight="1">${nCell(`A${row}`, 1, dateSerial(date))}${tCell(`B${row}`, 2, project)}${nCell(`C${row}`, 3, amount)}${tCell(`G${row}`, 2, sentinel)}${nCell(`H${row}`, 3, row)}</x:row>`;
 }
 
 async function certificate(transactions) {
@@ -88,10 +92,10 @@ function zipCentralFacts(zip) {
     const compressionMethod = typeof magic === "string" ? Buffer.from(magic, "binary").toString("hex") : Buffer.isBuffer(magic) ? magic.toString("hex") : null;
     entries.push({ name, crc32: (data.crc32 >>> 0).toString(16).padStart(8, "0"), size: data.uncompressedSize, compressedSize: data.compressedSize, compressionMethod });
   }
-  return { partCount: entries.length, factsDigest: canonicalDigest(entries), inventoryDigest: canonicalDigest(entries.map((entry) => entry.name)) };
+  return { partCount: entries.length, factsDigest: canonicalDigest(entries), inventoryDigest: canonicalDigest(entries.map((entry) => entry.name)), entries };
 }
 
-async function maliciousAuditRequest({ artifact, baseline, transactions, candidatePath, candidateBytes, worksheetXml }) {
+async function maliciousAuditRequest({ artifact, baseline, transactions, candidatePath, candidateBytes, worksheetXml, mutateCertificate = null }) {
   const zip = await JSZip.loadAsync(candidateBytes); const central = zipCentralFacts(zip);
   const localPatchCertificate = structuredClone(artifact.localPatchCertificate);
   localPatchCertificate.candidate = { sourceSha256: sha256Bytes(candidateBytes), sourceSize: candidateBytes.length };
@@ -100,6 +104,7 @@ async function maliciousAuditRequest({ artifact, baseline, transactions, candida
   localPatchCertificate.package.candidateFactsDigest = central.factsDigest;
   localPatchCertificate.package.candidatePartCount = central.partCount;
   localPatchCertificate.package.candidateInventoryDigest = central.inventoryDigest;
+  if (mutateCertificate) mutateCertificate(localPatchCertificate);
   delete localPatchCertificate.certificateDigest;
   localPatchCertificate.certificateDigest = canonicalDigest(localPatchCertificate);
   const requestNonce = crypto.randomBytes(32).toString("hex");
@@ -210,6 +215,45 @@ test("independent root audit worker is prestarted before candidate construction 
   }
 });
 
+test("formal candidate rows select the complete 0-3 decimal style family for C and D", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "codex-xhs-candidate-money-family-")); let stagingRoot;
+  try {
+    const baseline = await writeWorkbook(path.join(root, "小红书支出总表.xlsx"), { rows: [headerRow(), dataRow(2)] });
+    const amounts = ["10", "10.1", "10.12", "10.123"];
+    const result = await build(baseline, amounts.map((amount, index) => ({
+      id: `TX-P-${index}`,
+      date: `2032-02-0${index + 1}`,
+      amount,
+      classification: `精度分类-${index}`,
+    })));
+    stagingRoot = result.stagingRoot;
+    const artifact = result.artifacts[0];
+    const zip = await JSZip.loadAsync(await fs.readFile(artifact.candidatePath));
+    const sheet = await zip.file("xl/worksheets/sheet1.xml").async("string");
+    const expectedStyles = [3, 5, 6, 7];
+    for (const [index, expectedStyle] of expectedStyles.entries()) {
+      const row = index + 3;
+      assert.match(sheet, new RegExp(`<x:c r="C${row}" s="${expectedStyle}" t="n"><x:v>${amounts[index].replace(".", "\\.")}</x:v></x:c>`, "u"));
+      assert.match(sheet, new RegExp(`<x:c r="D${row}" s="${expectedStyle}" t="n"><x:f>SUM\\(C${row}:C${row}\\)</x:f><x:v>${amounts[index].replace(".", "\\.")}</x:v></x:c>`, "u"));
+    }
+    assert.deepEqual(artifact.localPatchCertificate.transform.insertions[0].styleSource.styles[3], expectedStyles);
+    assert.deepEqual(artifact.localPatchCertificate.transform.insertions[0].styleSource.styles[4], expectedStyles);
+  } finally {
+    if (stagingRoot) await fs.rm(stagingRoot, { recursive: true, force: true });
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("bounded candidate central-directory parser matches JSZip metadata without inflating payloads", async () => {
+  const zip = new JSZip();
+  zip.file("[Content_Types].xml", Buffer.from("types", "utf8"));
+  zip.file("xl/worksheets/sheet1.xml", Buffer.from("<worksheet/>", "utf8"));
+  zip.file("xl/media/凭证.png", Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+  const bytes = await zip.generateAsync({ type: "nodebuffer", compression: "DEFLATE", compressionOptions: { level: 1 }, platform: "DOS" });
+  const loaded = await JSZip.loadAsync(bytes, { createFolders: false });
+  assert.deepEqual(parseBoundedZipCentralFacts(bytes), zipCentralFacts(loaded));
+});
+
 test("supplement insertion indexes only A dates and D:F boundaries while shifting the affected suffix", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "codex-xhs-candidate-supplement-")); let stagingRoot;
   try {
@@ -239,6 +283,127 @@ test("supplement insertion indexes only A dates and D:F boundaries while shiftin
     assert.equal(artifact.audit.auditOperations.patchWorksheetCallCount, 0);
     assert.equal(artifact.audit.auditOperations.coordinateRowsCompared, 4, "supplement audit compares only the shifted historical suffix");
     assert.equal(artifact.localPatchCertificate.transform.coordinateTransform.preservedPrefixRowCount, 2);
+  } finally {
+    if (stagingRoot) await fs.rm(stagingRoot, { recursive: true, force: true });
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("supplement insertion automatically splits a provable cross-date D:F group before Gate 1", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "codex-xhs-candidate-split-group-")); let stagingRoot;
+  try {
+    const rows = [
+      headerRow(),
+      dataRow(2, { date: "2032-01-10", project: "历史前段", amount: "80.5", person: "历史人员", classification: "历史分类", formulaText: "SUM(C2:C3)" })
+        .replace("<x:v>80.5</x:v></x:c><x:c r=\"E2\"", "<x:v>761</x:v></x:c><x:c r=\"E2\""),
+      splitGroupTailRow(3, { date: "2032-03-10", project: "历史后段", amount: "680.5" }),
+      dataRow(4, { date: "2032-04-10", project: "局部样式见证", amount: "1" }),
+    ];
+    const baseline = await writeWorkbook(path.join(root, "小红书支出总表.xlsx"), { rows, merges: ["D2:D3", "E2:E3", "F2:F3"] });
+    const result = await build(baseline, [{ id: "TX-SPLIT", date: "2032-02-15", amount: "7.5", project: "匿名组内补报", reportingKind: "supplement" }]);
+    stagingRoot = result.stagingRoot;
+    const artifact = result.artifacts[0];
+    const zip = await JSZip.loadAsync(await fs.readFile(artifact.candidatePath));
+    const sheet = await zip.file("xl/worksheets/sheet1.xml").async("string");
+    assert.match(sheet, /<x:c r="D2" s="5" t="n"><x:f>SUM\(C2:C2\)<\/x:f><x:v>80\.5<\/x:v><\/x:c>/u);
+    assert.match(sheet, /<x:row r="3"[^>]*>[\s\S]*匿名组内补报/u);
+    assert.match(sheet, /<x:c r="D4" s="5" t="n"><x:f>SUM\(C4:C4\)<\/x:f><x:v>680\.5<\/x:v><\/x:c>/u);
+    assert.doesNotMatch(sheet, /<x:mergeCell ref="[DEF](?:2:|4:)/u, "single-row historical fragments must keep anchors without merges");
+    assert.equal(artifact.structuralRepairs.length, 1);
+    assert.deepEqual(artifact.structuralRepairs[0].cutRows, [3]);
+    assert.equal(artifact.structuralRepairs[0].beforeTotal, "761");
+    assert.deepEqual(artifact.structuralRepairs[0].afterTotals, ["80.5", "680.5"]);
+    assert.equal(artifact.audit.projection.locality.globalHistoricalBusinessScanCount, 0);
+    assert.equal(artifact.audit.projection.locality.affectedHistoricalRanges[0].rangeAddress, "C2:F3");
+  } finally {
+    if (stagingRoot) await fs.rm(stagingRoot, { recursive: true, force: true });
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("cross-date D:F repair blocks incomplete, misaligned, or unprovable local groups", async (context) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "codex-xhs-candidate-split-blocks-"));
+  const transaction = [{ id: "TX-SPLIT-BLOCK", date: "2032-02-15", amount: "7.5", project: "匿名组内补报", reportingKind: "supplement" }];
+  const anchor = () => dataRow(2, { date: "2032-01-10", project: "历史前段", amount: "80.5", person: "历史人员", classification: "历史分类", formulaText: "SUM(C2:C3)" })
+    .replace("<x:v>80.5</x:v></x:c><x:c r=\"E2\"", "<x:v>761</x:v></x:c><x:c r=\"E2\"");
+  const tail = () => splitGroupTailRow(3, { date: "2032-03-10", project: "历史后段", amount: "680.5" });
+  const scenarios = [
+    {
+      label: "missing E anchor",
+      rows: () => [headerRow(), anchor().replace(/<x:c r="E2"[\s\S]*?<\/x:c>/u, ""), tail(), dataRow(4, { date: "2032-04-10" })],
+      merges: ["D2:D3", "E2:E3", "F2:F3"],
+      expected: /D anchor|E anchor|F anchor/iu,
+    },
+    {
+      label: "misaligned merge triplet",
+      rows: () => [headerRow(), anchor(), tail(), dataRow(4, { date: "2032-04-10" })],
+      merges: ["D2:D3", "E2:E4", "F2:F3"],
+      expected: /overlapping D:F expense groups|aligned D:E:F merge triplet/iu,
+    },
+    {
+      label: "merged child D payload",
+      rows: () => [headerRow(), anchor(), tail().replace(`<x:c r="G3"`, `${nCell("D3", 4, "680.5")}<x:c r="G3"`), dataRow(4, { date: "2032-04-10" })],
+      merges: ["D2:D3", "E2:E3", "F2:F3"],
+      expected: /merged child row 3 contains D:F payload/iu,
+    },
+    {
+      label: "noncanonical D sum",
+      rows: () => [headerRow(), anchor().replace("SUM(C2:C3)", "SUM(C2,C3)"), tail(), dataRow(4, { date: "2032-04-10" })],
+      merges: ["D2:D3", "E2:E3", "F2:F3"],
+      expected: /D anchor must contain the exact local SUM formula and cache/iu,
+    },
+    {
+      label: "D cache not closed",
+      rows: () => [headerRow(), anchor().replace("<x:v>761</x:v>", "<x:v>760</x:v>"), tail(), dataRow(4, { date: "2032-04-10" })],
+      merges: ["D2:D3", "E2:E3", "F2:F3"],
+      expected: /D cache does not equal the affected local C sum/iu,
+    },
+  ];
+  try {
+    for (const scenario of scenarios) await context.test(scenario.label, async () => {
+      const scenarioRoot = path.join(root, scenario.label.replaceAll(" ", "-"));
+      await fs.mkdir(scenarioRoot);
+      const baseline = await writeWorkbook(path.join(scenarioRoot, "小红书支出总表.xlsx"), { rows: scenario.rows(), merges: scenario.merges });
+      await assert.rejects(() => build(baseline, transaction), scenario.expected);
+    });
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("independent audit rejects a coherently re-digested splitPlan repair tamper", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "codex-xhs-candidate-split-tamper-")); let stagingRoot;
+  const transactions = [{ id: "TX-SPLIT-TAMPER", date: "2032-02-15", amount: "7.5", project: "匿名组内补报", reportingKind: "supplement" }];
+  try {
+    const rows = [
+      headerRow(),
+      dataRow(2, { date: "2032-01-10", project: "历史前段", amount: "80.5", formulaText: "SUM(C2:C3)" })
+        .replace("<x:v>80.5</x:v></x:c><x:c r=\"E2\"", "<x:v>761</x:v></x:c><x:c r=\"E2\""),
+      splitGroupTailRow(3, { date: "2032-03-10", project: "历史后段", amount: "680.5" }),
+      dataRow(4, { date: "2032-04-10" }),
+    ];
+    const baseline = await writeWorkbook(path.join(root, "小红书支出总表.xlsx"), { rows, merges: ["D2:D3", "E2:E3", "F2:F3"] });
+    const clean = await build(baseline, transactions); stagingRoot = clean.stagingRoot; const artifact = clean.artifacts[0];
+    const candidateBytes = await fs.readFile(artifact.candidatePath);
+    const zip = await JSZip.loadAsync(candidateBytes); const worksheetXml = await zip.file("xl/worksheets/sheet1.xml").async("string");
+    const binding = await maliciousAuditRequest({
+      artifact, baseline, transactions, candidatePath: artifact.candidatePath, candidateBytes, worksheetXml,
+      mutateCertificate: (localPatchCertificate) => {
+        const repair = localPatchCertificate.transform.splitPlan.repairs[0];
+        repair.beforeTotal = "760";
+        const repairBody = structuredClone(repair); delete repairBody.repairDigest;
+        repair.repairDigest = canonicalDigest(repairBody);
+        const planBody = structuredClone(localPatchCertificate.transform.splitPlan); delete planBody.planDigest;
+        localPatchCertificate.transform.splitPlan.planDigest = canonicalDigest(planBody);
+        const transformBody = structuredClone(localPatchCertificate.transform); delete transformBody.transformDigest;
+        localPatchCertificate.transform.transformDigest = canonicalDigest(transformBody);
+        localPatchCertificate.transformDigest = localPatchCertificate.transform.transformDigest;
+      },
+    });
+    await assert.rejects(
+      () => runRootWorkbookAuditWorker({ requestBody: binding.request, requestFileSha256: binding.requestFileSha256, requestNonce: binding.requestNonce }),
+      /audit worker failed|coordinate transform differs|independently audited transform/iu,
+    );
   } finally {
     if (stagingRoot) await fs.rm(stagingRoot, { recursive: true, force: true });
     await fs.rm(root, { recursive: true, force: true });
@@ -326,6 +491,62 @@ test("audit worker independently rereads the bound candidate from disk", async (
     } } }), /audit source SHA\/size changed|cleanup incomplete/u);
   } finally {
     if (stagingRoot) await fs.rm(stagingRoot, { recursive: true, force: true });
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("reused root audit session rereads baseline and candidate bytes and recovers without losing full audit checks", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "codex-xhs-root-audit-session-"));
+  const transactions = [{ id: "TX-SESSION", date: "2032-02-01", amount: "2.125", project: "匿名会话复核" }];
+  let built;
+  let session;
+  try {
+    const baseline = await writeWorkbook(path.join(root, "小红书支出总表.xlsx"), { rows: [headerRow(), dataRow(2)] });
+    built = await build(baseline, transactions);
+    const artifact = built.artifacts[0];
+    const requestNonce = crypto.randomBytes(32).toString("hex");
+    const request = {
+      kind: ROOT_WORKBOOK_AUDIT_REQUEST_KIND,
+      requestNonce,
+      reimbursementFactsCertificate: await certificate(transactions),
+      profiles: [{
+        profileId: "xiaohongshu",
+        baselinePath: baseline.path,
+        baselineSha256: baseline.sha256,
+        candidatePath: artifact.candidatePath,
+        candidateSha256: artifact.candidateSha256,
+        localPatchCertificate: artifact.localPatchCertificate,
+      }],
+    };
+    request.requestDigest = computeRootWorkbookAuditRequestDigest(request);
+    const options = { requestBody: request, requestFileSha256: sha256Bytes(jsonBytes(request)), requestNonce };
+    session = prestartRootWorkbookAuditWorker();
+
+    const first = await session.run(options);
+    assert.equal(first.audits[0].auditOperations.zipEntryPayloadInflateCount, 7);
+    assert.ok(first.audits[0].auditOperations.coordinateRowsCompared >= 1);
+    assert.ok(first.audits[0].auditOperations.historicalFormulasChecked >= 0);
+    assert.ok(first.audits[0].auditOperations.styleRowsInspected >= 1);
+    assert.equal(first.audits[0].unchangedPartCount, artifact.audit.unchangedPartCount);
+
+    const candidateBytes = await fs.readFile(artifact.candidatePath);
+    await fs.appendFile(artifact.candidatePath, Buffer.from([0]));
+    await assert.rejects(session.run(options), /xiaohongshu audit source SHA\/size changed/u, "the next request must reread changed candidate bytes");
+    await fs.writeFile(artifact.candidatePath, candidateBytes);
+
+    const baselineBytes = await fs.readFile(baseline.path);
+    await fs.appendFile(baseline.path, Buffer.from([0]));
+    await assert.rejects(session.run(options), /xiaohongshu audit source SHA\/size changed/u, "the next request must reread changed baseline bytes");
+    await fs.writeFile(baseline.path, baselineBytes);
+
+    const recovered = await session.run(options);
+    assert.equal(recovered.audits[0].auditDigest, first.audits[0].auditDigest, "failed requests must not contaminate a later legal audit");
+    assert.equal(recovered.audits[0].auditOperations.zipEntryPayloadInflateCount, 7);
+    assert.equal(recovered.audits[0].localPatchCertificateDigest, artifact.localPatchCertificate.certificateDigest);
+    assert.equal(recovered.audits[0].transformDigest, artifact.localPatchCertificate.transformDigest);
+  } finally {
+    if (session) await session.terminate();
+    if (built?.stagingRoot) await fs.rm(built.stagingRoot, { recursive: true, force: true });
     await fs.rm(root, { recursive: true, force: true });
   }
 });
