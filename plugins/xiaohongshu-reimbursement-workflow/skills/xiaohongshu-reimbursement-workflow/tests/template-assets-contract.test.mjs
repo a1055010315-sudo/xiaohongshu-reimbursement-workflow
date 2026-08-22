@@ -5,10 +5,17 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { loadBundledDependency, sha256Bytes } from "../scripts/workflow_primitives.mjs";
+import {
+  assertTemplateCodeRoleCoverage,
+  auditOpenedWorkbookStyleContract,
+  validateWorkbookStyleContract,
+} from "../scripts/workbook_style_contract.mjs";
 
 const JSZipModule = loadBundledDependency("jszip");
 const JSZip = JSZipModule.default ?? JSZipModule;
 const templateRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "assets", "templates", "xiaohongshu");
+const disbursementTemplateRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "assets", "templates", "disbursement");
+const styleContractPath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "references", "workbook-style-contract.json");
 const namespace = "(?:[A-Za-z_][\\w.-]*:)?";
 
 function tagAttributes(tag) {
@@ -115,4 +122,185 @@ test("sanitized workbook templates contain one blank standard row and no hidden 
       assert.equal(definition.outputMergePolicy.expenseGroup, true);
     }
   }
+});
+
+test("reference-batch style golden exhaustively binds template-manifest roles to their code consumers", async () => {
+  const [contractText, manifestText, artifactBuilder, rootBuilder] = await Promise.all([
+    fs.readFile(styleContractPath, "utf8"),
+    fs.readFile(path.join(templateRoot, "template-manifest.json"), "utf8"),
+    fs.readFile(path.resolve(templateRoot, "..", "..", "..", "scripts", "build_reimbursement_artifacts.mjs"), "utf8"),
+    fs.readFile(path.resolve(templateRoot, "..", "..", "..", "scripts", "build_root_workbook_candidate.mjs"), "utf8"),
+  ]);
+  const contract = validateWorkbookStyleContract(JSON.parse(contractText));
+  const manifest = JSON.parse(manifestText);
+  assert.equal(contract.contractId, "xhs-reference-batch-style-golden-v1");
+  assert.equal(contract.authority.policy, "user-designated-reference-batch-only");
+  assert.equal(contract.authority.containsBusinessData, false);
+  assert.deepEqual(contract.runtimeBudget, {
+    gate1AddedFileReads: 0,
+    gate1AddedImageDecodes: 0,
+    gate1AddedComCalls: 0,
+    gate2AddedZipOpens: 0,
+    finalizeMedianIncreaseMaximumPercent: 2,
+    totalRunMedianIncreaseMaximumPercent: 1,
+    metrics: ["styleContractChecks", "stylePartsInflated", "styleBytesInflated", "styleMismatchCount", "styleCheckMs"],
+  });
+  assert.deepEqual(contract.referencePalette, {
+    titleDeepGreenArgb: "FF567D27",
+    headerOliveGreenArgb: "FF6B8E23",
+    voucherHeaderGoldArgb: "FFE3B333",
+    bodyWhiteArgb: "FFFFFFFF",
+    bodyBorderArgb: "FFE0E6E8",
+    sectionLightGreenArgb: "FFE2F0D9",
+    summaryLightBlueArgb: "FFDDEBF7",
+    voucherIvoryArgb: "FFFFFCF4",
+  });
+  for (const forbidden of ["未脱敏姓名甲", "未脱敏姓名乙", "真实业务金额甲", "真实业务金额乙"]) {
+    assert.equal(contractText.includes(forbidden), false, `style golden leaked ${forbidden}`);
+  }
+  const coverage = assertTemplateCodeRoleCoverage({
+    contract,
+    templateManifest: manifest,
+    sourceTexts: {
+      "scripts/build_reimbursement_artifacts.mjs": artifactBuilder,
+      "scripts/build_root_workbook_candidate.mjs": rootBuilder,
+    },
+  });
+  assert.deepEqual(coverage.map((item) => item.templateId), [
+    "current-detail",
+    "screenshot-map",
+    "supplement-detail",
+    "ledger-batch-preview",
+  ]);
+  for (const [id, definition] of Object.entries(manifest.templates)) {
+    const entry = contract.templates[id];
+    assert.ok(entry, `${id} style contract`);
+    assert.equal(entry.assetSha256, definition.sha256, `${id} asset SHA`);
+    assert.equal(entry.sheetName, definition.sheetName, `${id} sheet name`);
+    assert.deepEqual(entry.moneyNumberFormats, definition.moneyNumberFormats, `${id} money formats`);
+    for (const role of entry.requiredRoles) assert.match(entry.roleSignatures[role], /^[0-9a-f]{64}$/u, `${id}.${role} semantic style`);
+  }
+});
+
+test("compact disbursement template is sanitized, single-sheet, visible, and bound to the fixed eleven-column contract", async () => {
+  const [manifestText, contractText] = await Promise.all([
+    fs.readFile(path.join(disbursementTemplateRoot, "template-manifest.json"), "utf8"),
+    fs.readFile(styleContractPath, "utf8"),
+  ]);
+  const manifest = JSON.parse(manifestText);
+  const definition = manifest.templates["compact-disbursement"];
+  const bytes = await fs.readFile(path.join(disbursementTemplateRoot, definition.file));
+  assert.equal(sha256Bytes(bytes), definition.sha256);
+  assert.equal(definition.worksheetCount, 1);
+  assert.equal(definition.visibleWorksheetCount, 1);
+  assert.equal(definition.hiddenWorksheetCount, 0);
+  assert.deepEqual(definition.requiredHeaders, [
+    "姓名/事项", "小红书报销", "公司报销", "驻所报销", "工资类别", "工资",
+    "应发合计", "实际发放", "方式", "状态", "凭证/备注",
+  ]);
+  assert.deepEqual(definition.visibleStatuses, ["已核销", "待凭证", "待现金确认", "异常待说明", "非本批", "已忽略尾差"]);
+
+  const zip = await JSZip.loadAsync(bytes, { createFolders: false });
+  const worksheetParts = Object.keys(zip.files).filter((name) => /^xl\/worksheets\/[^/]+\.xml$/iu.test(name));
+  assert.deepEqual(worksheetParts, ["xl/worksheets/sheet1.xml"]);
+  const workbookXml = await zip.file("xl/workbook.xml").async("string");
+  const sheetTags = [...workbookXml.matchAll(new RegExp(`<${namespace}sheet\\b[^>]*\\/?\\s*>`, "giu"))];
+  assert.equal(sheetTags.length, 1);
+  assert.equal(tagAttributes(sheetTags[0][0]).get("name"), definition.sheetName);
+  assert.equal(["hidden", "veryHidden"].includes(tagAttributes(sheetTags[0][0]).get("state")), false);
+  const worksheetXml = await zip.file("xl/worksheets/sheet1.xml").async("string");
+  const headerRow = rowXml(worksheetXml, definition.headerRow);
+  assert.ok(headerRow);
+  const headers = [...headerRow.matchAll(new RegExp(`<${namespace}c\\b[^>]*>[\\s\\S]*?<${namespace}t\\b[^>]*>([^<]*)<\\/${namespace}t>[^<]*<\\/${namespace}is>[\\s\\S]*?<\\/${namespace}c>`, "giu"))]
+    .map((match) => match[1]
+      .replace(/&#x([0-9a-f]+);/giu, (_whole, hex) => String.fromCodePoint(Number.parseInt(hex, 16)))
+      .replace(/&#([0-9]+);/gu, (_whole, decimal) => String.fromCodePoint(Number.parseInt(decimal, 10))));
+  assert.deepEqual(headers, definition.requiredHeaders);
+  assert.equal(/(?:comments|threadedComments|persons|customXml|externalLinks|xl\/media\/)/iu.test(Object.keys(zip.files).join("\n")), false);
+
+  const contract = validateWorkbookStyleContract(JSON.parse(contractText));
+  const result = auditOpenedWorkbookStyleContract({
+    contract,
+    templateId: "compact-disbursement",
+    templateDefinition: definition,
+    styleRoles: definition.styleRoles,
+    parts: {
+      stylesXml: await zip.file("xl/styles.xml").async("string"),
+      themeXml: await zip.file("xl/theme/theme1.xml").async("string"),
+      worksheetXml,
+      workbookXml,
+    },
+  });
+  assert.equal(result.ok, true);
+  assert.equal(definition.contractRoleSignaturesDigest, contract.templates["compact-disbursement"].roleSignaturesDigest);
+  assert.equal(definition.styleRolesDigest, result.binding.styleRolesDigest);
+  assert.equal(definition.layoutDigest, result.binding.layoutDigest);
+  assert.equal(definition.styleBindingDigest, result.binding.bindingDigest);
+  assert.deepEqual({
+    reads: result.metrics.addedFileReads,
+    decodes: result.metrics.addedImageDecodes,
+    com: result.metrics.addedComCalls,
+    zipOpens: result.metrics.addedZipOpens,
+    inflatedParts: result.metrics.stylePartsInflated,
+    inflatedBytes: result.metrics.styleBytesInflated,
+  }, { reads: 0, decodes: 0, com: 0, zipOpens: 0, inflatedParts: 0, inflatedBytes: 0 });
+
+  const printMutation = auditOpenedWorkbookStyleContract({
+    contract,
+    templateId: "compact-disbursement",
+    templateDefinition: definition,
+    styleRoles: definition.styleRoles,
+    throwOnMismatch: false,
+    parts: {
+      stylesXml: await zip.file("xl/styles.xml").async("string"),
+      themeXml: await zip.file("xl/theme/theme1.xml").async("string"),
+      worksheetXml: worksheetXml.replace('orientation="landscape"', 'orientation="portrait"'),
+      workbookXml,
+    },
+  });
+  assert.equal(printMutation.ok, false);
+  assert.match(printMutation.mismatches.map((entry) => entry.field).join("\n"), /outputPolicy\.orientation/u);
+  const filterMutation = auditOpenedWorkbookStyleContract({
+    contract,
+    templateId: "compact-disbursement",
+    templateDefinition: definition,
+    styleRoles: definition.styleRoles,
+    throwOnMismatch: false,
+    parts: {
+      stylesXml: await zip.file("xl/styles.xml").async("string"),
+      themeXml: await zip.file("xl/theme/theme1.xml").async("string"),
+      worksheetXml: worksheetXml.replace(`ref="A${definition.headerRow}:K${definition.dataEndRow}"`, `ref="A${definition.headerRow}:K${definition.dataEndRow - 1}"`),
+      workbookXml,
+    },
+  });
+  assert.equal(filterMutation.ok, false);
+  assert.match(filterMutation.mismatches.map((entry) => entry.field).join("\n"), /outputPolicy\.autoFilter/u);
+
+  const summaryTemplateRow = rowXml(worksheetXml, definition.summaryRow);
+  assert.ok(summaryTemplateRow);
+  const stressSummaryRow = 217;
+  const dynamicSummaryRow = summaryTemplateRow
+    .replace(`r="${definition.summaryRow}"`, `r="${stressSummaryRow}"`)
+    .replace(/([A-K])47/gu, (_whole, column) => `${column}${stressSummaryRow}`);
+  const stressDataEndRow = stressSummaryRow - 1;
+  const dynamicWorksheetXml = worksheetXml
+    .replace(summaryTemplateRow, dynamicSummaryRow)
+    .replace(`A${definition.headerRow}:K${definition.dataEndRow}`, `A${definition.headerRow}:K${stressDataEndRow}`);
+  const dynamicWorkbookXml = workbookXml
+    .replace(`$A$${definition.headerRow}:$K$${definition.dataEndRow}`, `$A$${definition.headerRow}:$K$${stressDataEndRow}`)
+    .replace(`$A$1:$K$${definition.summaryRow}`, `$A$1:$K$${stressSummaryRow}`);
+  const generated = auditOpenedWorkbookStyleContract({
+    contract,
+    templateId: "compact-disbursement",
+    templateDefinition: definition,
+    styleRoles: definition.styleRoles,
+    layoutMode: "generated",
+    parts: {
+      stylesXml: await zip.file("xl/styles.xml").async("string"),
+      themeXml: await zip.file("xl/theme/theme1.xml").async("string"),
+      worksheetXml: dynamicWorksheetXml,
+      workbookXml: dynamicWorkbookXml,
+    },
+  });
+  assert.equal(generated.ok, true, "generated contract must follow a 200-row stress summary instead of pinning row 47");
 });

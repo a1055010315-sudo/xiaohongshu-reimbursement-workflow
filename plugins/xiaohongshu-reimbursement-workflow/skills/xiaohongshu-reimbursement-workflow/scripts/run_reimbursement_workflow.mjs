@@ -1,10 +1,11 @@
 import crypto from "node:crypto";
-import { execFile, spawn } from "node:child_process";
+import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { Worker } from "node:worker_threads";
 
 import { buildGateBinding } from "./build_gate_binding.mjs";
 import { loadProfileRegistry } from "./finance_domain.mjs";
@@ -158,26 +159,28 @@ async function assertBoundFile(binding, field) {
   return stable;
 }
 
-function auditManifest(manifestPath, expectedSha256) {
+export function auditManifest(manifestPath, expectedSha256) {
   return new Promise((resolve, reject) => {
-    execFile(process.execPath, [MANIFEST_AUDITOR, manifestPath, "--defer-ordinary-file-verification"], {
-      encoding: "utf8",
-      shell: false,
-      windowsHide: true,
-      maxBuffer: MAX_JSON_BYTES,
-      timeout: 60_000,
-    }, (error, stdout, stderr) => {
+    const worker = new Worker(pathToFileURL(MANIFEST_AUDITOR), {
+      execArgv: [],
+      workerData: { kind: "ordinary-manifest-audit-worker-v1", manifestPath, deferOrdinaryFileVerification: true },
+      resourceLimits: { maxOldGenerationSizeMb: 256, maxYoungGenerationSizeMb: 64 },
+    });
+    let done = false;
+    const finish = (operation) => { if (done) return; done = true; clearTimeout(timer); operation(); void worker.terminate(); };
+    const timer = setTimeout(() => finish(() => reject(new Error("manifest audit timed out"))), 60_000);
+    worker.once("message", (message) => finish(() => {
       try {
-        if (error || stderr) fail(`manifest audit failed: ${stderr?.trim() || error?.message || "unknown error"}`);
-        const lines = stdout.split(/\r?\n/u).filter(Boolean);
-        if (lines.length !== 1) fail("manifest auditor must return one JSON line.");
-        const result = parseStrictJson(lines[0]);
+        if (message?.kind !== "ordinary-manifest-audit-result-v1" || message.ok !== true) fail(`manifest audit failed: ${message?.error ?? "invalid worker response"}`);
+        const result = object(message.result, "manifest audit result");
         if (result.ok !== true || result.manifestFileSha256 !== expectedSha256 || result.fileVerificationMode !== "bound-builders" || !result.reimbursementFactsCertificate) fail("manifest audit result is incomplete or changed.");
         resolve(result);
       } catch (auditError) {
         reject(auditError);
       }
-    });
+    }));
+    worker.once("error", (error) => finish(() => reject(error)));
+    worker.once("exit", (code) => { if (!done) finish(() => reject(new Error(`manifest audit worker exited with code ${code}`))); });
   });
 }
 
@@ -581,6 +584,7 @@ export async function buildReviewPreviews(workflowRoot, rootBuild, presentationB
     });
     const decodedPreviewBySha256 = new Map();
     const validated = await mapSettledLimit(validatedPreviewBindings, PREVIEW_VALIDATION_CONCURRENCY, async ({ index, raw, job, renderSha256 }) => {
+      if (stage === "gate-2" && testHooks?.beforeGate2PreviewRead) await testHooks.beforeGate2PreviewRead({ index, profileId: job.profileId, role: job.role, path: job.outputPath });
       const stable = await readStableBinaryFile(job.outputPath, { maxBytes: MAX_PREVIEW_BYTES });
       if (stable.sha256 !== renderSha256 || stable.size !== raw.size) fail("preview renderer output changed after render.");
       let dimensions;
@@ -696,7 +700,17 @@ export async function prepareReimbursementWorkflow(rawRequest, { testHooks } = {
   if (!Array.isArray(rawRequest.baselines) || rawRequest.baselines.length < 1 || rawRequest.baselines.length > 3) fail("baselines must contain one to three profiles.");
   const manifestPath = path.resolve(text(rawRequest.manifestPath, "manifestPath"));
   const manifestSha256 = sha(rawRequest.manifestSha256, "manifestSha256");
-  const registry = await loadProfileRegistry();
+  const workflowRoot = path.join(path.resolve(os.tmpdir()), `${WORKFLOW_PREFIX}${rawRequest.stagingToken}`);
+  const registryPromise = loadProfileRegistry();
+  const rootInfo = await fs.lstat(workflowRoot).catch((error) => error?.code === "ENOENT" ? null : Promise.reject(error));
+  const earlyManifestAudit = rootInfo ? null : (testHooks?.auditManifest
+    ? Promise.resolve().then(() => testHooks.auditManifest(manifestPath, manifestSha256))
+    : auditManifest(manifestPath, manifestSha256));
+  const earlyManifestAuditSettled = earlyManifestAudit?.then(
+    (value) => ({ status: "fulfilled", value }),
+    (reason) => ({ status: "rejected", reason }),
+  );
+  const registry = await registryPromise;
   const baselines = rawRequest.baselines.map((raw, index) => {
     exact(raw, new Set(["profileId", "path", "sha256", "size", "candidateRevision"]), `baselines[${index}]`);
     const profileId = text(raw.profileId, `baselines[${index}].profileId`);
@@ -704,7 +718,6 @@ export async function prepareReimbursementWorkflow(rawRequest, { testHooks } = {
     if (!Number.isSafeInteger(raw.size) || raw.size < 1 || !Number.isSafeInteger(raw.candidateRevision) || raw.candidateRevision < 1) fail(`${profileId} baseline size/revision is invalid.`);
     return { profileId, path: path.resolve(text(raw.path, `${profileId}.path`)), sha256: sha(raw.sha256, `${profileId}.sha256`), size: raw.size, candidateRevision: raw.candidateRevision };
   });
-  const workflowRoot = path.join(path.resolve(os.tmpdir()), `${WORKFLOW_PREFIX}${rawRequest.stagingToken}`);
   const prepareRequestDigest = canonicalDigest({
     kind: rawRequest.kind,
     stagingToken: rawRequest.stagingToken,
@@ -722,7 +735,6 @@ export async function prepareReimbursementWorkflow(rawRequest, { testHooks } = {
   let reusedCheckpoint = false;
   let existingWorkflowRoot = false;
   try {
-    const rootInfo = await fs.lstat(workflowRoot).catch((error) => error?.code === "ENOENT" ? null : Promise.reject(error));
     if (rootInfo) {
       existingWorkflowRoot = true;
       if (!rootInfo.isDirectory() || rootInfo.isSymbolicLink() || !samePath(await fs.realpath(workflowRoot), workflowRoot)) fail("existing workflow root is not a plain owned directory.");
@@ -754,9 +766,10 @@ export async function prepareReimbursementWorkflow(rawRequest, { testHooks } = {
       previewCheckpoint = { path: checkpoint.path, sha256: checkpoint.snapshot.sha256, size: checkpoint.snapshot.size };
       reusedCheckpoint = true;
     } else {
-      const manifestAuditPromise = testHooks?.auditManifest
-        ? Promise.resolve().then(() => testHooks.auditManifest(manifestPath, manifestSha256))
-        : auditManifest(manifestPath, manifestSha256);
+      const manifestAuditPromise = earlyManifestAuditSettled.then((settled) => {
+        if (settled.status === "rejected") throw settled.reason;
+        return settled.value;
+      });
       const rootBuilderModulePromise = testHooks?.buildRootWorkbookCandidates
         ? Promise.resolve(null)
         : import("./build_root_workbook_candidate.mjs");
@@ -906,6 +919,22 @@ export async function finalizeReimbursementWorkflow(rawRequest, { testHooks } = 
   const correspondencePath = path.join(ready.state.workflowRoot, "gate2-full-correspondence.json");
   let correspondence;
   let correspondenceFile;
+  // Gate 2 preview verification only rereads and hashes the already-bound Gate 1
+  // PNGs. Start it alongside full correspondence, but keep a settled wrapper so
+  // correspondence remains the first reported failure and no rejection escapes.
+  const gate2PreviewBuildSettled = buildReviewPreviews(
+    ready.state.workflowRoot,
+    ready.state.rootBuild,
+    ready.state.presentationBuild,
+    ready.state.certificate.sourceCoverageDigest,
+    testHooks,
+    "gate-2",
+    ready.state.previewBuild,
+  ).then(
+    (value) => ({ status: "fulfilled", value }),
+    (reason) => ({ status: "rejected", reason }),
+  );
+  try {
   const existingCorrespondence = await readOptionalStableJson(correspondencePath);
   if (existingCorrespondence) {
     correspondence = object(existingCorrespondence.value, "full correspondence checkpoint");
@@ -971,12 +1000,18 @@ export async function finalizeReimbursementWorkflow(rawRequest, { testHooks } = 
       fail(`full correspondence audit found ${issueCount} mismatch(es); Gate 1 is permanently invalid and a corrected batch requires a new Gate 1.`);
     }
   }
+  } catch (error) {
+    await gate2PreviewBuildSettled;
+    throw error;
+  }
   const finalAudit = {
     kind: "gate2-full-correspondence-profile-audits-v1",
     reportDigest: correspondence.reportDigest,
     audits: correspondence.profileAudits,
   };
-  const gate2PreviewBuild = await buildReviewPreviews(ready.state.workflowRoot, ready.state.rootBuild, ready.state.presentationBuild, ready.state.certificate.sourceCoverageDigest, testHooks, "gate-2", ready.state.previewBuild);
+  const gate2PreviewBuildResult = await gate2PreviewBuildSettled;
+  if (gate2PreviewBuildResult.status === "rejected") throw gate2PreviewBuildResult.reason;
+  const gate2PreviewBuild = gate2PreviewBuildResult.value;
   try {
     const gate2 = gate2For(
       { ...ready.state.manifest, batch: { batchId: ready.state.manifest.batchId }, sourceCoverageDigest: ready.state.certificate.sourceCoverageDigest },

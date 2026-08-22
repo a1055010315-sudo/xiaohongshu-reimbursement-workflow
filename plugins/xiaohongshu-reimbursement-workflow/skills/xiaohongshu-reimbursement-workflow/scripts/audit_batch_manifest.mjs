@@ -2,6 +2,7 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
 import crypto from "node:crypto";
+import { isMainThread, parentPort, workerData } from "node:worker_threads";
 
 import {
   canonicalDigest as digest,
@@ -491,11 +492,12 @@ async function mapWithConcurrency(items, limit, worker) {
   return results;
 }
 
-const manifestPath = process.argv[2];
-const deferOrdinaryFileVerification = process.argv[3] === "--defer-ordinary-file-verification";
+const manifestWorker = !isMainThread && workerData?.kind === "ordinary-manifest-audit-worker-v1";
+const manifestPath = manifestWorker ? workerData.manifestPath : process.argv[2];
+const deferOrdinaryFileVerification = manifestWorker ? workerData.deferOrdinaryFileVerification === true : process.argv[3] === "--defer-ordinary-file-verification";
 
 try {
-  if (!manifestPath || process.argv[4] !== undefined || (process.argv[3] !== undefined && !deferOrdinaryFileVerification)) {
+  if (!manifestPath || (!manifestWorker && (process.argv[4] !== undefined || (process.argv[3] !== undefined && !deferOrdinaryFileVerification)))) {
     throw new Error("Use audit_batch_manifest.mjs <manifest.json> [--defer-ordinary-file-verification].");
   }
   const absoluteManifestPath = path.resolve(manifestPath);
@@ -1228,8 +1230,9 @@ try {
       [...settlementTotals].map(([settlement, total]) => [settlement, formatAmount(total)]),
     );
   }
-  process.stdout.write(`${JSON.stringify(result)}\n`);
-  process.exitCode = 0;
+  if (manifestWorker) parentPort.postMessage({ kind: "ordinary-manifest-audit-result-v1", ok: true, result });
+  else { process.stdout.write(`${JSON.stringify(result)}\n`); process.exitCode = 0; }
 } catch (error) {
-  fail(error instanceof Error ? error.message : String(error));
+  if (manifestWorker) parentPort.postMessage({ kind: "ordinary-manifest-audit-result-v1", ok: false, error: error instanceof Error ? error.message : String(error) });
+  else fail(error instanceof Error ? error.message : String(error));
 }

@@ -1096,7 +1096,7 @@ function validatePreviewBindings(add, state, root, presentation, profileId) {
   for (const preview of previews) if (!expected.has(preview.role)) add("extra", "gate1-preview-binding-extra", { profileId, artifact: "gate1-preview", role: preview.role });
 }
 
-async function validateEvidenceArchive(add, artifact, transactions, files, profileId, metrics, archiveCache) {
+async function validateEvidenceArchive(add, artifact, transactions, files, profileId, metrics, archiveCache, hooks) {
   const expectedBySha = new Map();
   for (const transaction of transactions) for (const evidenceId of transaction.evidence) {
     const file = files.get(evidenceId);
@@ -1113,7 +1113,10 @@ async function validateEvidenceArchive(add, artifact, transactions, files, profi
     const cacheKey = `${archivePath}\0${entry.sha256}`;
     let snapshot = archiveCache.get(cacheKey);
     if (!snapshot) {
-      snapshot = readStableBinaryFile(archivePath, { maxBytes: MAX_SOURCE_BYTES });
+      snapshot = (async () => {
+        if (hooks?.beforeEvidenceArchiveRead) await hooks.beforeEvidenceArchiveRead({ profileId, path: archivePath, sha256: entry.sha256 });
+        return readStableBinaryFile(archivePath, { maxBytes: MAX_SOURCE_BYTES });
+      })();
       archiveCache.set(cacheKey, snapshot);
       metrics.uniqueArchiveMediaReadCount += 1;
     } else {
@@ -1170,7 +1173,22 @@ export async function auditFullCorrespondence(rawInput, { hooks } = {}) {
   const reviewSnapshot = suppliedReview;
   const review = object(reviewSnapshot.value, "independent evidence review");
   const observations = validateReview(review, state, sourceByRef, transactions, summaryAnnotations, annotationResults, add);
-  const freshSources = await freshReviewSources(sourceByRef, usedMediaFiles, observations, add, metrics, hooks);
+  // Fresh source verification and Gate 1 artifact loading are independent inputs
+  // to this one Gate 2 audit. Start the fresh reads now, but join them before any
+  // artifact validation so the original source-first error and issue ordering is
+  // preserved while workbook ZIP inflation no longer waits on media decoding.
+  const freshSourcesSettled = freshReviewSources(sourceByRef, usedMediaFiles, observations, add, metrics, hooks).then(
+    (value) => ({ status: "fulfilled", value }),
+    (reason) => ({ status: "rejected", reason }),
+  );
+  let freshSources;
+  const requireFreshSources = async () => {
+    if (freshSources) return freshSources;
+    const settled = await freshSourcesSettled;
+    if (settled.status === "rejected") throw settled.reason;
+    freshSources = settled.value;
+    return freshSources;
+  };
 
   const workbookCache = new Map();
   const screenshotCache = new Map();
@@ -1238,7 +1256,38 @@ export async function auditFullCorrespondence(rawInput, { hooks } = {}) {
         { key: "candidate", load: () => loadWorkbookOnce({ path: root.candidatePath, sha256: root.candidateSha256, size: root.candidateSize }, "candidate", workbookCache, metrics, { sheetName: root.audit.profile.managedRootSheetName, selectedRows: candidateRows }) },
         { key: "root-preview", load: () => loadWorkbookOnce({ path: root.previewPath, sha256: root.previewSha256, size: root.previewSize }, "root-preview", workbookCache, metrics, { sheetName: root.previewSheetName, includeAllRows: true, strictSingleSheet: true }) },
       ];
-      const loaded = await mapSettledInInputOrder(loadTasks, SOURCE_CONCURRENCY, (task) => task.load());
+      if (hooks?.beforeArtifactLoad) await hooks.beforeArtifactLoad({ profileId, taskKeys: loadTasks.map((task) => task.key) });
+      // Evidence archive bytes are independent of the workbook/text artifact loads.
+      // Start their stable reads here, but isolate issues and metrics until the
+      // original evidence-validation point below so report ordering is unchanged.
+      const evidenceIssueStore = issueStore();
+      const evidenceMetrics = {
+        boundMediaArtifactCount: 0,
+        uniqueArchiveMediaReadCount: 0,
+        archiveMediaCacheHits: 0,
+      };
+      const evidenceArchiveSettled = validateEvidenceArchive(
+        evidenceIssueStore.add,
+        presentation,
+        profileTransactions,
+        files,
+        profileId,
+        evidenceMetrics,
+        archiveCache,
+        hooks,
+      ).then(
+        () => ({ status: "fulfilled" }),
+        (reason) => ({ status: "rejected", reason }),
+      );
+      if (hooks?.beforeArtifactTasksExecute) await hooks.beforeArtifactTasksExecute({ profileId, taskKeys: loadTasks.map((task) => task.key) });
+      let loaded;
+      try {
+        loaded = await mapSettledInInputOrder(loadTasks, SOURCE_CONCURRENCY, (task) => task.load());
+      } catch (error) {
+        await requireFreshSources();
+        throw error;
+      }
+      await requireFreshSources();
       const loadedByKey = new Map(loadTasks.map((task, index) => [task.key, loaded.settled[index].value]));
 
       const detailFacts = loadedByKey.get("detail");
@@ -1274,7 +1323,12 @@ export async function auditFullCorrespondence(rawInput, { hooks } = {}) {
       for (const transaction of profileTransactions) markTransactionCheck(transactionResults, transaction.id, "root-preview", { path: root.previewPath, range: root.previewRangeAddress });
       validatePreviewBindings(add, state, root, presentation, profileId);
       for (const transaction of profileTransactions) markTransactionCheck(transactionResults, transaction.id, "preview-binding", { previewDigest: state.previewBuild.previewDigest });
-      await validateEvidenceArchive(add, presentation, profileTransactions, files, profileId, metrics, archiveCache);
+      const evidenceArchiveResult = await evidenceArchiveSettled;
+      if (evidenceArchiveResult.status === "rejected") throw evidenceArchiveResult.reason;
+      for (const [kind, items] of Object.entries(evidenceIssueStore.result)) issues[kind].push(...items);
+      metrics.boundMediaArtifactCount += evidenceMetrics.boundMediaArtifactCount;
+      metrics.uniqueArchiveMediaReadCount += evidenceMetrics.uniqueArchiveMediaReadCount;
+      metrics.archiveMediaCacheHits += evidenceMetrics.archiveMediaCacheHits;
       for (const transaction of profileTransactions) markTransactionCheck(transactionResults, transaction.id, "evidence", { archiveCount: presentation.evidenceArchive.length });
     } catch (error) {
       if (isRetryableInfrastructureError(error)) throw error;
@@ -1294,6 +1348,7 @@ export async function auditFullCorrespondence(rawInput, { hooks } = {}) {
     };
     profileAudits.push({ ...body, auditDigest: canonicalDigest(body) });
   }
+  await requireFreshSources();
 
   const mediaReferences = transactions.flatMap((transaction) => transaction.evidence
     .filter((evidenceId) => files.get(evidenceId)?.kind === "image")

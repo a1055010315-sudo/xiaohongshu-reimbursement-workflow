@@ -3,10 +3,15 @@ import fs from "node:fs/promises";
 import { constants as fsConstants, realpathSync } from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { TextDecoder } from "node:util";
 
 const BUNDLED_DEPENDENCY_ALLOWLIST = new Set(["jszip", "sax", "sharp"]);
 const bundledDependencyCache = new Map();
+const BUNDLED_ESM_DEPENDENCY_ALLOWLIST = new Map([
+  ["pdfjs-dist", "legacy/build/pdf.mjs"],
+]);
+const bundledEsmDependencyCache = new Map();
 
 function canonicalize(value) {
   if (Array.isArray(value)) return value.map(canonicalize);
@@ -457,6 +462,78 @@ export function loadBundledDependency(packageName) {
   const loaded = require(resolved);
   bundledDependencyCache.set(packageName, loaded);
   return loaded;
+}
+
+function bundledRuntimeDependencyRoots() {
+  const executableDirectory = path.dirname(process.execPath);
+  const candidates = [
+    path.resolve(executableDirectory, "..", "node_modules"),
+    path.resolve(executableDirectory, "node_modules"),
+  ];
+  const roots = [];
+  const seen = new Set();
+  for (const candidate of candidates) {
+    let canonical;
+    try {
+      canonical = realpathSync(candidate);
+    } catch {
+      continue;
+    }
+    const key = process.platform === "win32" ? canonical.toLowerCase() : canonical;
+    if (!seen.has(key)) {
+      seen.add(key);
+      roots.push(canonical);
+    }
+  }
+  if (roots.length === 0) throw new Error("Bundled runtime dependency root is unavailable.");
+  return roots;
+}
+
+function resolveBundledEsmDependency(packageName, moduleRelativePath) {
+  const failures = [];
+  for (const modulesRoot of bundledRuntimeDependencyRoots()) {
+    const require = createRequire(path.join(path.dirname(modulesRoot), "__codex_bundled_runtime__.cjs"));
+    try {
+      const packageJson = realpathSync(require.resolve(`${packageName}/package.json`));
+      const packageRelative = path.relative(modulesRoot, packageJson);
+      if (!packageRelative || packageRelative === ".." || packageRelative.startsWith(`..${path.sep}`) || path.isAbsolute(packageRelative)) {
+        throw new Error(`${packageName} package metadata escaped the fixed bundled runtime dependency root.`);
+      }
+      const packageRoot = realpathSync(path.dirname(packageJson));
+      const resolvedModule = realpathSync(path.join(packageRoot, ...moduleRelativePath.split("/")));
+      const moduleRelative = path.relative(packageRoot, resolvedModule);
+      if (!moduleRelative || moduleRelative === ".." || moduleRelative.startsWith(`..${path.sep}`) || path.isAbsolute(moduleRelative)) {
+        throw new Error(`${packageName} module escaped its bundled package root.`);
+      }
+      if (moduleRelative.split(path.sep).join("/") !== moduleRelativePath) {
+        throw new Error(`${packageName} module did not resolve to its allowlisted bundled path.`);
+      }
+      return resolvedModule;
+    } catch (error) {
+      failures.push(error);
+    }
+  }
+  throw new Error(
+    `${packageName} is unavailable; run with a bundled Node runtime that provides the allowlisted workspace dependency.`,
+    { cause: failures.at(-1) },
+  );
+}
+
+export async function importBundledDependency(packageName) {
+  const moduleRelativePath = BUNDLED_ESM_DEPENDENCY_ALLOWLIST.get(packageName);
+  if (!moduleRelativePath) throw new Error(`Bundled ESM dependency is not allowlisted: ${packageName}`);
+  if (bundledEsmDependencyCache.has(packageName)) return bundledEsmDependencyCache.get(packageName);
+  const loading = (async () => {
+    const resolvedModule = resolveBundledEsmDependency(packageName, moduleRelativePath);
+    return import(pathToFileURL(resolvedModule).href);
+  })();
+  bundledEsmDependencyCache.set(packageName, loading);
+  try {
+    return await loading;
+  } catch (error) {
+    bundledEsmDependencyCache.delete(packageName);
+    throw error;
+  }
 }
 
 export async function mapSettledLimit(items, limit, worker) {

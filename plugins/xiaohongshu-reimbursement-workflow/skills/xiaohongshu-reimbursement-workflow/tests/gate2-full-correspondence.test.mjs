@@ -370,6 +370,79 @@ test("Gate 2 performs one cached full-correspondence pass and exposes its report
   }
 });
 
+test("Gate 2 overlaps fresh source decode with Gate 1 artifact loading while retaining both audits", async () => {
+  const temp = await fs.mkdtemp(path.join(os.tmpdir(), "codex-xhs-gate2-read-overlap-"));
+  let workflowRoot;
+  try {
+    const fixture = await prepareFixture(temp);
+    workflowRoot = fixture.workflowRoot;
+    const reviewFile = await writeJson(path.join(temp, "overlap-review.json"), reviewFor(fixture.gate1, fixture.firstImage, fixture.secondImage));
+    let activeFreshReads = 0;
+    let freshReadCalls = 0;
+    let artifactLoadCalls = 0;
+    let artifactLoadObservedFreshRead = false;
+    let activeArchiveReads = 0;
+    let archiveReadCalls = 0;
+    let artifactTasksObservedArchiveRead = false;
+    let activeGate2PreviewReads = 0;
+    let gate2PreviewReadCalls = 0;
+    let correspondenceObservedGate2PreviewRead = false;
+    const gate2 = await finalizeReimbursementWorkflow({
+      statePath: fixture.gate1.statePath,
+      expectedGate1BindingDigest: fixture.gate1.gate1BindingDigest,
+      approvalText: "本次报销通过无误",
+      independentEvidenceReviewPath: reviewFile.path,
+      independentEvidenceReviewSha256: reviewFile.sha256,
+    }, {
+      testHooks: {
+        fullCorrespondenceHooks: {
+          beforeSourceRead: async () => {
+            freshReadCalls += 1;
+            correspondenceObservedGate2PreviewRead ||= activeGate2PreviewReads > 0;
+            activeFreshReads += 1;
+            await new Promise((resolve) => setTimeout(resolve, 50));
+            activeFreshReads -= 1;
+          },
+          beforeArtifactLoad: ({ taskKeys }) => {
+            artifactLoadCalls += 1;
+            artifactLoadObservedFreshRead ||= activeFreshReads > 0;
+            assert.deepEqual(taskKeys, ["detail", "screenshot", "summary", "supplement:0", "candidate", "root-preview"]);
+          },
+          beforeEvidenceArchiveRead: async () => {
+            archiveReadCalls += 1;
+            activeArchiveReads += 1;
+            await new Promise((resolve) => setTimeout(resolve, 50));
+            activeArchiveReads -= 1;
+          },
+          beforeArtifactTasksExecute: ({ taskKeys }) => {
+            artifactTasksObservedArchiveRead ||= activeArchiveReads > 0;
+            assert.deepEqual(taskKeys, ["detail", "screenshot", "summary", "supplement:0", "candidate", "root-preview"]);
+          },
+        },
+        beforeGate2PreviewRead: async () => {
+          gate2PreviewReadCalls += 1;
+          activeGate2PreviewReads += 1;
+          await new Promise((resolve) => setTimeout(resolve, 50));
+          activeGate2PreviewReads -= 1;
+        },
+      },
+    });
+    assert.equal(gate2.status, "ready-for-gate-2");
+    assert.equal(freshReadCalls, 2);
+    assert.equal(artifactLoadCalls, 1);
+    assert.equal(artifactLoadObservedFreshRead, true, "artifact loading must start while fresh source reads are still active");
+    assert.equal(archiveReadCalls, 2);
+    assert.equal(artifactTasksObservedArchiveRead, true, "artifact loading must start while evidence archive reads are still active");
+    assert.equal(gate2PreviewReadCalls, 3);
+    assert.equal(correspondenceObservedGate2PreviewRead, true, "full correspondence must start while Gate 2 preview reads are still active");
+    assert.equal(gate2.fullCorrespondenceAudit.metrics.uniqueMediaDecodeCount, 2);
+    assert.equal(gate2.fullCorrespondenceAudit.metrics.artifactParseCount, 6);
+  } finally {
+    if (workflowRoot) await fs.rm(workflowRoot, { recursive: true, force: true });
+    await fs.rm(temp, { recursive: true, force: true });
+  }
+});
+
 test("Gate 2 cannot pass when a required transaction correspondence stage was not checked", async () => {
   const temp = await fs.mkdtemp(path.join(os.tmpdir(), "codex-xhs-gate2-required-stage-"));
   let workflowRoot;
@@ -749,7 +822,25 @@ test("a transient Gate 2 infrastructure error preserves Gate 1 for retry", async
     await assert.rejects(fs.access(path.join(workflowRoot, "gate1-invalidation.json")), /ENOENT/u);
     const reviewFile = await writeJson(path.join(temp, "retryable-review.json"), review);
     const request = { statePath: fixture.gate1.statePath, expectedGate1BindingDigest: fixture.gate1.gate1BindingDigest, approvalText: "本次报销通过无误", independentEvidenceReviewPath: reviewFile.path, independentEvidenceReviewSha256: reviewFile.sha256 };
-    await assert.rejects(() => finalizeReimbursementWorkflow(request, { testHooks: { fullCorrespondenceHooks: { beforeSourceRead: () => { const error = new Error("synthetic source is temporarily locked"); error.code = "EACCES"; throw error; } } } }), /Gate 1 remains valid/u);
+    await assert.rejects(
+      () => finalizeReimbursementWorkflow(request, {
+        testHooks: {
+          beforeGate2PreviewRead: () => { throw new Error("synthetic preview verification failure"); },
+          fullCorrespondenceHooks: {
+            beforeSourceRead: () => {
+              const error = new Error("synthetic source is temporarily locked");
+              error.code = "EACCES";
+              throw error;
+            },
+          },
+        },
+      }),
+      (error) => {
+        assert.match(error.message, /Gate 1 remains valid/u);
+        assert.doesNotMatch(error.message, /synthetic preview verification failure/u);
+        return true;
+      },
+    );
     await assert.rejects(fs.access(path.join(workflowRoot, "gate1-invalidation.json")), /ENOENT/u);
     await assert.rejects(fs.access(path.join(workflowRoot, "gate2-full-correspondence.json")), /ENOENT/u);
     const retried = await finalizeReimbursementWorkflow(request);

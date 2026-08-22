@@ -1,6 +1,6 @@
-# 三类报销共享归档工作流
+# 三类报销与发放归档工作流
 
-这是面向 Codex 的 skills-only 插件。它用一条 profile 驱动的普通报销流程处理小红书、公司和驻所报销，并保留独立的历史纠错/零增量重排路径。
+这是面向 Codex 的 skills-only 插件。它用一条 profile 驱动的普通报销流程处理小红书、公司和驻所报销，并提供一条与普通报销隔离的发放归档流程；历史纠错/零增量重排仍走独立路径。
 
 普通流程只为本批实际有交易的 profile 生成和发布成品；无交易 profile 不创建空文件，也不修改根表。`住所` 可作为驻所输入别名，但正式文件和 Sheet 始终使用 canonical `驻所` 身份。
 
@@ -16,17 +16,29 @@
 
 三份正式根表分别为 `小红书支出总表.xlsx`、`公司支出总表.xlsx` 和 `驻所支出.xlsx`。金额使用 BigInt milliunits 计算，按规范值显示 0 至 3 位小数，不取整也不补无意义尾零。普通报销只索引本批插入边界，不解析历史 B:F 业务内容；候选关闭后由独立进程重读真实 XLSX/OOXML 审计，发布前后均 fresh 读取并核对 SHA256。
 
+## 发放归档产物
+
+发放归档没有人工 Gate，也不复用普通报销的 Gate 1/Gate 2 状态。唯一 CLI 是 `scripts/run_compact_disbursement_workflow.mjs --archive <request.json>`，唯一 API 是 `archiveCompactDisbursementWorkflow`。请求严格只允许四个字段：`kind`、`stagingToken`、`manifestPath`、`manifestSha256`；其中 `kind` 固定为 `compact-disbursement-archive-v1`。
+
+一次调用依次完成来源 fresh 复核、候选生成、内部校验和原子归档。最终批次目录严格只有：
+
+- `发放情况说明.txt`；
+- `发放核对表.xlsx`；
+- `发放凭证/`。
+
+最终目录由 manifest 中的 `batch.archiveParentPath` 与批次名派生。报销来源只通过 `reimbursementSources[].originalManifestPath` 和 `publishReceiptPath` 绑定；发放流程不移动、不覆盖原报销材料，也不扫描工资目录或改动三份报销根表，普通报销入口则不得导入发放模块。
+
 ## 版本状态与下载
 
 | 版本 | 状态 | 说明 |
 |---|---|---|
 | `0.5.0+codex.20260819174146` | 用户已确认本机原版可用 | 作为当前性能对比基线。原版含私有回归样例，因此不公开原字节；GitHub 提供删除私有测试并泛化示例的 [`portable1` 脱敏便携包](https://github.com/a1055010315-sudo/xiaohongshu-reimbursement-workflow/releases/tag/v0.5.0-codex.20260819174146-portable1)，运行脚本保持一致，并附 SHA256。 |
 | `0.5.0+codex.20260820094210` | **尚未经过用户业务验收** | 首次加入四个脱敏报销工作簿模板，并区分空白模板结构与成品动态合并/行高。仅作为[模板版预发布包](https://github.com/a1055010315-sudo/xiaohongshu-reimbursement-workflow/releases/tag/v0.5.0-codex.20260820094210)保留，不应取代已验证基线。 |
-| `0.5.0+codex.20260821073607` | 当前 hardening 候选 | 完成固定脱敏模板、候选局部增量、批次预览、可恢复双门禁、严格图片验证和 Gate 2 全量独立对应复核。完整匿名回归与性能门槛均已通过，继续保留在草稿 PR 中，不自动安装或合并。 |
+| `0.5.0+codex.20260821194339` | 当前已验证版本 | 普通报销保留可恢复 Gate 1/Gate 2、严格图片验证和 Gate 2 全量对应复核；新增隔离的单次无人工 Gate 发放归档。全量回归、独立前向测试、打包及安装态复核均已通过；20% 仅是信息性改善目标，不再是验收硬门。 |
 
 `19174146.portable1` 是隐私脱敏的可迁移运行包，不宣称与含私有测试的本机原版逐字节相同。原版来源证明摘要为 `d070ae296d0606db8a03a5d50f08559eb3a42fccadec7aecbeca20b400ca16b5`，算法为按相对路径排序后，对每项 `relativePath + NUL + SHA256 + NUL + size` 形成清单再计算 SHA256。
 
-从对应 Release 或仓库 `dist/` 下载明确命名的插件 ZIP 和 `.sha256`，不要使用 GitHub 自动生成的 “Source code” 压缩包。先核对校验和，再解压到新的本地目录，并把该解压目录作为 marketplace 根：
+从对应 Release 或仓库 `dist/` 下载明确命名的 marketplace ZIP 和 `.sha256`，不要使用 GitHub 自动生成的 “Source code” 压缩包。先核对校验和，再解压到新的本地目录，并把该解压目录注册为 `xiaohongshu-finance` marketplace 根。不得使用 `personal` marketplace 或其旧安装缓存代替当前候选：
 
 ### 安装
 
@@ -73,22 +85,45 @@ codex plugin list --json
 
 任何候选、基线、来源覆盖、预览或摘要变化都会使旧门禁失效。公司根表的未受管 Sheet 必须保持；驻所输入别名不会改变正式输出身份。
 
+用户明确要求整理发放记录时才进入发放归档。准备好经过来源绑定的 manifest 后，只执行一次：
+
+```bash
+node scripts/run_compact_disbursement_workflow.mjs --archive <request.json>
+```
+
+`request.json` 必须严格为以下四字段结构，不接受批准口令、Gate、`statePath`、binding 或其他旧字段：
+
+```json
+{
+  "kind": "compact-disbursement-archive-v1",
+  "stagingToken": "<本次暂存令牌>",
+  "manifestPath": "<manifest 绝对路径>",
+  "manifestSha256": "<manifest SHA256>"
+}
+```
+
 ## 仓库内容
 
 - `SKILL.md`：唯一公开工作流入口和阶段路由；
 - `references/ledger-profiles.json`：三 profile 的 canonical 配置；
 - `scripts/run_reimbursement_workflow.mjs`：普通报销 prepare/finalize/publish 总控；
+- `scripts/run_compact_disbursement_workflow.mjs`：发放归档的唯一 `--archive` CLI；
+- `scripts/disbursement_*.mjs`：发放 manifest、领域规则、候选生成、审计和原子归档实现；
 - `scripts/`：manifest、XLSX 构建、OOXML facts、transition、业务审计和安全发布实现；
 - `assets/templates/xiaohongshu/`：经 SHA256 绑定的四个脱敏工作簿模板、文字说明模板和单一 `template-manifest.json`；模板只保存静态样式，成品按本批事实生成动态合并、行高、斑马色、公式和等比图片锚点；
+- `assets/templates/disbursement/`：发放说明与核对表模板及其样式契约；
+- `references/compact-disbursement.md`：严格四字段、无人工 Gate 的发放归档契约；
 - `references/gate2-full-correspondence.md`：Gate 2 逐交易、逐媒体和逐工件的独立复核契约；
-- `tests/`：单元、真实 XLSX、安全、恢复和性能测试。
+- `tests/`：普通报销与发放归档的单元、真实 XLSX、安全、恢复、隔离和性能测试。
 
 仓库不包含真实报销截图、财务数据、账号凭证或本机财务路径。
 
-## 当前候选验收
+## 当前候选验证与性能口径
 
-- 顺序完整回归：346 项，344 通过、0 失败、2 项按环境条件跳过。
-- 相对 `0.5.0+codex.20260819174146` 的同机交替 7×7：冷启动 `990.062ms → 668.146ms`，提速 32.515%；热运行 `810.233ms → 550.300ms`，提速 32.081%。
-- 新版计时包含 Gate 2 对 7 类工件、全部唯一源图和归档媒体的独立读取、完整解码、逐项对应审计及报告生成；不包含外部人工/模型形成第二遍视觉观察的等待时间。
+- 普通报销继续使用 Gate 1/Gate 2；发放归档是一次调用完成的独立无人工 Gate 流程。两者不共享状态、来源扫描或发布入口。
+- 20% 只作为默认信息性改善目标，不是通过硬门。保留已证明有效且安全的优化；不为跨过 20% 叠加未证明收益的复杂度。验收守卫仍是输出完全等价、p95 不退化、RSS 无明显恶化，并保持普通流程预览 PNG 唯一性。
+- H 线正式对比（只读旧安装缓存与未修改目标版）记录的冷、热改善分别为 `34.159%`、`34.148%`。
+- O 线 r12 信息性诊断（未修改目标版与当前普通报销优化版）记录的冷、热 p50 改善分别为 `18.311%`、`23.142%`；冷启动未达到 20%，如实保留为信息性结果，不写成“20% 门槛通过”。该次诊断输出等价、PNG 唯一性及 RSS 条件通过。
+- 新版普通报销计时包含 Gate 2 对 7 类工件、全部唯一源图和归档媒体的独立读取、完整解码、逐项对应审计及报告生成；不包含外部人工/模型形成第二遍视觉观察的等待时间。
 - 普通总表预览只含本批投影；预览失败只重跑渲染，不重建候选、交付表或证据。
-- JPEG 允许仅缺少 EOI 但仍可严格完整解码的输入；扫描数据截断、无有效 SOF、超出 25 MiB 或像素上限的媒体会被拒绝，归档始终保留原始字节和 SHA256。
+- JPEG 允许仅缺少 EOI 但仍可严格完整解码的输入；扫描数据截断、无有效 SOF、超出 25 MiB 或像素上限的媒体会被拒绝，归档始终保留原始字节和 SHA256。发放 PDF 还会逐页解析内容流，并拒绝加密、损坏、超限或无法完整解析的文件。

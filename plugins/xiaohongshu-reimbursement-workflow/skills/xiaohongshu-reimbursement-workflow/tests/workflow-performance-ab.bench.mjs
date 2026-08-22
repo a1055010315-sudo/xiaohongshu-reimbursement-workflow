@@ -11,9 +11,15 @@
  * inside it.
  *
  * Examples:
- *   node tests/workflow-performance-ab.bench.mjs --old-root=<verified-baseline-skill-root> --renderer=fake
- *   node tests/workflow-performance-ab.bench.mjs --old-root=<verified-baseline-skill-root> --renderer=com
- *   node tests/workflow-performance-ab.bench.mjs --old-root=<verified-baseline-skill-root> --renderer=fake --diagnostic --samples=1
+ *   node tests/workflow-performance-ab.bench.mjs --line=H --old-root=<19174146-skill-root> --new-root=<unmodified-21073607-skill-root> --renderer=fake
+ *   node tests/workflow-performance-ab.bench.mjs --line=O --identity-only --old-root=<unmodified-21073607-skill-root> --new-root=<candidate-skill-root>
+ *   node tests/workflow-performance-ab.bench.mjs --line=H --old-root=<19174146-skill-root> --new-root=<unmodified-21073607-skill-root> --renderer=fake --diagnostic --samples=1 --warmups=0
+ *
+ * O acceptance additionally requires the six identity values printed by
+ * --identity-only. Acceptance never permits fewer than 11 timed pairs or two
+ * warm-ups. The configured improvement percentage is reported as an
+ * informational target; p95 non-regression, RSS and output safeguards decide
+ * acceptance.
  */
 
 import { spawn, spawnSync } from "node:child_process";
@@ -25,16 +31,48 @@ import process from "node:process";
 import { performance } from "node:perf_hooks";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
+import {
+  evaluateStrictPerformanceAcceptance,
+  improvementPercent,
+  pairedBootstrapImprovement,
+  summarizeDistribution,
+} from "../scripts/performance_statistics.mjs";
+import { loadBundledDependency } from "../scripts/workflow_primitives.mjs";
+import {
+  assertStableFileSnapshotCurrent,
+  openWorkbookSnapshot,
+  readStableFileSnapshot,
+} from "../scripts/workbook_snapshot.mjs";
+
 const SCRIPT_PATH = fileURLToPath(import.meta.url);
+const STATISTICS_PATH = path.resolve(path.dirname(SCRIPT_PATH), "..", "scripts", "performance_statistics.mjs");
 const DEFAULT_NEW_ROOT = path.resolve(path.dirname(SCRIPT_PATH), "..");
-const DEFAULT_SAMPLES = 7;
+const DEFAULT_SAMPLES = 11;
+const DEFAULT_WARMUPS = 2;
 const DEFAULT_THRESHOLD_PERCENT = 20;
-const BENCHMARK_KIND = "xiaohongshu-workflow-performance-ab-v1";
+const BENCHMARK_KIND = "xiaohongshu-workflow-performance-ab-v2";
 const FIXTURE_KIND = "xiaohongshu-workflow-performance-fixture-v1";
-const SAMPLE_KIND = "xiaohongshu-workflow-performance-sample-v1";
+const SAMPLE_KIND = "xiaohongshu-workflow-performance-sample-v2";
+const PLUGIN_NAME = "xiaohongshu-reimbursement-workflow";
+const BENCHMARK_LINES = new Set(["H", "O"]);
+const SHA_RE = /^[0-9a-f]{64}$/u;
+const H_IDENTITY_LOCK = Object.freeze({
+  old: Object.freeze({
+    version: "0.5.0+codex.20260819174146",
+    skillTreeSha256: "df2943f536af035724e8d00fd471888df28b975f83a2bb86640c1f7eb8d812a5",
+    packageTreeSha256: "4dcce05f00e92a54ff339cb4485979307bbc5f7b062374355acc1f574e07986c",
+  }),
+  new: Object.freeze({
+    version: "0.5.0+codex.20260821073607",
+    skillTreeSha256: "2188793cf320dfece7289b719fbaaefecdc3949aff411c3ad2a8088b62c92ef5",
+    packageTreeSha256: "48b9243e7b0364693b9e91a4ccaf563825bc06e7889fb52bec2f2aff0c044f3a",
+  }),
+});
 // Keep the owned prefix short: Excel COM and Windows PowerShell still encounter
 // legacy MAX_PATH behavior for deeply nested preview request names.
 const SAFE_TEMP_PREFIX = "codex-xhs-ab-";
+const JSZipModule = loadBundledDependency("jszip");
+const JSZip = JSZipModule.default ?? JSZipModule;
 
 function sha256(bytes) {
   return crypto.createHash("sha256").update(bytes).digest("hex");
@@ -46,31 +84,64 @@ function jsonBytes(value) {
 
 function parseArgs(argv) {
   const result = {
+    line: "H",
     renderer: "fake",
     samples: DEFAULT_SAMPLES,
+    warmups: DEFAULT_WARMUPS,
     threshold: DEFAULT_THRESHOLD_PERCENT,
     diagnostic: false,
+    identityOnly: false,
     output: null,
     oldRoot: process.env.XHS_BENCH_OLD_ROOT ? path.resolve(process.env.XHS_BENCH_OLD_ROOT) : null,
     newRoot: process.env.XHS_BENCH_NEW_ROOT ? path.resolve(process.env.XHS_BENCH_NEW_ROOT) : DEFAULT_NEW_ROOT,
   };
   for (const argument of argv) {
     if (argument === "--diagnostic") result.diagnostic = true;
+    else if (argument === "--identity-only") result.identityOnly = true;
+    else if (argument.startsWith("--line=")) result.line = argument.slice("--line=".length).toUpperCase();
     else if (argument.startsWith("--renderer=")) result.renderer = argument.slice("--renderer=".length);
     else if (argument.startsWith("--samples=")) result.samples = Number(argument.slice("--samples=".length));
+    else if (argument.startsWith("--warmups=")) result.warmups = Number(argument.slice("--warmups=".length));
     else if (argument.startsWith("--threshold=")) result.threshold = Number(argument.slice("--threshold=".length));
     else if (argument.startsWith("--output=")) result.output = path.resolve(argument.slice("--output=".length));
     else if (argument.startsWith("--old-root=")) result.oldRoot = path.resolve(argument.slice("--old-root=".length));
     else if (argument.startsWith("--new-root=")) result.newRoot = path.resolve(argument.slice("--new-root=".length));
+    else if (argument.startsWith("--old-version=")) result.oldVersion = argument.slice("--old-version=".length);
+    else if (argument.startsWith("--new-version=")) result.newVersion = argument.slice("--new-version=".length);
+    else if (argument.startsWith("--old-skill-sha256=")) result.oldSkillSha256 = argument.slice("--old-skill-sha256=".length);
+    else if (argument.startsWith("--new-skill-sha256=")) result.newSkillSha256 = argument.slice("--new-skill-sha256=".length);
+    else if (argument.startsWith("--old-package-sha256=")) result.oldPackageSha256 = argument.slice("--old-package-sha256=".length);
+    else if (argument.startsWith("--new-package-sha256=")) result.newPackageSha256 = argument.slice("--new-package-sha256=".length);
     else throw new Error(`unknown argument: ${argument}`);
   }
+  if (!BENCHMARK_LINES.has(result.line)) throw new Error("--line must be H or O");
   if (!new Set(["fake", "com"]).has(result.renderer)) throw new Error("--renderer must be fake or com");
   if (!result.oldRoot) throw new Error("verified baseline root is required: pass --old-root=... or set XHS_BENCH_OLD_ROOT");
   if (!Number.isSafeInteger(result.samples) || result.samples < 1) throw new Error("--samples must be a positive integer");
+  if (!Number.isSafeInteger(result.warmups) || result.warmups < 0) throw new Error("--warmups must be a non-negative integer");
   if (!result.diagnostic && result.samples < DEFAULT_SAMPLES) throw new Error(`acceptance mode requires at least ${DEFAULT_SAMPLES} samples per version and temperature`);
+  if (!result.diagnostic && result.warmups < DEFAULT_WARMUPS) throw new Error(`acceptance mode requires at least ${DEFAULT_WARMUPS} untimed warm-ups per version and temperature`);
   if (!Number.isFinite(result.threshold) || result.threshold < 0 || result.threshold > 100) throw new Error("--threshold must be between 0 and 100");
+  const explicitIdentityFields = ["oldVersion", "newVersion", "oldSkillSha256", "newSkillSha256", "oldPackageSha256", "newPackageSha256"];
+  for (const field of explicitIdentityFields.filter((name) => name.endsWith("Sha256"))) {
+    if (result[field] !== undefined && !SHA_RE.test(result[field])) throw new Error(`--${field.replaceAll(/[A-Z]/gu, (value) => `-${value.toLowerCase()}`)} must be a lowercase SHA-256 digest`);
+  }
+  const explicitCount = explicitIdentityFields.filter((field) => result[field] !== undefined).length;
+  if (explicitCount !== 0 && explicitCount !== explicitIdentityFields.length) throw new Error("an explicit identity lock must provide both versions and all four tree digests");
+  if (!result.diagnostic && !result.identityOnly && result.line === "O" && explicitCount !== explicitIdentityFields.length) throw new Error("O acceptance requires an explicit six-field identity lock");
+  result.identityLock = explicitCount === explicitIdentityFields.length
+    ? {
+        source: "explicit-cli",
+        old: { version: result.oldVersion, skillTreeSha256: result.oldSkillSha256, packageTreeSha256: result.oldPackageSha256 },
+        new: { version: result.newVersion, skillTreeSha256: result.newSkillSha256, packageTreeSha256: result.newPackageSha256 },
+      }
+    : result.line === "H"
+      ? { source: "built-in-H-v1", old: { ...H_IDENTITY_LOCK.old }, new: { ...H_IDENTITY_LOCK.new } }
+      : null;
   return result;
 }
+
+export const parseBenchmarkArgs = parseArgs;
 
 function workerArg(name) {
   const prefix = `--${name}=`;
@@ -110,6 +181,38 @@ function parseMoney(value) {
   if (!match) throw new Error(`benchmark amount is not fixed-point: ${value}`);
   const fraction = (match[3] ?? "").padEnd(2, "0");
   return (match[1] ? -1n : 1n) * (BigInt(match[2]) * 100n + BigInt(fraction || "0"));
+}
+
+function compactIsoDate(value) {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/u.exec(value);
+  if (!match) throw new Error(`benchmark date is not ISO: ${value}`);
+  return `${match[1]}.${Number(match[2])}.${Number(match[3])}`;
+}
+
+function canonicalMoney(cents) {
+  return formatMoney(cents).replace(/\.00$/u, "").replace(/(\.\d)0$/u, "$1");
+}
+
+function expectedOrdinaryArchiveName(mainPeriod, targetCategory, transactions) {
+  const period = mainPeriod.start === mainPeriod.end
+    ? compactIsoDate(mainPeriod.start)
+    : `${compactIsoDate(mainPeriod.start)}-${compactIsoDate(mainPeriod.end)}`;
+  const groups = new Map();
+  for (const transaction of transactions) {
+    if (transaction.reportingKind !== "supplement") continue;
+    const items = groups.get(transaction.person) ?? [];
+    items.push(transaction);
+    groups.set(transaction.person, items);
+  }
+  const supplements = [...groups.entries()].map(([person, items]) => {
+    const ordered = [...items].sort((left, right) => left.date.localeCompare(right.date) || left.sourceOrder - right.sourceOrder);
+    const start = ordered[0].date;
+    const end = ordered.at(-1).date;
+    const supplementPeriod = start === end ? compactIsoDate(start) : `${compactIsoDate(start)}-${compactIsoDate(end)}`;
+    const amount = canonicalMoney(ordered.reduce((sum, item) => sum + parseMoney(item.reimbursementAmount), 0n));
+    return `${person}${supplementPeriod}补报${ordered.length}笔${amount}元`;
+  });
+  return `${period}_${targetCategory}${supplements.length ? `（含${supplements.join("、")}）` : ""}`;
 }
 
 async function writeExclusive(filePath, bytes) {
@@ -170,7 +273,7 @@ function fileEntry(id, role, entry, extra = {}) {
   return { id, role, path: entry.path, sha256: entry.sha256, ...extra };
 }
 
-async function buildFixture(benchmarkRoot, oldRoot, newRoot) {
+async function buildFixture(benchmarkRoot, oldRoot, newRoot, benchmarkLine) {
   const inputRoot = path.join(benchmarkRoot, "input");
   await fs.mkdir(inputRoot, { recursive: false });
   const primitives = await import(pathToFileURL(path.join(newRoot, "scripts", "workflow_primitives.mjs")).href);
@@ -186,8 +289,22 @@ async function buildFixture(benchmarkRoot, oldRoot, newRoot) {
     ["V-E", "voucher-e.jpg", { width: 696, height: 522, format: "jpeg", seed: 17 }, "voucher"],
     ["V-F", "voucher-f.png", { width: 712, height: 534, format: "png", seed: 19 }, "voucher"],
   ];
+  const previewDefinitions = ["xiaohongshu", "company", "residence"].flatMap((profileId, profileIndex) =>
+    ["root", "detail", "screenshot"].map((role, roleIndex) => ({
+      key: `${profileId}:${role}`,
+      profileId,
+      role,
+      name: `preview-${profileId}-${role}.png`,
+      definition: { width: 820 + roleIndex * 17, height: 610 + profileIndex * 13, format: "png", seed: 101 + profileIndex * 11 + roleIndex * 3 },
+    })),
+  );
   const images = new Map();
   for (const [id, name, definition, usage] of imageDefinitions) images.set(id, { ...(await makeSyntheticImage(path.join(inputRoot, name), definition, sharp)), id, usage });
+  const fakePreviews = [];
+  for (const item of previewDefinitions) {
+    fakePreviews.push({ ...item, ...(await makeSyntheticImage(path.join(inputRoot, item.name), item.definition, sharp)) });
+  }
+  if (new Set(fakePreviews.map((item) => item.sha256)).size !== fakePreviews.length) throw new Error("synthetic fake preview PNGs are not byte-distinct");
   const rawTransactions = [
     ["TX-A01", "2034-05-11", "匿名甲", "当期事项一", "运营开支", "112.37", "109.11", "current", "employee_reimbursement", ["V-A"]],
     ["TX-A02", "2034-05-12", "匿名乙", "当期事项二", "广告费", "245.68", "245.68", "current", "employee_reimbursement", ["CTX"]],
@@ -239,7 +356,11 @@ async function buildFixture(benchmarkRoot, oldRoot, newRoot) {
     batch: {
       batchId: "anonymous-performance-batch-2034-05",
       rootPath: inputRoot,
-      archivePath: path.join(inputRoot, "2034.5.11-2034.5.17_小红书报销_匿名性能夹具"),
+      archivePath: path.join(inputRoot, expectedOrdinaryArchiveName(
+        { start: "2034-05-11", end: "2034-05-17" },
+        "小红书报销",
+        transactions,
+      )),
       period: "2034.5.11-2034.5.17",
       mainPeriod: { start: "2034-05-11", end: "2034-05-17" },
       targetCategory: "小红书报销",
@@ -281,7 +402,6 @@ async function buildFixture(benchmarkRoot, oldRoot, newRoot) {
       facts: [{ transactionId: transaction.id, date: transaction.date, person: transaction.person, project: transaction.project, sourceAmount: transaction.sourceAmount }],
     };
   });
-  const fakePng = images.get("CTX");
   const metadata = {
     kind: FIXTURE_KIND,
     inputRoot,
@@ -290,8 +410,9 @@ async function buildFixture(benchmarkRoot, oldRoot, newRoot) {
     expected: manifest.expected,
     sourceCoverageDigest: audited.sourceCoverageDigest,
     observations,
-    fakePng: { path: fakePng.path, sha256: fakePng.sha256, size: fakePng.size },
+    fakePreviews: fakePreviews.map(({ key, profileId, role, path: previewPath, sha256: digest, size, width, height, format }) => ({ key, profileId, role, path: previewPath, sha256: digest, size, width, height, format })),
     roots: { old: oldRoot, new: newRoot },
+    benchmarkLine,
   };
   const metadataFile = await writeExclusive(path.join(benchmarkRoot, "fixture.json"), jsonBytes(metadata));
   return { ...metadata, metadataPath: metadataFile.path };
@@ -299,6 +420,7 @@ async function buildFixture(benchmarkRoot, oldRoot, newRoot) {
 
 async function treeDigest(root) {
   const digest = crypto.createHash("sha256");
+  let fileCount = 0;
   async function visit(directory, prefix = "") {
     const entries = await fs.readdir(directory, { withFileTypes: true });
     entries.sort((left, right) => left.name.localeCompare(right.name));
@@ -307,6 +429,7 @@ async function treeDigest(root) {
       const absolute = path.join(directory, entry.name);
       if (entry.isDirectory()) await visit(absolute, relative);
       else if (entry.isFile()) {
+        fileCount += 1;
         digest.update(relative, "utf8");
         digest.update("\0");
         digest.update(await fs.readFile(absolute));
@@ -315,7 +438,96 @@ async function treeDigest(root) {
     }
   }
   await visit(root);
-  return digest.digest("hex");
+  return { sha256: digest.digest("hex"), fileCount };
+}
+
+function ordinalCompare(left, right) {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
+async function packageTreeDigest(root) {
+  const files = [];
+  async function visit(directory, prefix = "") {
+    const entries = await fs.readdir(directory, { withFileTypes: true });
+    for (const entry of entries) {
+      const relative = prefix ? `${prefix}/${entry.name}` : entry.name;
+      const absolute = path.join(directory, entry.name);
+      if (entry.isDirectory()) await visit(absolute, relative);
+      else if (entry.isFile()) files.push({ relative, absolute });
+      else throw new Error(`plugin package may not contain links or special entries: ${absolute}`);
+    }
+  }
+  await visit(root);
+  files.sort((left, right) => ordinalCompare(left.relative.toLowerCase(), right.relative.toLowerCase()) || ordinalCompare(left.relative, right.relative));
+  const digest = crypto.createHash("sha256");
+  for (const file of files) {
+    const fileSha256 = sha256(await fs.readFile(file.absolute));
+    digest.update(file.relative, "utf8");
+    digest.update("\0");
+    digest.update(fileSha256, "utf8");
+    digest.update("\n");
+  }
+  return { sha256: digest.digest("hex"), fileCount: files.length };
+}
+
+function samePath(left, right) {
+  const normalizedLeft = path.resolve(left);
+  const normalizedRight = path.resolve(right);
+  return process.platform === "win32" ? normalizedLeft.toLowerCase() === normalizedRight.toLowerCase() : normalizedLeft === normalizedRight;
+}
+
+export async function inspectBenchmarkRoot(skillRoot) {
+  const requestedSkillRoot = path.resolve(skillRoot);
+  const canonicalSkillRoot = await fs.realpath(requestedSkillRoot);
+  const skillsDirectory = path.dirname(canonicalSkillRoot);
+  if (path.basename(skillsDirectory).toLowerCase() !== "skills") throw new Error(`workflow skill root is not directly inside a skills directory: ${requestedSkillRoot}`);
+  const packageRoot = path.dirname(skillsDirectory);
+  const canonicalPackageRoot = await fs.realpath(packageRoot);
+  if (!within(canonicalPackageRoot, canonicalSkillRoot)) throw new Error(`workflow skill root escapes its plugin package: ${requestedSkillRoot}`);
+  const manifestPath = path.join(canonicalPackageRoot, ".codex-plugin", "plugin.json");
+  const manifestBytes = await fs.readFile(manifestPath);
+  const manifest = JSON.parse(manifestBytes.toString("utf8"));
+  if (manifest.name !== PLUGIN_NAME || typeof manifest.version !== "string" || !manifest.version) throw new Error(`plugin manifest identity is invalid: ${manifestPath}`);
+  const [skillTree, packageTree] = await Promise.all([treeDigest(canonicalSkillRoot), packageTreeDigest(canonicalPackageRoot)]);
+  return {
+    requestedSkillRoot,
+    canonicalSkillRoot,
+    canonicalPackageRoot,
+    manifestPath,
+    manifestSha256: sha256(manifestBytes),
+    pluginName: manifest.name,
+    version: manifest.version,
+    skillTreeSha256: skillTree.sha256,
+    skillFileCount: skillTree.fileCount,
+    packageTreeSha256: packageTree.sha256,
+    packageFileCount: packageTree.fileCount,
+  };
+}
+
+export function assertIdentityLock(actual, expected, label) {
+  if (!expected) throw new Error(`${label} has no explicit identity lock.`);
+  for (const field of ["version", "skillTreeSha256", "packageTreeSha256"]) {
+    if (actual[field] !== expected[field]) throw new Error(`${label} ${field} differs from the locked identity: expected ${expected[field]}, observed ${actual[field]}`);
+  }
+}
+
+export function assertUnchangedIdentity(before, after, label) {
+  for (const field of ["canonicalSkillRoot", "canonicalPackageRoot", "manifestSha256", "version", "skillTreeSha256", "skillFileCount", "packageTreeSha256", "packageFileCount"]) {
+    const equal = field.startsWith("canonical") ? samePath(before[field], after[field]) : before[field] === after[field];
+    if (!equal) throw new Error(`${label} changed during benchmark (${field}); discard all mixed-version samples.`);
+  }
+}
+
+async function benchmarkHarnessIdentity() {
+  const [scriptBytes, statisticsBytes] = await Promise.all([fs.readFile(SCRIPT_PATH), fs.readFile(STATISTICS_PATH)]);
+  return {
+    kind: "xiaohongshu-performance-harness-identity-v1",
+    benchmarkPath: SCRIPT_PATH,
+    benchmarkSha256: sha256(scriptBytes),
+    statisticsPath: STATISTICS_PATH,
+    statisticsSha256: sha256(statisticsBytes),
+    combinedSha256: sha256(jsonBytes({ benchmarkSha256: sha256(scriptBytes), statisticsSha256: sha256(statisticsBytes) })),
+  };
 }
 
 async function readFixture(metadataPath) {
@@ -334,13 +546,39 @@ async function safeRemoveRunRoot(benchmarkRoot, runRoot) {
   await fs.rm(runRoot, { recursive: true, force: true });
 }
 
-function makeFakeRenderer(pngBytes, pngSha256) {
+export function assertDistinctFakePreviewAssets(assets) {
+  if (!Array.isArray(assets) || assets.length < 1) throw new Error("fake renderer requires preview assets");
+  const keys = new Set();
+  const digests = new Set();
+  for (const [index, asset] of assets.entries()) {
+    if (!asset || typeof asset !== "object" || typeof asset.key !== "string" || !asset.key) throw new Error(`fake preview asset ${index} has no key`);
+    if (keys.has(asset.key)) throw new Error(`fake preview asset key is duplicated: ${asset.key}`);
+    keys.add(asset.key);
+    if (!Buffer.isBuffer(asset.bytes) || asset.bytes.length < 1_000 || !asset.bytes.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) {
+      throw new Error(`fake preview asset ${asset.key} is not a semantically valid benchmark PNG`);
+    }
+    const actualSha256 = sha256(asset.bytes);
+    if (asset.sha256 !== actualSha256) throw new Error(`fake preview asset ${asset.key} SHA-256 differs from its bytes`);
+    if (digests.has(actualSha256)) throw new Error("fake renderer refuses identical PNG bytes for different preview bindings");
+    digests.add(actualSha256);
+  }
+  return true;
+}
+
+export function makeFakeRenderer(assets) {
+  assertDistinctFakePreviewAssets(assets);
+  const byKey = new Map(assets.map((asset) => [asset.key, asset]));
   return async ({ request, requestFileSha256 }) => {
     const previews = [];
+    const usedDigests = new Set();
     for (const job of request.jobs) {
-      await fs.writeFile(job.outputPath, pngBytes, { flag: "wx" });
+      const asset = byKey.get(`${job.profileId}:${job.role}`);
+      if (!asset) throw new Error(`fake renderer has no PNG for ${job.profileId}:${job.role}`);
+      if (usedDigests.has(asset.sha256)) throw new Error("fake renderer refuses to reuse one PNG for two preview jobs");
+      usedDigests.add(asset.sha256);
+      await fs.writeFile(job.outputPath, asset.bytes, { flag: "wx" });
       if (request.kind === "ordinary-reimbursement-preview-request-v1") {
-        previews.push({ profileId: job.profileId, role: job.role, workbookSha256: job.workbookSha256, outputPath: job.outputPath, sha256: pngSha256, size: pngBytes.length });
+        previews.push({ profileId: job.profileId, role: job.role, workbookSha256: job.workbookSha256, outputPath: job.outputPath, sha256: asset.sha256, size: asset.bytes.length });
       } else if (request.kind === "ordinary-reimbursement-preview-request-v2") {
         previews.push({
           profileId: job.profileId,
@@ -354,8 +592,8 @@ function makeFakeRenderer(pngBytes, pngSha256) {
           batchRows: [...job.batchRows],
           bindingDigest: job.bindingDigest,
           outputPath: job.outputPath,
-          sha256: pngSha256,
-          size: pngBytes.length,
+          sha256: asset.sha256,
+          size: asset.bytes.length,
           renderAttempts: 1,
         });
       } else throw new Error(`fake renderer does not support ${request.kind}`);
@@ -421,8 +659,10 @@ export function __benchmarkArtifactMetrics() { return structuredClone(__artifact
   const bytes = await zip.generateAsync({ type: "nodebuffer", compression: "DEFLATE", compressionOptions: { level: 6 }, platform: "DOS" });
   __artifactProfile.workbookGenerateMs += performance.now() - __generateStarted;`);
   source = replaceOnce(source,
-    "  let created = false;\n  try {\n    const handle = await fs.open(filePath, \"wx\", 0o600);",
-    `  let created = false;
+    "  __artifactProfile.workbookGenerateMs += performance.now() - __generateStarted;\n  const expectedSha256 = sha256Bytes(bytes);\n  let created = false;\n  try {\n    const handle = await fs.open(filePath, \"wx\", 0o600);",
+    `  __artifactProfile.workbookGenerateMs += performance.now() - __generateStarted;
+  const expectedSha256 = sha256Bytes(bytes);
+  let created = false;
   try {
     const __writeStarted = performance.now();
     const handle = await fs.open(filePath, "wx", 0o600);`);
@@ -472,8 +712,261 @@ export function __benchmarkArtifactMetrics() { return structuredClone(__artifact
   return import(pathToFileURL(instrumentedPath).href);
 }
 
+function beginResourceObservation() {
+  const rssStartBytes = process.memoryUsage().rss;
+  let sampledPeakRssBytes = rssStartBytes;
+  let sampleCount = 1;
+  const startedUsage = process.resourceUsage();
+  const startedCpu = process.cpuUsage();
+  const intervalMs = 5;
+  const timer = setInterval(() => {
+    sampledPeakRssBytes = Math.max(sampledPeakRssBytes, process.memoryUsage().rss);
+    sampleCount += 1;
+  }, intervalMs);
+  timer.unref();
+  return () => {
+    clearInterval(timer);
+    const rssEndBytes = process.memoryUsage().rss;
+    sampledPeakRssBytes = Math.max(sampledPeakRssBytes, rssEndBytes);
+    sampleCount += 1;
+    const endedUsage = process.resourceUsage();
+    const cpu = process.cpuUsage(startedCpu);
+    return {
+      measurement: "node-process-resource-observation-v1",
+      rssScope: "benchmark-worker-node-process-only",
+      rssStartBytes,
+      rssEndBytes,
+      sampledPeakRssBytes,
+      rssSamplingIntervalMs: intervalMs,
+      rssSampleCount: sampleCount,
+      processMaxRssKilobytes: endedUsage.maxRSS,
+      cpuUserMicroseconds: cpu.user,
+      cpuSystemMicroseconds: cpu.system,
+      fsReadOperations: endedUsage.fsRead - startedUsage.fsRead,
+      fsWriteOperations: endedUsage.fsWrite - startedUsage.fsWrite,
+      involuntaryContextSwitches: endedUsage.involuntaryContextSwitches - startedUsage.involuntaryContextSwitches,
+      voluntaryContextSwitches: endedUsage.voluntaryContextSwitches - startedUsage.voluntaryContextSwitches,
+      ioBytes: null,
+      ioBytesReason: "Node process.resourceUsage exposes operation counters, not portable byte counts.",
+    };
+  };
+}
+
+function mergeResourceObservations(observations) {
+  if (!Array.isArray(observations) || observations.length < 1) throw new Error("resource observations are missing");
+  const sum = (field) => observations.reduce((total, item) => total + item[field], 0);
+  return {
+    measurement: "node-process-resource-observation-v1",
+    rssScope: "benchmark-worker-node-process-only",
+    measuredSegments: ["import-and-prepare", "finalize"],
+    rssStartBytes: observations[0].rssStartBytes,
+    rssEndBytes: observations.at(-1).rssEndBytes,
+    sampledPeakRssBytes: Math.max(...observations.map((item) => item.sampledPeakRssBytes)),
+    rssSamplingIntervalMs: observations[0].rssSamplingIntervalMs,
+    rssSampleCount: sum("rssSampleCount"),
+    processMaxRssKilobytes: Math.max(...observations.map((item) => item.processMaxRssKilobytes)),
+    cpuUserMicroseconds: sum("cpuUserMicroseconds"),
+    cpuSystemMicroseconds: sum("cpuSystemMicroseconds"),
+    fsReadOperations: sum("fsReadOperations"),
+    fsWriteOperations: sum("fsWriteOperations"),
+    involuntaryContextSwitches: sum("involuntaryContextSwitches"),
+    voluntaryContextSwitches: sum("voluntaryContextSwitches"),
+    ioBytes: null,
+    ioBytesReason: observations[0].ioBytesReason,
+  };
+}
+
+function assertShaOrNull(value, field, { required = false } = {}) {
+  if (value === null && !required) return null;
+  if (!SHA_RE.test(value)) throw new Error(`${field} must be a lowercase SHA-256 digest${required ? "" : " or null"}`);
+  return value;
+}
+
+export function assertOrdinaryOutputContract(value, { requirePublished = false } = {}) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("ordinary output contract must be an object");
+  const keys = Object.keys(value).sort();
+  const expected = ["businessFactsDigest", "candidateArtifactDigest", "publishedArtifactDigest", "publishedShapeDigest"].sort();
+  if (JSON.stringify(keys) !== JSON.stringify(expected)) throw new Error("ordinary output contract fields are not exact");
+  assertShaOrNull(value.businessFactsDigest, "businessFactsDigest", { required: true });
+  assertShaOrNull(value.candidateArtifactDigest, "candidateArtifactDigest", { required: true });
+  assertShaOrNull(value.publishedArtifactDigest, "publishedArtifactDigest", { required: requirePublished });
+  assertShaOrNull(value.publishedShapeDigest, "publishedShapeDigest", { required: requirePublished });
+  return value;
+}
+
+async function readPreparedOutputContract(statePath) {
+  const state = JSON.parse(await fs.readFile(statePath, "utf8"));
+  const semantic = {
+    factsDigest: state.factsDigest ?? state.certificate?.factsDigest ?? null,
+    sourceCoverageDigest: state.certificate?.sourceCoverageDigest ?? null,
+    profileConfigDigest: state.certificate?.profileConfigDigest ?? null,
+    affectedProfileIds: [...(state.affectedProfileIds ?? [])],
+  };
+  const artifacts = [];
+  for (const item of state.rootBuild?.artifacts ?? []) {
+    artifacts.push(await snapshotArtifactBinding(
+      { path: item.candidatePath, sha256: item.candidateSha256, size: item.candidateSize },
+      `${item.profileId}:root`,
+      "candidate",
+    ));
+  }
+  for (const item of state.presentationBuild?.artifacts ?? []) {
+    for (const role of ["detail", "screenshot", "summary"]) {
+      artifacts.push(await snapshotArtifactBinding(item[role], `${item.profileId}:${role}`, "candidate"));
+    }
+    for (const [index, supplement] of (item.supplements ?? []).entries()) {
+      artifacts.push(await snapshotArtifactBinding(supplement, `${item.profileId}:supplement:${String(index + 1).padStart(3, "0")}`, "candidate"));
+    }
+    for (const [index, evidence] of (item.evidenceArchive ?? []).entries()) {
+      artifacts.push(await snapshotArtifactBinding(evidence, `${item.profileId}:evidence:${String(index + 1).padStart(3, "0")}`, "candidate"));
+    }
+  }
+  artifacts.sort((left, right) => ordinalCompare(left.identity, right.identity));
+  return assertOrdinaryOutputContract({
+    businessFactsDigest: sha256(jsonBytes(semantic)),
+    candidateArtifactDigest: sha256(jsonBytes({ kind: "ordinary-candidate-artifacts-v2", artifacts })),
+    publishedArtifactDigest: null,
+    publishedShapeDigest: null,
+  });
+}
+
+async function canonicalOpcArtifact(filePath, stableSnapshot) {
+  const workbook = await openWorkbookSnapshot(stableSnapshot, {});
+  const rawBytes = await fs.readFile(filePath);
+  if (sha256(rawBytes) !== stableSnapshot.sha256 || rawBytes.length !== stableSnapshot.size) {
+    throw new Error(`workbook changed before canonical OPC hashing: ${filePath}`);
+  }
+  const zip = await JSZip.loadAsync(rawBytes, { checkCRC32: true, createFolders: false });
+  const parts = [];
+  for (const part of [...workbook.parts].sort((left, right) => ordinalCompare(left.name, right.name))) {
+    if (part.directory) {
+      parts.push({ name: part.name, type: "directory" });
+      continue;
+    }
+    const entry = zip.files[part.name];
+    if (!entry || entry.dir) throw new Error(`canonical OPC part is missing or changed type: ${part.name}`);
+    const bytes = await entry.async("nodebuffer");
+    parts.push({ name: part.name, type: "file", sha256: sha256(bytes), size: bytes.length });
+  }
+  await assertStableFileSnapshotCurrent(stableSnapshot);
+  return {
+    contentKind: "canonical-opc-parts-v1",
+    contentSha256: sha256(jsonBytes({ kind: "canonical-opc-parts-v1", parts })),
+    partCount: parts.length,
+  };
+}
+
+async function snapshotArtifactBinding(binding, identity, source = "published") {
+  if (!binding || typeof binding !== "object" || typeof binding.path !== "string" || !SHA_RE.test(binding.sha256)) {
+    throw new Error(`${source} binding ${identity} is incomplete`);
+  }
+  const resolved = path.resolve(binding.path);
+  const stats = await fs.lstat(resolved);
+  if (!stats.isFile() || stats.isSymbolicLink()) throw new Error(`${source} binding ${identity} is not a regular file`);
+  const stable = await readStableFileSnapshot(resolved, {});
+  if (stable.sha256 !== binding.sha256) throw new Error(`${source} binding ${identity} differs from its bound SHA-256`);
+  if (binding.size !== undefined && binding.size !== stable.size) throw new Error(`${source} binding ${identity} differs from its bound size`);
+  const common = { identity, name: path.basename(resolved) };
+  if (path.extname(resolved).toLowerCase() === ".xlsx") return { ...common, ...(await canonicalOpcArtifact(resolved, stable)) };
+  await assertStableFileSnapshotCurrent(stable);
+  return { ...common, contentKind: "raw-file-v1", contentSha256: stable.sha256, size: stable.size };
+}
+
+async function snapshotPublishedTree(directoryPath) {
+  const root = path.resolve(directoryPath);
+  const rootStats = await fs.lstat(root);
+  if (!rootStats.isDirectory() || rootStats.isSymbolicLink()) throw new Error(`published archive is not a plain directory: ${root}`);
+  const entries = [];
+  async function visit(directory, prefix = "") {
+    const children = await fs.readdir(directory, { withFileTypes: true });
+    children.sort((left, right) => ordinalCompare(left.name, right.name));
+    for (const child of children) {
+      if (child.isSymbolicLink()) throw new Error(`published archive contains a symbolic link: ${path.join(directory, child.name)}`);
+      const relative = prefix ? `${prefix}/${child.name}` : child.name;
+      const absolute = path.join(directory, child.name);
+      if (child.isDirectory()) {
+        entries.push({ path: relative, type: "directory" });
+        await visit(absolute, relative);
+      } else if (child.isFile()) {
+        const bytes = await fs.readFile(absolute);
+        entries.push({ path: relative, type: "file", sha256: sha256(bytes), size: bytes.length });
+      } else {
+        throw new Error(`published archive contains a special entry: ${absolute}`);
+      }
+    }
+  }
+  await visit(root);
+  return entries;
+}
+
+async function readPublishedOutputContract(prepared, receipt) {
+  if (!receipt || receipt.kind !== "ordinary-reimbursement-published-v1" || !Array.isArray(receipt.outputs) || receipt.outputs.length < 1) {
+    throw new Error("ordinary publish receipt is incomplete");
+  }
+  const artifacts = [];
+  const archiveRoots = new Map();
+  const outputs = [...receipt.outputs].sort((left, right) => ordinalCompare(left.profileId, right.profileId));
+  for (const output of outputs) {
+    for (const role of ["root", "detail", "screenshot", "summary", "snapshot"]) {
+      artifacts.push(await snapshotArtifactBinding(output[role], `${output.profileId}:${role}`));
+    }
+    for (const [index, binding] of (output.supplements ?? []).entries()) {
+      artifacts.push(await snapshotArtifactBinding(binding, `${output.profileId}:supplement:${String(index + 1).padStart(3, "0")}`));
+    }
+    for (const [index, binding] of (output.evidenceArchive ?? []).entries()) {
+      artifacts.push(await snapshotArtifactBinding(binding, `${output.profileId}:evidence:${String(index + 1).padStart(3, "0")}`));
+    }
+    const archiveRoot = path.dirname(path.resolve(output.detail.path));
+    archiveRoots.set(process.platform === "win32" ? archiveRoot.toLowerCase() : archiveRoot, archiveRoot);
+  }
+  artifacts.sort((left, right) => ordinalCompare(left.identity, right.identity));
+  const shapes = [];
+  for (const archiveRoot of [...archiveRoots.values()].sort(ordinalCompare)) {
+    const entries = await snapshotPublishedTree(archiveRoot);
+    shapes.push({ name: path.basename(archiveRoot), entries: entries.map((entry) => ({ path: entry.path, type: entry.type })) });
+  }
+  return assertOrdinaryOutputContract({
+    ...prepared,
+    publishedArtifactDigest: sha256(jsonBytes({ kind: "ordinary-published-artifacts-v1", artifacts })),
+    publishedShapeDigest: sha256(jsonBytes({ kind: "ordinary-published-shape-v1", archives: shapes })),
+  }, { requirePublished: true });
+}
+
+async function createIsolatedPublishInput(runRoot, fixture) {
+  const isolatedRoot = path.join(runRoot, "published-input");
+  await fs.mkdir(isolatedRoot, { recursive: false });
+  const baselinePath = path.join(isolatedRoot, path.basename(fixture.baseline.path));
+  await fs.copyFile(fixture.baseline.path, baselinePath, fs.constants.COPYFILE_EXCL);
+  const baselineBytes = await fs.readFile(baselinePath);
+  if (sha256(baselineBytes) !== fixture.baseline.sha256) throw new Error("isolated ordinary baseline copy differs from the frozen fixture");
+  const manifest = JSON.parse(await fs.readFile(fixture.manifest.path, "utf8"));
+  manifest.batch.rootPath = isolatedRoot;
+  manifest.batch.archivePath = path.join(isolatedRoot, path.basename(manifest.batch.archivePath));
+  const baselineEntry = manifest.files.find((entry) => entry.role === "baseline");
+  if (!baselineEntry) throw new Error("ordinary fixture has no baseline binding");
+  baselineEntry.path = baselinePath;
+  const manifestBytes = jsonBytes(manifest);
+  const manifestPath = path.join(runRoot, "isolated-manifest.json");
+  await fs.writeFile(manifestPath, manifestBytes, { flag: "wx" });
+  return {
+    manifest: { path: manifestPath, sha256: sha256(manifestBytes), size: manifestBytes.length },
+    baseline: { path: baselinePath, sha256: fixture.baseline.sha256, size: baselineBytes.length },
+  };
+}
+
+function ordinaryBenchmarkRunIdentity(fixture, purpose, hexLength) {
+  if (fixture.benchmarkLine !== "O") return crypto.randomBytes(hexLength / 2).toString("hex");
+  return sha256(jsonBytes({
+    kind: "ordinary-performance-deterministic-run-identity-v1",
+    sourceCoverageDigest: fixture.sourceCoverageDigest,
+    purpose,
+  })).slice(0, hexLength);
+}
+
 async function runTimedSample({ benchmarkRoot, fixture, version, renderer, round, temperature, workflowModule, includeImport }) {
-  const runRoot = path.join(benchmarkRoot, `run-${temperature[0]}-${round}-${version[0]}-${crypto.randomBytes(3).toString("hex")}`);
+  const runRoot = fixture.benchmarkLine === "O"
+    ? path.join(benchmarkRoot, `run-${temperature[0]}-paired`)
+    : path.join(benchmarkRoot, `run-${temperature[0]}-${round}-${version[0]}-${crypto.randomBytes(3).toString("hex")}`);
   await fs.mkdir(runRoot, { recursive: false });
   const priorTemp = process.env.TEMP;
   const priorTmp = process.env.TMP;
@@ -481,15 +974,26 @@ async function runTimedSample({ benchmarkRoot, fixture, version, renderer, round
   process.env.TMP = runRoot;
   let module = workflowModule;
   let importMs = 0;
+  let stopResourceObservation;
+  let resourceMetrics;
   try {
+    const fakeAssets = renderer === "fake"
+      ? await Promise.all(fixture.fakePreviews.map(async (item) => ({ key: item.key, sha256: item.sha256, bytes: await fs.readFile(item.path) })))
+      : null;
+    const publishContractRequired = fixture.benchmarkLine === "O";
+    const publishInputStarted = performance.now();
+    const sampleInput = publishContractRequired
+      ? await createIsolatedPublishInput(runRoot, fixture)
+      : { manifest: fixture.manifest, baseline: fixture.baseline };
+    const excludedPublishInputSetupMs = performance.now() - publishInputStarted;
+    stopResourceObservation = beginResourceObservation();
     if (!module) {
       const started = performance.now();
       module = await loadWorkflow(fixture.roots[version], `${temperature}-${round}-${version}`);
       importMs = performance.now() - started;
     }
-    const fakeBytes = renderer === "fake" ? await fs.readFile(fixture.fakePng.path) : null;
     const profilePhases = process.env.XHS_WORKFLOW_PROFILE === "1" && version === "new" ? {} : null;
-    const baseRenderer = renderer === "fake" ? makeFakeRenderer(fakeBytes, fixture.fakePng.sha256) : null;
+    const baseRenderer = renderer === "fake" ? makeFakeRenderer(fakeAssets) : null;
     let hooks = baseRenderer ? { runPreviewRenderer: baseRenderer } : undefined;
     if (profilePhases) {
       const rootBuilderModule = await import(pathToFileURL(path.join(fixture.roots.new, "scripts", "build_root_workbook_candidate.mjs")).href);
@@ -500,13 +1004,7 @@ async function runTimedSample({ benchmarkRoot, fixture, version, renderer, round
       };
       hooks = {
         ...(hooks ?? {}),
-        auditManifest: async (manifestPath, expectedSha256) => timeAsync("manifestAuditMs", async () => {
-          const child = spawnSync(process.execPath, [path.join(fixture.roots.new, "scripts", "audit_batch_manifest.mjs"), manifestPath, "--defer-ordinary-file-verification"], { encoding: "utf8", maxBuffer: 32 * 1024 * 1024 });
-          if (child.status !== 0) throw new Error(`profile manifest audit failed: ${child.stderr || child.stdout}`);
-          const audited = JSON.parse(child.stdout.trim());
-          if (audited.manifestFileSha256 !== expectedSha256) throw new Error("profile manifest audit SHA differs");
-          return audited;
-        }),
+        auditManifest: (manifestPath, expectedSha256) => timeAsync("manifestAuditMs", () => module.auditManifest(manifestPath, expectedSha256)),
         buildRootWorkbookCandidates: (request, options) => timeAsync("candidateBuildAuditMs", () => rootBuilderModule.buildRootWorkbookCandidates(request, options)),
         buildReimbursementArtifacts: (request) => timeAsync("artifactTemplateImageMs", async () => {
           const result = await artifactBuilderModule.buildReimbursementArtifacts(request);
@@ -516,13 +1014,13 @@ async function runTimedSample({ benchmarkRoot, fixture, version, renderer, round
         ...(baseRenderer ? { runPreviewRenderer: (request) => timeAsync("previewRendererCallbackMs", () => baseRenderer(request)) } : {}),
       };
     }
-    const stagingToken = crypto.randomBytes(32).toString("hex");
+    const stagingToken = ordinaryBenchmarkRunIdentity(fixture, "staging-token", 64);
     const prepareRequest = {
       kind: "ordinary-reimbursement-prepare-v1",
       stagingToken,
-      manifestPath: fixture.manifest.path,
-      manifestSha256: fixture.manifest.sha256,
-      baselines: [{ profileId: "xiaohongshu", path: fixture.baseline.path, sha256: fixture.baseline.sha256, size: fixture.baseline.size, candidateRevision: 1 }],
+      manifestPath: sampleInput.manifest.path,
+      manifestSha256: sampleInput.manifest.sha256,
+      baselines: [{ profileId: "xiaohongshu", path: sampleInput.baseline.path, sha256: sampleInput.baseline.sha256, size: sampleInput.baseline.size, candidateRevision: 1 }],
     };
     const prepareStarted = performance.now();
     const gate1 = await module.prepareReimbursementWorkflow(prepareRequest, hooks ? { testHooks: hooks } : undefined);
@@ -536,14 +1034,17 @@ async function runTimedSample({ benchmarkRoot, fixture, version, renderer, round
       role: preview.role,
       attempts: preview.renderAttempts ?? null,
     })));
+    const prepareResourceMetrics = stopResourceObservation();
+    stopResourceObservation = undefined;
 
     let reviewSetupMs = 0;
     let finalizeRequest;
-    if (version === "new") {
+    const requiresIndependentReview = fixture.benchmarkLine === "O" || version === "new";
+    if (requiresIndependentReview) {
       const reviewStarted = performance.now();
       const review = {
         kind: "independent-evidence-review-v1",
-        reviewerRunId: crypto.randomBytes(16).toString("hex"),
+        reviewerRunId: ordinaryBenchmarkRunIdentity(fixture, "independent-reviewer-run", 32),
         gate1BindingDigest: gate1.gate1BindingDigest,
         sourceCoverageDigest: fixture.sourceCoverageDigest,
         independence: { performedAfterGate1: true, originalSourcesReadFresh: true, gate1ArtifactsNotUsed: true, observationsNotCopied: true },
@@ -564,9 +1065,29 @@ async function runTimedSample({ benchmarkRoot, fixture, version, renderer, round
     } else {
       finalizeRequest = { statePath: gate1.statePath, expectedGate1BindingDigest: gate1.gate1BindingDigest, approvalText: "本次报销通过无误" };
     }
+    stopResourceObservation = beginResourceObservation();
     const finalizeStarted = performance.now();
     const gate2 = await module.finalizeReimbursementWorkflow(finalizeRequest);
     const finalizeMs = performance.now() - finalizeStarted;
+    const finalizeResourceMetrics = stopResourceObservation();
+    stopResourceObservation = undefined;
+    resourceMetrics = mergeResourceObservations([prepareResourceMetrics, finalizeResourceMetrics]);
+    resourceMetrics.externalProcessRssBoundary = {
+          manifestAuditorWorker: {
+            timingIncluded: true,
+            includedInWorkerRss: true,
+            reason: "The manifest auditor is an isolated worker thread in the benchmark Node process and is included in process RSS.",
+      },
+      previewRenderer: {
+        mode: renderer,
+        timingIncluded: true,
+        includedInWorkerRss: renderer === "fake",
+        enginePeakWorkingSetBytes: Math.max(gate1.previewEnginePeakWorkingSetBytes ?? 0, gate2.previewEnginePeakWorkingSetBytes ?? 0),
+        reason: renderer === "fake"
+          ? "The fake renderer executes in the benchmark worker and is included in worker RSS."
+          : "Excel/PowerShell COM executes outside the Node worker; its reported engine peak is recorded separately and not added to worker RSS.",
+      },
+    };
     if (profilePhases && version === "new") {
       const [gate1StateBytes, reviewBytes] = await Promise.all([
         fs.readFile(gate1.statePath),
@@ -588,6 +1109,26 @@ async function runTimedSample({ benchmarkRoot, fixture, version, renderer, round
       profilePhases.gate2FullCorrespondenceDirectMs = performance.now() - auditStarted;
     }
     const totalPluginMs = (includeImport ? importMs : 0) + prepareMs + finalizeMs;
+    const contractStarted = performance.now();
+    const preparedOutputContract = await readPreparedOutputContract(gate1.statePath);
+    let excludedOutputContractReadMs = performance.now() - contractStarted;
+    let outputContract = preparedOutputContract;
+    let excludedPublishForEquivalenceMs = 0;
+    if (publishContractRequired) {
+      const publishStarted = performance.now();
+      const receipt = await module.publishReimbursementWorkflow({
+        statePath: gate2.statePath,
+        expectedGate1BindingDigest: gate1.gate1BindingDigest,
+        gate1ApprovalText: "本次报销通过无误",
+        expectedGate2BindingDigest: gate2.gate2BindingDigest,
+        gate2ApprovalText: "确认更新根目录支出总表",
+      });
+      excludedPublishForEquivalenceMs = performance.now() - publishStarted;
+      const publishedContractStarted = performance.now();
+      outputContract = await readPublishedOutputContract(preparedOutputContract, receipt);
+      excludedOutputContractReadMs += performance.now() - publishedContractStarted;
+    }
+    const gate1PreviewSha256 = gate1.review.flatMap((profile) => profile.previews.map((preview) => preview.sha256));
     return {
       kind: SAMPLE_KIND,
       version,
@@ -598,12 +1139,30 @@ async function runTimedSample({ benchmarkRoot, fixture, version, renderer, round
       prepareMs,
       finalizeMs,
       totalPluginMs,
+      excludedPublishInputSetupMs,
+      excludedPublishForEquivalenceMs,
       excludedIndependentReviewSetupMs: reviewSetupMs,
+      excludedOutputContractReadMs,
       gate1RenderAttempts,
+      observedCounts: {
+        gate1PreviewCount: gate1PreviewSha256.length,
+        gate1UniquePreviewPngCount: new Set(gate1PreviewSha256).size,
+        gate1PreviewRenderAttemptCount: gate1RenderAttempts.reduce((sum, item) => sum + (item.attempts ?? 1), 0),
+        gate2: gate2.fullCorrespondenceAudit?.metrics ?? null,
+      },
+      bindings: {
+        gate1BindingDigest: gate1.gate1BindingDigest,
+        gate2BindingDigest: gate2.gate2BindingDigest ?? null,
+        gate2ReportDigest: gate2.fullCorrespondenceAudit?.reportDigest ?? null,
+        gate2Status: gate2.fullCorrespondenceAudit?.status ?? null,
+      },
+      resources: resourceMetrics,
+      outputContract,
       profilePhases,
       gate2Metrics: gate2.fullCorrespondenceAudit?.metrics ?? null,
     };
   } finally {
+    if (stopResourceObservation) stopResourceObservation();
     process.env.TEMP = priorTemp;
     process.env.TMP = priorTmp;
     await safeRemoveRunRoot(benchmarkRoot, runRoot);
@@ -636,11 +1195,16 @@ async function workerHot() {
   const benchmarkRoot = path.resolve(workerArg("benchmark-root"));
   const renderer = workerArg("renderer");
   const samples = Number(workerArg("samples"));
+  const warmups = Number(workerArg("warmups"));
   const fixture = await readFixture(metadataPath);
+  if (!Number.isSafeInteger(samples) || samples < 1 || !Number.isSafeInteger(warmups) || warmups < 0) throw new Error("hot worker sample and warm-up counts are invalid");
   const modules = {
     old: await loadWorkflow(fixture.roots.old, "hot-old"),
     new: await loadWorkflow(fixture.roots.new, "hot-new"),
   };
+  for (const { version, round } of sampleOrder(warmups)) {
+    await runTimedSample({ benchmarkRoot, fixture, version, renderer, round: round - warmups, temperature: "hot", workflowModule: modules[version], includeImport: false });
+  }
   const results = [];
   for (const { version, round } of sampleOrder(samples)) {
     results.push(await runTimedSample({ benchmarkRoot, fixture, version, renderer, round, temperature: "hot", workflowModule: modules[version], includeImport: false }));
@@ -671,49 +1235,194 @@ function spawnJson(args, { timeoutMs = 15 * 60_000 } = {}) {
   });
 }
 
-function median(values) {
-  const ordered = [...values].sort((left, right) => left - right);
-  const middle = Math.floor(ordered.length / 2);
-  return ordered.length % 2 === 0 ? (ordered[middle - 1] + ordered[middle]) / 2 : ordered[middle];
-}
-
 function round(value, digits = 3) {
+  if (value === null || value === undefined) return value;
   const factor = 10 ** digits;
   return Math.round(value * factor) / factor;
 }
 
-function medianBreakdown(samples) {
-  return Object.fromEntries(["importMs", "prepareMs", "finalizeMs", "totalPluginMs", "excludedIndependentReviewSetupMs"].map((field) => [field, round(median(samples.map((sample) => sample[field])))]));
+function roundedDistribution(values) {
+  return Object.fromEntries(Object.entries(summarizeDistribution(values)).map(([field, value]) => [field, Number.isFinite(value) ? round(value) : value]));
 }
 
-function summarizeTemperature(samples, threshold) {
+function metricBreakdown(samples) {
+  return Object.fromEntries(
+    ["importMs", "prepareMs", "finalizeMs", "totalPluginMs", "excludedPublishInputSetupMs", "excludedPublishForEquivalenceMs", "excludedIndependentReviewSetupMs", "excludedOutputContractReadMs"]
+      .map((field) => [field, roundedDistribution(samples.map((sample) => sample[field]))]),
+  );
+}
+
+function pairedValues(samples, field) {
+  const byRound = new Map();
+  for (const sample of samples) {
+    const pair = byRound.get(sample.round) ?? {};
+    if (pair[sample.version]) throw new Error(`duplicate ${sample.version} sample for round ${sample.round}`);
+    pair[sample.version] = sample;
+    byRound.set(sample.round, pair);
+  }
+  const ordered = [...byRound.entries()].sort(([left], [right]) => left - right);
+  for (const [sampleRound, pair] of ordered) if (!pair.old || !pair.new) throw new Error(`round ${sampleRound} is not a complete pair`);
+  return {
+    old: ordered.map(([, pair]) => pair.old[field]),
+    new: ordered.map(([, pair]) => pair.new[field]),
+  };
+}
+
+function summarizeResources(samples) {
+  return Object.fromEntries(
+    ["rssStartBytes", "rssEndBytes", "sampledPeakRssBytes", "processMaxRssKilobytes", "cpuUserMicroseconds", "cpuSystemMicroseconds", "fsReadOperations", "fsWriteOperations", "involuntaryContextSwitches", "voluntaryContextSwitches"]
+      .map((field) => [field, roundedDistribution(samples.map((sample) => sample.resources[field]))]),
+  );
+}
+
+export function summarizeOrdinaryPerformanceSamples(samples, { threshold, acceptance, line, temperature, renderer }) {
   const oldSamples = samples.filter((sample) => sample.version === "old");
   const newSamples = samples.filter((sample) => sample.version === "new");
-  const oldMedian = median(oldSamples.map((sample) => sample.totalPluginMs));
-  const newMedian = median(newSamples.map((sample) => sample.totalPluginMs));
-  const improvementPercent = ((oldMedian - newMedian) / oldMedian) * 100;
+  const pairs = pairedValues(samples, "totalPluginMs");
+  const oldDistribution = summarizeDistribution(pairs.old);
+  const newDistribution = summarizeDistribution(pairs.new);
+  const p50Improvement = improvementPercent(oldDistribution.p50, newDistribution.p50);
+  const p95Improvement = improvementPercent(oldDistribution.p95, newDistribution.p95);
+  const insufficientConfidence = { method: "unavailable", pairCount: pairs.old.length, reason: "at least two timed pairs are required", pointEstimatePercent: null, lowerPercent: null, upperPercent: null };
+  const p50Confidence = pairs.old.length >= 2
+    ? pairedBootstrapImprovement({ baseline: pairs.old, candidate: pairs.new, probability: 0.5, seedMaterial: `${line}:${temperature}:p50` })
+    : insufficientConfidence;
+  const p95Confidence = pairs.old.length >= 2
+    ? pairedBootstrapImprovement({ baseline: pairs.old, candidate: pairs.new, probability: 0.95, seedMaterial: `${line}:${temperature}:p95` })
+    : insufficientConfidence;
+  const outputPairs = pairedValues(samples, "outputContract");
+  const requirePublished = line === "O";
+  const oldOutputDigests = outputPairs.old.map((item) => sha256(jsonBytes(assertOrdinaryOutputContract(item, { requirePublished }))));
+  const newOutputDigests = outputPairs.new.map((item) => sha256(jsonBytes(assertOrdinaryOutputContract(item, { requirePublished }))));
+  const outputEquivalent = oldOutputDigests.every((digest, index) => digest === newOutputDigests[index])
+    && new Set(oldOutputDigests).size === 1
+    && new Set(newOutputDigests).size === 1;
+  const fakePngDistinct = renderer !== "fake" || samples.every((sample) => sample.observedCounts.gate1PreviewCount === sample.observedCounts.gate1UniquePreviewPngCount);
+  const oldResource = summarizeResources(oldSamples);
+  const newResource = summarizeResources(newSamples);
+  const peakRssRegressionPercent = ((newResource.sampledPeakRssBytes.p50 - oldResource.sampledPeakRssBytes.p50) / oldResource.sampledPeakRssBytes.p50) * 100;
+  const strict = evaluateStrictPerformanceAcceptance({
+    thresholdPercent: threshold,
+    p50ImprovementPercent: p50Improvement,
+    p50BootstrapLowerPercent: Number.isFinite(p50Confidence.lowerPercent) ? p50Confidence.lowerPercent : -Number.MAX_VALUE,
+    p95ImprovementPercent: p95Improvement,
+    peakRssRegressionPercent,
+    outputEquivalent,
+  });
+  const criteria = { ...strict.criteria, fakePreviewPngsAreDistinct: fakePngDistinct };
+  const improvementTargetMet = strict.improvementTargetMet;
+  const safeguardsPassed = strict.safeguardsPassed && fakePngDistinct;
   return {
     sampleCountPerVersion: oldSamples.length,
-    old: medianBreakdown(oldSamples),
-    new: medianBreakdown(newSamples),
-    improvementPercent: round(improvementPercent),
+    old: { phases: metricBreakdown(oldSamples), resources: oldResource },
+    new: { phases: metricBreakdown(newSamples), resources: newResource },
+    totalPluginMs: {
+      old: Object.fromEntries(Object.entries(oldDistribution).map(([field, value]) => [field, round(value)])),
+      new: Object.fromEntries(Object.entries(newDistribution).map(([field, value]) => [field, round(value)])),
+      p50ImprovementPercent: round(p50Improvement),
+      p95ImprovementPercent: round(p95Improvement),
+      pairedBootstrap95: {
+        p50: Object.fromEntries(Object.entries(p50Confidence).map(([field, value]) => [field, typeof value === "number" ? round(value) : value])),
+        p95: Object.fromEntries(Object.entries(p95Confidence).map(([field, value]) => [field, typeof value === "number" ? round(value) : value])),
+      },
+    },
+    peakRssRegressionPercent: round(peakRssRegressionPercent),
+    outputEquivalent,
+    fakePngDistinct,
     requiredImprovementPercent: threshold,
-    passed: improvementPercent >= threshold,
+    criteria,
+    improvementTargetMet,
+    safeguardsPassed,
+    acceptancePassed: acceptance ? safeguardsPassed : null,
+    diagnosticWouldMeetConfiguredCriteria: acceptance ? null : improvementTargetMet && safeguardsPassed,
+    diagnosticWouldPassSafeguards: acceptance ? null : safeguardsPassed,
+  };
+}
+
+async function dependencyIdentity(packageName) {
+  const packageRoot = path.join(path.resolve(path.dirname(process.execPath), ".."), "node_modules", packageName);
+  try {
+    const canonicalRoot = await fs.realpath(packageRoot);
+    const packageJsonBytes = await fs.readFile(path.join(canonicalRoot, "package.json"));
+    const packageJson = JSON.parse(packageJsonBytes.toString("utf8"));
+    return { name: packageName, version: packageJson.version ?? null, canonicalRoot, packageJsonSha256: sha256(packageJsonBytes) };
+  } catch (error) {
+    return { name: packageName, available: false, reason: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+async function environmentIdentity() {
+  const power = process.platform === "win32"
+    ? spawnSync("powercfg", ["/getactivescheme"], { encoding: "utf8", windowsHide: true, timeout: 10_000 })
+    : null;
+  return {
+    node: process.version,
+    nodeExecPath: process.execPath,
+    nodeVersions: { ...process.versions },
+    platform: process.platform,
+    arch: process.arch,
+    osType: os.type(),
+    osRelease: os.release(),
+    osVersion: os.version(),
+    cpuModel: os.cpus()[0]?.model ?? "unknown",
+    logicalCpuCount: os.cpus().length,
+    totalMemoryBytes: os.totalmem(),
+    uptimeSecondsAtStart: round(os.uptime()),
+    powerScheme: power?.status === 0 ? power.stdout.trim() : null,
+    powerSchemeObservationError: power && power.status !== 0 ? (power.stderr || `exit ${power.status}`).trim() : null,
+    bundledRuntimeRoot: path.resolve(path.dirname(process.execPath), ".."),
+    dependencies: await Promise.all([dependencyIdentity("jszip"), dependencyIdentity("sharp")]),
   };
 }
 
 async function main() {
   const options = parseArgs(process.argv.slice(2));
+  const harnessBefore = await benchmarkHarnessIdentity();
   for (const root of [options.oldRoot, options.newRoot]) {
-    const stats = await fs.stat(path.join(root, "scripts", "run_reimbursement_workflow.mjs"));
-    if (!stats.isFile()) throw new Error(`workflow root is invalid: ${root}`);
+      const stats = await fs.stat(path.join(root, "scripts", "run_reimbursement_workflow.mjs"));
+      if (!stats.isFile()) throw new Error(`workflow root is invalid: ${root}`);
+  }
+  const identitiesBefore = {
+    old: await inspectBenchmarkRoot(options.oldRoot),
+    new: await inspectBenchmarkRoot(options.newRoot),
+  };
+  if (samePath(identitiesBefore.old.canonicalSkillRoot, identitiesBefore.new.canonicalSkillRoot)) throw new Error("old and new benchmark roots resolve to the same skill tree");
+  if (options.identityLock) {
+    assertIdentityLock(identitiesBefore.old, options.identityLock.old, "old workflow root");
+    assertIdentityLock(identitiesBefore.new, options.identityLock.new, "new workflow root");
+  }
+  if (options.identityOnly) {
+    process.stdout.write(`${JSON.stringify({
+      kind: "xiaohongshu-workflow-performance-identity-v1",
+      benchmarkLine: options.line,
+      generatedAt: new Date().toISOString(),
+      harness: harnessBefore,
+      roots: identitiesBefore,
+      acceptanceCliLock: {
+        oldVersion: identitiesBefore.old.version,
+        newVersion: identitiesBefore.new.version,
+        oldSkillSha256: identitiesBefore.old.skillTreeSha256,
+        newSkillSha256: identitiesBefore.new.skillTreeSha256,
+        oldPackageSha256: identitiesBefore.old.packageTreeSha256,
+        newPackageSha256: identitiesBefore.new.packageTreeSha256,
+      },
+    }, null, 2)}\n`);
+    return;
   }
   const benchmarkRoot = await fs.mkdtemp(path.join(os.tmpdir(), SAFE_TEMP_PREFIX));
   let finalReport;
   try {
-    const oldTreeBefore = await treeDigest(options.oldRoot);
-    const newTreeBefore = await treeDigest(options.newRoot);
-    const fixture = await buildFixture(benchmarkRoot, options.oldRoot, options.newRoot);
+    const fixture = await buildFixture(benchmarkRoot, identitiesBefore.old.canonicalSkillRoot, identitiesBefore.new.canonicalSkillRoot, options.line);
+    for (const { version, round: warmupRound } of sampleOrder(options.warmups)) {
+      await spawnJson([
+        "--worker-one",
+        `--fixture=${fixture.metadataPath}`,
+        `--benchmark-root=${benchmarkRoot}`,
+        `--version=${version}`,
+        `--renderer=${options.renderer}`,
+        `--round=${warmupRound - options.warmups}`,
+      ]);
+    }
     const cold = [];
     for (const { version, round: sampleRound } of sampleOrder(options.samples)) {
       cold.push(await spawnJson([
@@ -731,37 +1440,63 @@ async function main() {
       `--benchmark-root=${benchmarkRoot}`,
       `--renderer=${options.renderer}`,
       `--samples=${options.samples}`,
+      `--warmups=${options.warmups}`,
     ], { timeoutMs: 30 * 60_000 });
-    const oldTreeAfter = await treeDigest(options.oldRoot);
-    const newTreeAfter = await treeDigest(options.newRoot);
-    if (oldTreeBefore !== oldTreeAfter) throw new Error("immutable installed baseline changed during benchmark");
-    if (newTreeBefore !== newTreeAfter) throw new Error("new workflow source changed during benchmark; discard mixed-version samples and rerun");
-    const coldSummary = summarizeTemperature(cold, options.threshold);
-    const hotSummary = summarizeTemperature(hot, options.threshold);
+    const identitiesAfter = {
+      old: await inspectBenchmarkRoot(options.oldRoot),
+      new: await inspectBenchmarkRoot(options.newRoot),
+    };
+    const harnessAfter = await benchmarkHarnessIdentity();
+    if (harnessBefore.combinedSha256 !== harnessAfter.combinedSha256) throw new Error("benchmark harness changed during the run; discard all samples");
+    assertUnchangedIdentity(identitiesBefore.old, identitiesAfter.old, "old workflow root");
+    assertUnchangedIdentity(identitiesBefore.new, identitiesAfter.new, "new workflow root");
+    if (options.identityLock) {
+      assertIdentityLock(identitiesAfter.old, options.identityLock.old, "old workflow root after benchmark");
+      assertIdentityLock(identitiesAfter.new, options.identityLock.new, "new workflow root after benchmark");
+    }
+    const summaryOptions = { threshold: options.threshold, acceptance: !options.diagnostic, line: options.line, renderer: options.renderer };
+    const coldSummary = summarizeOrdinaryPerformanceSamples(cold, { ...summaryOptions, temperature: "cold" });
+    const hotSummary = summarizeOrdinaryPerformanceSamples(hot, { ...summaryOptions, temperature: "hot" });
+    const acceptancePassed = coldSummary.acceptancePassed === true && hotSummary.acceptancePassed === true;
     finalReport = {
       kind: BENCHMARK_KIND,
       generatedAt: new Date().toISOString(),
       acceptance: !options.diagnostic,
+      benchmarkLine: options.line,
       renderer: options.renderer,
-      environment: {
-        node: process.version,
-        platform: process.platform,
-        arch: process.arch,
-        cpuModel: os.cpus()[0]?.model ?? "unknown",
-        logicalCpuCount: os.cpus().length,
-        totalMemoryBytes: os.totalmem(),
-      },
+      environment: await environmentIdentity(),
       protocol: {
-        oldRoot: options.oldRoot,
-        newRoot: options.newRoot,
-        immutableOldTreeSha256: oldTreeAfter,
-        measuredNewTreeSha256: newTreeAfter,
+        line: options.line,
+        lineMeaning: options.line === "H"
+          ? "immutable installed 20260819174146 legacy contract versus unmodified 20260821073607 full-correspondence contract"
+          : "unmodified 20260821073607 full-correspondence ordinary path versus candidate full-correspondence ordinary path",
+        identityLock: options.identityLock ?? { source: "observed-diagnostic-only", old: null, new: null },
+        harnessBefore,
+        harnessAfter,
+        rootsBefore: identitiesBefore,
+        rootsAfter: identitiesAfter,
         samplesPerVersionPerTemperature: options.samples,
+        untimedWarmupsPerVersionPerTemperature: options.warmups,
+        improvementTargetIsInformational: true,
         ordering: "alternating-old-new/new-old-by-round",
-        cold: "one fresh Node process per sample; timed dynamic import + prepare/Gate1 + finalize",
+        cold: "one fresh Node process per sample (Windows filesystem cache not flushed); timed dynamic import + prepare/Gate1 + finalize",
         hot: "both versions imported before timing; repeated in one Node process",
-        excluded: ["synthetic fixture generation", "independent evidence observation construction and JSON write"],
+        excluded: [
+          "synthetic fixture generation",
+          "independent evidence observation construction and JSON write",
+          "O-line isolated publish-input copy/rebinding",
+          "O-line publish execution used only to prove published-output equivalence",
+          "benchmark-only published artifact/tree read and hashing",
+          "warm-up runs",
+        ],
         included: ["all plugin-controlled manifest/workbook/media reads", "candidate and delivery construction", "preview validation", "Gate 2 fresh media decode", "full correspondence audit/report", "Gate 2 preview binding"],
+        resourceMeasurement: {
+          rss: "5 ms user-space sampling of the benchmark worker Node process; enforced for both cold and hot summaries, with cold samples isolated and hot samples sharing one process",
+          workerScope: "runner import (cold only), prepare/Gate 1, and finalize/Gate 2",
+          manifestAuditorWorker: "timing is included and the isolated worker thread is included in benchmark-process RSS",
+          previewRenderer: "fake rendering runs in-process and is included; Excel/PowerShell COM is out-of-process, so its enginePeakWorkingSetBytes is reported separately and is not added to worker RSS",
+          io: "process.resourceUsage filesystem operation deltas; portable per-process byte counters unavailable and therefore reported as null",
+        },
       },
       fixture: {
         historyRows: 1500,
@@ -774,9 +1509,17 @@ async function main() {
         hasContextVoucherMultiImageAndRepeatedReferences: true,
         manifestSha256: fixture.manifest.sha256,
         baselineSha256: fixture.baseline.sha256,
+        fakePreviewPngCount: fixture.fakePreviews.length,
+        fakePreviewPngSha256: fixture.fakePreviews.map((item) => ({ key: item.key, sha256: item.sha256 })),
       },
       summaries: { cold: coldSummary, hot: hotSummary },
-      thresholdPassed: coldSummary.passed && hotSummary.passed,
+      acceptancePassed: options.diagnostic ? null : acceptancePassed,
+      diagnosticWouldMeetConfiguredCriteria: options.diagnostic
+        ? coldSummary.diagnosticWouldMeetConfiguredCriteria === true && hotSummary.diagnosticWouldMeetConfiguredCriteria === true
+        : null,
+      diagnosticWouldPassSafeguards: options.diagnostic
+        ? coldSummary.diagnosticWouldPassSafeguards === true && hotSummary.diagnosticWouldPassSafeguards === true
+        : null,
       rawSamples: { cold, hot },
     };
     const bytes = Buffer.from(`${JSON.stringify(finalReport, null, 2)}\n`, "utf8");
@@ -787,18 +1530,20 @@ async function main() {
       await fs.rename(temporary, options.output);
     }
     process.stdout.write(bytes);
-    if (!options.diagnostic && !finalReport.thresholdPassed) process.exitCode = 2;
+    if (!options.diagnostic && !finalReport.acceptancePassed) process.exitCode = 2;
   } finally {
     if (!path.basename(benchmarkRoot).startsWith(SAFE_TEMP_PREFIX)) throw new Error(`refusing to clean unsafe benchmark root: ${benchmarkRoot}`);
     await fs.rm(benchmarkRoot, { recursive: true, force: true });
   }
 }
 
-try {
-  if (process.argv[2] === "--worker-one") await workerOne();
-  else if (process.argv[2] === "--worker-hot") await workerHot();
-  else await main();
-} catch (error) {
-  process.stderr.write(`${error instanceof Error ? error.stack ?? error.message : String(error)}\n`);
-  process.exitCode = 1;
+if (process.argv[1] && samePath(SCRIPT_PATH, process.argv[1])) {
+  try {
+    if (process.argv[2] === "--worker-one") await workerOne();
+    else if (process.argv[2] === "--worker-hot") await workerHot();
+    else await main();
+  } catch (error) {
+    process.stderr.write(`${error instanceof Error ? error.stack ?? error.message : String(error)}\n`);
+    process.exitCode = 1;
+  }
 }

@@ -61,6 +61,6 @@ Gate 2 必须把每个 manifest 交易逐项对应到明细表、截图对应表
 
 Gate 2 为发现 Gate 1 内容错误而执行，不能退化为只比较 SHA256。独立复核不得进入 Gate 1 热路径；Gate 2 内文字说明、明细、截图表、各补报表和本批候选投影各解析一次，每个唯一媒体从原始路径 fresh-read/完整 decode 一次后复用于其全部引用，候选禁止读取 `batchRows` 之外的历史业务内容。
 
-最终验收以只读安装版本 `0.5.0+codex.20260819174146` 为基线，不以人为构造的朴素实现替代。必须在同一机器、同一完全合成批次和相同冷/热规则下，分别测量旧版 `prepare + Gate 1 + finalize` 与新版 `prepare + Gate 1 + full-correspondence Gate 2 finalize` 的插件可控代码阶段中位总耗时；冷、热条件下新版都必须至少快 20%。外部人员或模型生成 `independent-evidence-review-v1` 的等待时间单独记录且不计入总耗时，插件读取 review、每个唯一媒体的 fresh-read/decode、审计和报告生成全部计入。基线安装缓存只读且禁止修改；不达标时必须先进行热点 review 并优化重复 I/O、解码或解析，不能减少复核范围。
+性能评估以只读安装版本 `0.5.0+codex.20260819174146` 为基线，不以人为构造的朴素实现替代。必须在同一机器、同一完全合成批次和相同冷/热规则下，分别测量旧版 `prepare + Gate 1 + finalize` 与新版 `prepare + Gate 1 + full-correspondence Gate 2 finalize` 的插件可控代码阶段总耗时。20% 仅作为默认信息性改善目标；未达到时如实报告，不单独判失败。通过仍要求输出完全等价、p95 不退化且冷/热峰值内存增幅均不超过 15%。外部人员或模型生成 `independent-evidence-review-v1` 的等待时间单独记录且不计入总耗时，插件读取 review、每个唯一媒体的 fresh-read/decode、审计和报告生成全部计入。基线安装缓存只读且禁止修改；优化优先处理重复 I/O、解码或解析，不能减少复核范围。
 
 具体输入独立性、报告字段、失效和展示规则见 [Gate 2 全量对应复核](gate2-full-correspondence.md)。

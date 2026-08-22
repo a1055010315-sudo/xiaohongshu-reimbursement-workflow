@@ -1,364 +1,2993 @@
 {
-  "schemaVersion": 1,
-  "contractId": "xhs-reimbursement-semantic-layout-v1",
-  "baseProfile": "xiaohongshu",
-  "scope": {
-    "applyOnlyToEditableExpenseSheets": true,
-    "excludeProtectedSheets": true
-  },
-  "semanticColumns": {
-    "ledgerRoot": {
-      "A": "date",
-      "B": "project",
-      "C": "amount",
-      "D": "groupTotal",
-      "E": "personOrSubject",
-      "F": "classification"
+  "schemaVersion": 2,
+  "contractId": "xhs-reference-batch-style-golden-v1",
+  "authority": {
+    "policy": "user-designated-reference-batch-only",
+    "referenceSourceDigests": {
+      "current-detail": "0d0e2d2127d39fd953fec91eb42e2f5d39e7d5edf78e265bf329e0386bd46abc",
+      "screenshot-map": "898e4eea474761d05b44c4da1019e64412c3cce6f139c35c82b30b5f62dc7d0f",
+      "supplement-detail-variant-a": "84b62ad173cd115496350d7a652552c42aa81c46a86dccdf4c5e1b1eb8041a84",
+      "supplement-detail-variant-b": "c33bf25440d87ad5b557701f62957da1b7d5aa6cc60c609b6d163e03d419748a",
+      "ledger-root": "9f7694822d6c295dc3642ced798f9ca9b95d86cee05edf787af5c55bf51a913c",
+      "summary-text": "d54e3112829447336684dbe57d64c39396e8bf3e61de4bd6ae92b5be38945ef4"
     },
-    "currentDetail": {
-      "A": "date",
-      "B": "project",
-      "C": "amount",
-      "D": "groupTotal",
-      "E": "classification",
-      "F": "settlementDisplay"
-    }
+    "extractionMode": "offline-read-only",
+    "containsBusinessData": false,
+    "forbiddenPayload": [
+      "person names",
+      "business amounts",
+      "shared strings",
+      "source images",
+      "relationship ids",
+      "zip ordering",
+      "office timestamps"
+    ],
+    "updatePolicy": "manual-review-and-explicit-user-approval-only"
   },
-  "roles": {
-    "title": {
+  "runtimeBudget": {
+    "gate1AddedFileReads": 0,
+    "gate1AddedImageDecodes": 0,
+    "gate1AddedComCalls": 0,
+    "gate2AddedZipOpens": 0,
+    "finalizeMedianIncreaseMaximumPercent": 2,
+    "totalRunMedianIncreaseMaximumPercent": 1,
+    "metrics": [
+      "styleContractChecks",
+      "stylePartsInflated",
+      "styleBytesInflated",
+      "styleMismatchCount",
+      "styleCheckMs"
+    ]
+  },
+  "referencePalette": {
+    "titleDeepGreenArgb": "FF567D27",
+    "headerOliveGreenArgb": "FF6B8E23",
+    "voucherHeaderGoldArgb": "FFE3B333",
+    "bodyWhiteArgb": "FFFFFFFF",
+    "bodyBorderArgb": "FFE0E6E8",
+    "sectionLightGreenArgb": "FFE2F0D9",
+    "summaryLightBlueArgb": "FFDDEBF7",
+    "voucherIvoryArgb": "FFFFFCF4"
+  },
+  "privacy": {
+    "storesOnlySemanticStyleAndLayoutFacts": true,
+    "storesCellValues": false,
+    "storesMediaBytes": false
+  },
+  "textTemplate": {
+    "asset": "assets/templates/xiaohongshu/summary-text.txt",
+    "assetSha256": "d024d1fca7e4cd49b7ccd90a8614bfd9483afba2e133f0b5232a205e752aadb4",
+    "encoding": "utf-8",
+    "visualStyle": "plain-text"
+  },
+  "semanticStyles": {
+    "00bf1c31c7fa5f1f4e35a3d9f5dfeb491fbf6f4096cb5bd9c26680239469a4dd": {
       "font": {
-        "name": "仿宋",
-        "sizePoints": 14,
+        "name": "Carlito",
+        "sizePoints": 12,
         "bold": true,
-        "colorArgb": "FF000000"
+        "italic": false,
+        "underline": null,
+        "color": "FF375623"
       },
-      "horizontalAlignment": "center",
-      "verticalAlignment": "middle",
-      "wrapText": true,
-      "shrinkToFit": false,
-      "fillToken": "primary",
-      "borderToken": "none",
-      "rowHeightPoints": 32
+      "fill": {
+        "patternType": "solid",
+        "foreground": "FFE2F0D9",
+        "background": null
+      },
+      "border": {
+        "left": {
+          "style": "thin",
+          "color": "FFA9D08E"
+        },
+        "right": {
+          "style": "thin",
+          "color": "FFA9D08E"
+        },
+        "top": {
+          "style": "thin",
+          "color": "FFA9D08E"
+        },
+        "bottom": {
+          "style": "thin",
+          "color": "FFA9D08E"
+        }
+      },
+      "alignment": {
+        "horizontal": "center",
+        "vertical": "center",
+        "wrapText": false,
+        "shrinkToFit": false,
+        "textRotation": 0,
+        "indent": 0
+      },
+      "numberFormat": "0",
+      "protection": null
     },
-    "header": {
+    "010ab5f7453194e87348cef3df11a35400bfda3f5127c2317660ecff0ff68df0": {
+      "font": {
+        "name": "Microsoft YaHei",
+        "sizePoints": 10,
+        "bold": false,
+        "italic": false,
+        "underline": null,
+        "color": "FF263238"
+      },
+      "fill": {
+        "patternType": "none",
+        "foreground": null,
+        "background": null
+      },
+      "border": {
+        "left": {
+          "style": "thin",
+          "color": "FFE0E6E8"
+        },
+        "right": {
+          "style": "thin",
+          "color": "FFE0E6E8"
+        },
+        "top": {
+          "style": "thin",
+          "color": "FFE0E6E8"
+        },
+        "bottom": {
+          "style": "thin",
+          "color": "FFE0E6E8"
+        }
+      },
+      "alignment": {
+        "horizontal": "center",
+        "vertical": "center",
+        "wrapText": true,
+        "shrinkToFit": false,
+        "textRotation": 0,
+        "indent": 0
+      },
+      "numberFormat": "builtin:0",
+      "protection": null
+    },
+    "010d6d63974d618aadcc0757d18747fc1ebe935f5bdd001be63227299c23392b": {
+      "font": {
+        "name": "Carlito",
+        "sizePoints": 10,
+        "bold": false,
+        "italic": false,
+        "underline": null,
+        "color": "FF222222"
+      },
+      "fill": {
+        "patternType": "none",
+        "foreground": null,
+        "background": null
+      },
+      "border": {
+        "left": {
+          "style": "thin",
+          "color": "FFD9EAD3"
+        },
+        "right": {
+          "style": "thin",
+          "color": "FFD9EAD3"
+        },
+        "top": {
+          "style": "thin",
+          "color": "FFD9EAD3"
+        },
+        "bottom": {
+          "style": "thin",
+          "color": "FFD9EAD3"
+        }
+      },
+      "alignment": {
+        "horizontal": "center",
+        "vertical": "center",
+        "wrapText": false,
+        "shrinkToFit": false,
+        "textRotation": 0,
+        "indent": 0
+      },
+      "numberFormat": "mm-dd",
+      "protection": null
+    },
+    "023fb2ac8e91dc10ccb67c0f8141a8200b9a326ef2d6b14c9f96ae0827f60262": {
+      "font": {
+        "name": "Microsoft YaHei",
+        "sizePoints": 9,
+        "bold": false,
+        "italic": false,
+        "underline": null,
+        "color": "FF4C5962"
+      },
+      "fill": {
+        "patternType": "solid",
+        "foreground": "FFFFF7E6",
+        "background": null
+      },
+      "border": {
+        "left": {
+          "style": "thin",
+          "color": "FFD7DDE0"
+        },
+        "right": {
+          "style": "thin",
+          "color": "FFD7DDE0"
+        },
+        "top": {
+          "style": "thin",
+          "color": "FFD7DDE0"
+        },
+        "bottom": {
+          "style": "thin",
+          "color": "FFD7DDE0"
+        }
+      },
+      "alignment": {
+        "horizontal": "center",
+        "vertical": "center",
+        "wrapText": true,
+        "shrinkToFit": false,
+        "textRotation": 0,
+        "indent": 0
+      },
+      "numberFormat": "builtin:0",
+      "protection": null
+    },
+    "037816b6caa631f80ed04f2a0434693a2dcc856d0a7bbbf3c7caf35c50ee4e3f": {
       "font": {
         "name": "仿宋",
         "sizePoints": 14,
         "bold": false,
-        "colorArgb": "FF000000"
+        "italic": false,
+        "underline": null,
+        "color": "FF000000"
       },
-      "horizontalAlignment": "center",
-      "verticalAlignment": "middle",
-      "wrapText": true,
-      "shrinkToFit": false,
-      "fillToken": "primary",
-      "borderToken": "none",
-      "rowHeightPoints": 21.95
+      "fill": {
+        "patternType": "none",
+        "foreground": null,
+        "background": null
+      },
+      "border": {
+        "left": {
+          "style": "thin",
+          "color": "FFFFFFFF"
+        },
+        "right": {
+          "style": "thin",
+          "color": "FFFFFFFF"
+        },
+        "top": {
+          "style": "thin",
+          "color": "FFFFFFFF"
+        },
+        "bottom": {
+          "style": "thin",
+          "color": "FFFFFFFF"
+        }
+      },
+      "alignment": {
+        "horizontal": "center",
+        "vertical": "center",
+        "wrapText": true,
+        "shrinkToFit": false,
+        "textRotation": 0,
+        "indent": 0
+      },
+      "numberFormat": "builtin:0",
+      "protection": null
     },
-    "summaryCard": {
+    "0aacaf3e9b6afd33881f21309eb1c74b26c0eea6b20a9d8ed372abb1381c12f4": {
       "font": {
-        "name": "仿宋",
-        "sizePoints": 14,
+        "name": "Carlito",
+        "sizePoints": 10,
+        "bold": false,
+        "italic": false,
+        "underline": null,
+        "color": "FF222222"
+      },
+      "fill": {
+        "patternType": "none",
+        "foreground": null,
+        "background": null
+      },
+      "border": {
+        "left": {
+          "style": "thin",
+          "color": "FFD9EAD3"
+        },
+        "right": {
+          "style": "thin",
+          "color": "FFD9EAD3"
+        },
+        "top": {
+          "style": "thin",
+          "color": "FFD9EAD3"
+        },
+        "bottom": {
+          "style": "thin",
+          "color": "FFD9EAD3"
+        }
+      },
+      "alignment": {
+        "horizontal": "left",
+        "vertical": "center",
+        "wrapText": false,
+        "shrinkToFit": false,
+        "textRotation": 0,
+        "indent": 0
+      },
+      "numberFormat": "builtin:0",
+      "protection": null
+    },
+    "0b131c9a008aba1450fb9e5092c132eb06f53dff32859fa90795996c901a8140": {
+      "font": {
+        "name": "Microsoft YaHei",
+        "sizePoints": 10,
+        "bold": false,
+        "italic": false,
+        "underline": null,
+        "color": "FF607080"
+      },
+      "fill": {
+        "patternType": "solid",
+        "foreground": "FFEEF5E8",
+        "background": null
+      },
+      "border": {},
+      "alignment": {
+        "horizontal": "center",
+        "vertical": "center",
+        "wrapText": false,
+        "shrinkToFit": false,
+        "textRotation": 0,
+        "indent": 0
+      },
+      "numberFormat": "builtin:0",
+      "protection": null
+    },
+    "1187387332a43ad15984aab4b2be872350de60c760d219d22c7deb20bd566d4b": {
+      "font": {
+        "name": "Carlito",
+        "sizePoints": 9,
+        "bold": false,
+        "italic": false,
+        "underline": null,
+        "color": "FF375623"
+      },
+      "fill": {
+        "patternType": "solid",
+        "foreground": "FFE2F0D9",
+        "background": null
+      },
+      "border": {},
+      "alignment": {
+        "horizontal": "center",
+        "vertical": "center",
+        "wrapText": true,
+        "shrinkToFit": false,
+        "textRotation": 0,
+        "indent": 0
+      },
+      "numberFormat": "builtin:0",
+      "protection": null
+    },
+    "17f563944d7536b458e7ff80ea7f64ae4591349ce2dcfab9ac954b837512cddf": {
+      "font": {
+        "name": "Microsoft YaHei",
+        "sizePoints": 9,
+        "bold": false,
+        "italic": false,
+        "underline": null,
+        "color": "FF4C5962"
+      },
+      "fill": {
+        "patternType": "solid",
+        "foreground": "FFFFF7E6",
+        "background": null
+      },
+      "border": {
+        "left": {
+          "style": "thin",
+          "color": "FFD7DDE0"
+        },
+        "right": {
+          "style": "thin",
+          "color": "FFD7DDE0"
+        },
+        "top": {
+          "style": "thin",
+          "color": "FFD7DDE0"
+        },
+        "bottom": {
+          "style": "thin",
+          "color": "FFD7DDE0"
+        }
+      },
+      "alignment": {
+        "horizontal": "center",
+        "vertical": "center",
+        "wrapText": true,
+        "shrinkToFit": false,
+        "textRotation": 0,
+        "indent": 0
+      },
+      "numberFormat": "0",
+      "protection": null
+    },
+    "21c6b8aaebb5e75c56be0d92c83d905835ccd6304fb10b9da6928d4601dbc939": {
+      "font": {
+        "name": "Carlito",
+        "sizePoints": 11,
         "bold": true,
-        "colorArgb": "FF000000"
+        "italic": false,
+        "underline": null,
+        "color": "FF7F4125"
       },
-      "horizontalAlignment": "center",
-      "verticalAlignment": "middle",
-      "wrapText": true,
-      "shrinkToFit": false,
-      "fillToken": "primary",
-      "borderToken": "none",
-      "rowHeightPoints": 28
+      "fill": {
+        "patternType": "solid",
+        "foreground": "FFFCE4D6",
+        "background": null
+      },
+      "border": {},
+      "alignment": {
+        "horizontal": "center",
+        "vertical": "center",
+        "wrapText": false,
+        "shrinkToFit": false,
+        "textRotation": 0,
+        "indent": 0
+      },
+      "numberFormat": "builtin:0",
+      "protection": null
     },
-    "personBlockHeader": {
+    "247c2cd28a68e7c76acb6d74f1b2b1c01b6345ea667b4b897ffcf2e7600c439d": {
       "font": {
-        "name": "仿宋",
-        "sizePoints": 14,
+        "name": "Microsoft YaHei",
+        "sizePoints": 9,
+        "bold": false,
+        "italic": false,
+        "underline": null,
+        "color": "FF4C5962"
+      },
+      "fill": {
+        "patternType": "solid",
+        "foreground": "FFFFFCF4",
+        "background": null
+      },
+      "border": {
+        "left": {
+          "style": "thin",
+          "color": "FFD7DDE0"
+        },
+        "right": {
+          "style": "thin",
+          "color": "FFD7DDE0"
+        },
+        "top": {
+          "style": "thin",
+          "color": "FFD7DDE0"
+        },
+        "bottom": {
+          "style": "thin",
+          "color": "FFD7DDE0"
+        }
+      },
+      "alignment": {
+        "horizontal": "center",
+        "vertical": "center",
+        "wrapText": true,
+        "shrinkToFit": false,
+        "textRotation": 0,
+        "indent": 0
+      },
+      "numberFormat": "0",
+      "protection": null
+    },
+    "260595096a31cada514e2b08296f835a6eb6f8aa494fbd6713dbcdf802a220dc": {
+      "font": {
+        "name": "Carlito",
+        "sizePoints": 16,
         "bold": true,
-        "colorArgb": "FF000000"
+        "italic": false,
+        "underline": null,
+        "color": null
       },
-      "horizontalAlignment": "center",
-      "verticalAlignment": "middle",
-      "wrapText": true,
-      "shrinkToFit": false,
-      "fillToken": "primary",
-      "borderToken": "none",
-      "rowHeightPoints": 28
+      "fill": {
+        "patternType": "solid",
+        "foreground": "FFE2F0D9",
+        "background": null
+      },
+      "border": {},
+      "alignment": {
+        "horizontal": "center",
+        "vertical": "center",
+        "wrapText": false,
+        "shrinkToFit": false,
+        "textRotation": 0,
+        "indent": 0
+      },
+      "numberFormat": "0",
+      "protection": null
     },
-    "businessCell": {
+    "265c97f7fde4499fa0d5ef36e09c33b00240c569c3a2994edb47f1f41bf98876": {
+      "font": {
+        "name": "Carlito",
+        "sizePoints": 12,
+        "bold": true,
+        "italic": false,
+        "underline": null,
+        "color": "FF375623"
+      },
+      "fill": {
+        "patternType": "solid",
+        "foreground": "FFE2F0D9",
+        "background": null
+      },
+      "border": {
+        "left": {
+          "style": "thin",
+          "color": "FFA9D08E"
+        },
+        "right": {
+          "style": "thin",
+          "color": "FFA9D08E"
+        },
+        "top": {
+          "style": "thin",
+          "color": "FFA9D08E"
+        },
+        "bottom": {
+          "style": "thin",
+          "color": "FFA9D08E"
+        }
+      },
+      "alignment": {
+        "horizontal": "center",
+        "vertical": "center",
+        "wrapText": false,
+        "shrinkToFit": false,
+        "textRotation": 0,
+        "indent": 0
+      },
+      "numberFormat": "builtin:0",
+      "protection": null
+    },
+    "29a869ff3cb24da9a27d4f9bb46bf2d87fdec26b7443c1c5e90c2d2c391fa6b3": {
+      "font": {
+        "name": "Carlito",
+        "sizePoints": 16,
+        "bold": true,
+        "italic": false,
+        "underline": null,
+        "color": null
+      },
+      "fill": {
+        "patternType": "solid",
+        "foreground": "FFDDEBF7",
+        "background": null
+      },
+      "border": {},
+      "alignment": {
+        "horizontal": "center",
+        "vertical": "center",
+        "wrapText": false,
+        "shrinkToFit": false,
+        "textRotation": 0,
+        "indent": 0
+      },
+      "numberFormat": "0",
+      "protection": null
+    },
+    "41896b8c1129e25646ee63706a159f28b126ab361e3558e51f75695bbc0dc417": {
       "font": {
         "name": "仿宋",
         "sizePoints": 14,
         "bold": false,
-        "colorArgb": "FF000000"
+        "italic": false,
+        "underline": null,
+        "color": "FF000000"
       },
-      "horizontalAlignment": "center",
-      "verticalAlignment": "middle",
-      "wrapText": "by-column-policy",
-      "shrinkToFit": false,
-      "fillArgb": "FFFFFFFF",
-      "borderToken": "none",
-      "minimumRowHeightPoints": 30
+      "fill": {
+        "patternType": "none",
+        "foreground": null,
+        "background": null
+      },
+      "border": {
+        "left": {
+          "style": "thin",
+          "color": "FFFFFFFF"
+        },
+        "right": {
+          "style": "thin",
+          "color": "FFFFFFFF"
+        },
+        "top": {
+          "style": "thin",
+          "color": "FFFFFFFF"
+        },
+        "bottom": {
+          "style": "thin",
+          "color": "FFFFFFFF"
+        }
+      },
+      "alignment": {
+        "horizontal": "center",
+        "vertical": "center",
+        "wrapText": true,
+        "shrinkToFit": false,
+        "textRotation": 0,
+        "indent": 0
+      },
+      "numberFormat": "0",
+      "protection": null
     },
-    "mergedBusinessAnchor": {
+    "4285579109cdc1d0240ce4f8d8bb592c6fcfb36a6e9fec51d9d3d6f91366c7c1": {
       "font": {
         "name": "仿宋",
         "sizePoints": 14,
         "bold": false,
-        "colorArgb": "FF000000"
+        "italic": false,
+        "underline": null,
+        "color": "FF000000"
       },
-      "horizontalAlignment": "center",
-      "verticalAlignment": "middle",
-      "wrapText": true,
-      "shrinkToFit": false,
-      "fillArgb": "FFFFFFFF",
-      "borderToken": "none"
+      "fill": {
+        "patternType": "none",
+        "foreground": null,
+        "background": null
+      },
+      "border": {
+        "left": {
+          "style": "thin",
+          "color": "FFFFFFFF"
+        },
+        "right": {
+          "style": "thin",
+          "color": "FFFFFFFF"
+        },
+        "top": {
+          "style": "thin",
+          "color": "FFFFFFFF"
+        },
+        "bottom": {
+          "style": "thin",
+          "color": "FFFFFFFF"
+        }
+      },
+      "alignment": {
+        "horizontal": "center",
+        "vertical": "center",
+        "wrapText": true,
+        "shrinkToFit": false,
+        "textRotation": 0,
+        "indent": 0
+      },
+      "numberFormat": "mm-dd",
+      "protection": null
     },
-    "narrative": {
+    "4449c105155746398c44078042846a65c6230380222ce78de1088e48b5819e90": {
       "font": {
         "name": "仿宋",
         "sizePoints": 14,
         "bold": false,
-        "colorArgb": "FF000000"
+        "italic": false,
+        "underline": null,
+        "color": "FFFFFFFF"
       },
-      "horizontalAlignment": "left",
-      "verticalAlignment": "middle",
-      "wrapText": true,
-      "shrinkToFit": false,
-      "fillArgb": "FFFFFFFF",
-      "borderToken": "none"
+      "fill": {
+        "patternType": "solid",
+        "foreground": "FFB68C02",
+        "background": null
+      },
+      "border": {},
+      "alignment": {
+        "horizontal": "center",
+        "vertical": "center",
+        "wrapText": false,
+        "shrinkToFit": false,
+        "textRotation": 0,
+        "indent": 0
+      },
+      "numberFormat": "builtin:0",
+      "protection": null
+    },
+    "47bedff020bacc7abccc12b7362d7b5cbe484c58b835153dd231e116f10f9884": {
+      "font": {
+        "name": "Carlito",
+        "sizePoints": 16,
+        "bold": true,
+        "italic": false,
+        "underline": null,
+        "color": "FFFFFFFF"
+      },
+      "fill": {
+        "patternType": "solid",
+        "foreground": "FF548235",
+        "background": null
+      },
+      "border": {},
+      "alignment": {
+        "horizontal": "center",
+        "vertical": "center",
+        "wrapText": false,
+        "shrinkToFit": false,
+        "textRotation": 0,
+        "indent": 0
+      },
+      "numberFormat": "builtin:0",
+      "protection": null
+    },
+    "4a8dc411946fcaac5f53c0199e1eeb29bff9e3e88f8b6767c65f2dc79bd5799b": {
+      "font": {
+        "name": "Microsoft YaHei",
+        "sizePoints": 11,
+        "bold": true,
+        "italic": false,
+        "underline": null,
+        "color": "FFFFFFFF"
+      },
+      "fill": {
+        "patternType": "solid",
+        "foreground": "FFE3B333",
+        "background": null
+      },
+      "border": {
+        "left": {
+          "style": "thin",
+          "color": "FFC89B19"
+        },
+        "right": {
+          "style": "thin",
+          "color": "FFC89B19"
+        },
+        "top": {
+          "style": "thin",
+          "color": "FFC89B19"
+        },
+        "bottom": {
+          "style": "thin",
+          "color": "FFC89B19"
+        }
+      },
+      "alignment": {
+        "horizontal": "center",
+        "vertical": "center",
+        "wrapText": true,
+        "shrinkToFit": false,
+        "textRotation": 0,
+        "indent": 0
+      },
+      "numberFormat": "builtin:0",
+      "protection": null
+    },
+    "4d74ed58283165038c33724c270a7804cf9a26c6bd5365f242ed2e01744dc94f": {
+      "font": {
+        "name": "Carlito",
+        "sizePoints": 11,
+        "bold": true,
+        "italic": false,
+        "underline": null,
+        "color": "FFFFFFFF"
+      },
+      "fill": {
+        "patternType": "solid",
+        "foreground": "FF70AD47",
+        "background": null
+      },
+      "border": {
+        "left": {
+          "style": "thin",
+          "color": "FFA9D08E"
+        },
+        "right": {
+          "style": "thin",
+          "color": "FFA9D08E"
+        },
+        "top": {
+          "style": "thin",
+          "color": "FFA9D08E"
+        },
+        "bottom": {
+          "style": "thin",
+          "color": "FFA9D08E"
+        }
+      },
+      "alignment": {
+        "horizontal": "center",
+        "vertical": "center",
+        "wrapText": false,
+        "shrinkToFit": false,
+        "textRotation": 0,
+        "indent": 0
+      },
+      "numberFormat": "builtin:0",
+      "protection": null
+    },
+    "50a473a8b896cf32f070ad9bbfce32fadfa5cae8e38d543cfdc6f302209ca91f": {
+      "font": {
+        "name": "Carlito",
+        "sizePoints": 11,
+        "bold": true,
+        "italic": false,
+        "underline": null,
+        "color": "FF375623"
+      },
+      "fill": {
+        "patternType": "solid",
+        "foreground": "FFF2F2F2",
+        "background": null
+      },
+      "border": {},
+      "alignment": {
+        "horizontal": "center",
+        "vertical": "center",
+        "wrapText": false,
+        "shrinkToFit": false,
+        "textRotation": 0,
+        "indent": 0
+      },
+      "numberFormat": "builtin:0",
+      "protection": null
+    },
+    "52e7f5775899c1e2900388ad0eee35c32c4fd8a6ee27243c3f75edb3cddee6e2": {
+      "font": {
+        "name": "Carlito",
+        "sizePoints": 11,
+        "bold": true,
+        "italic": false,
+        "underline": null,
+        "color": "001F4E78"
+      },
+      "fill": {
+        "patternType": "solid",
+        "foreground": "00DDEBF7",
+        "background": null
+      },
+      "border": {
+        "left": {
+          "style": "thin",
+          "color": "00C6D5B4"
+        },
+        "right": {
+          "style": "thin",
+          "color": "00C6D5B4"
+        },
+        "top": {
+          "style": "thin",
+          "color": "00C6D5B4"
+        },
+        "bottom": {
+          "style": "thin",
+          "color": "00C6D5B4"
+        }
+      },
+      "alignment": {
+        "horizontal": "left",
+        "vertical": "center",
+        "wrapText": true,
+        "shrinkToFit": false,
+        "textRotation": 0,
+        "indent": 0
+      },
+      "numberFormat": "builtin:0",
+      "protection": null
+    },
+    "5690bfd70b83c4778da2cc31883a8af0a459e582e450536f4086e6a4b088814d": {
+      "font": {
+        "name": "Microsoft YaHei",
+        "sizePoints": 10,
+        "bold": false,
+        "italic": false,
+        "underline": null,
+        "color": "FF263238"
+      },
+      "fill": {
+        "patternType": "none",
+        "foreground": null,
+        "background": null
+      },
+      "border": {
+        "left": {
+          "style": "thin",
+          "color": "FFE0E6E8"
+        },
+        "right": {
+          "style": "thin",
+          "color": "FFE0E6E8"
+        },
+        "top": {
+          "style": "thin",
+          "color": "FFE0E6E8"
+        },
+        "bottom": {
+          "style": "thin",
+          "color": "FFE0E6E8"
+        }
+      },
+      "alignment": {
+        "horizontal": "center",
+        "vertical": "center",
+        "wrapText": false,
+        "shrinkToFit": false,
+        "textRotation": 0,
+        "indent": 0
+      },
+      "numberFormat": "mm\\-dd",
+      "protection": null
+    },
+    "62add124b9f20fbae27fdb1bf66880400fdc9b1aea58295c20e41db24c81793a": {
+      "font": {
+        "name": "仿宋",
+        "sizePoints": 14,
+        "bold": false,
+        "italic": false,
+        "underline": null,
+        "color": "FFFFFFFF"
+      },
+      "fill": {
+        "patternType": "solid",
+        "foreground": "FFB68C02",
+        "background": null
+      },
+      "border": {},
+      "alignment": {
+        "horizontal": "center",
+        "vertical": "center",
+        "wrapText": false,
+        "shrinkToFit": false,
+        "textRotation": 0,
+        "indent": 0
+      },
+      "numberFormat": "builtin:49",
+      "protection": null
+    },
+    "764b146b0ebc1cc491a54f803950915f41fd6e8e4bd09344c21a76caae0e7cb2": {
+      "font": {
+        "name": "Carlito",
+        "sizePoints": 10,
+        "bold": false,
+        "italic": false,
+        "underline": null,
+        "color": "FF222222"
+      },
+      "fill": {
+        "patternType": "none",
+        "foreground": null,
+        "background": null
+      },
+      "border": {
+        "left": {
+          "style": "thin",
+          "color": "FFD9EAD3"
+        },
+        "right": {
+          "style": "thin",
+          "color": "FFD9EAD3"
+        },
+        "top": {
+          "style": "thin",
+          "color": "FFD9EAD3"
+        },
+        "bottom": {
+          "style": "thin",
+          "color": "FFD9EAD3"
+        }
+      },
+      "alignment": {
+        "horizontal": "right",
+        "vertical": "center",
+        "wrapText": false,
+        "shrinkToFit": false,
+        "textRotation": 0,
+        "indent": 0
+      },
+      "numberFormat": "0",
+      "protection": null
+    },
+    "7be66ff1187368f3e23e464e3ac6a22b37d4c1e90feceae16eb9d9e2a8e1c01d": {
+      "font": {
+        "name": "Carlito",
+        "sizePoints": 11,
+        "bold": true,
+        "italic": false,
+        "underline": null,
+        "color": "00FFFFFF"
+      },
+      "fill": {
+        "patternType": "solid",
+        "foreground": "006B8E23",
+        "background": null
+      },
+      "border": {
+        "left": {
+          "style": "thin",
+          "color": "00CFD8DC"
+        },
+        "right": {
+          "style": "thin",
+          "color": "00CFD8DC"
+        },
+        "top": {
+          "style": "thin",
+          "color": "00CFD8DC"
+        },
+        "bottom": {
+          "style": "thin",
+          "color": "00CFD8DC"
+        }
+      },
+      "alignment": {
+        "horizontal": "center",
+        "vertical": "center",
+        "wrapText": true,
+        "shrinkToFit": false,
+        "textRotation": 0,
+        "indent": 0
+      },
+      "numberFormat": "builtin:0",
+      "protection": null
+    },
+    "823e3c9213a596e14dbf55b669f7b3d147c477248d845554ece50cfe53e12be7": {
+      "font": {
+        "name": "Microsoft YaHei",
+        "sizePoints": 10,
+        "bold": false,
+        "italic": false,
+        "underline": null,
+        "color": "00263238"
+      },
+      "fill": {
+        "patternType": "solid",
+        "foreground": "00FFFFFF",
+        "background": null
+      },
+      "border": {
+        "left": {
+          "style": "thin",
+          "color": "00E0E6E8"
+        },
+        "right": {
+          "style": "thin",
+          "color": "00E0E6E8"
+        },
+        "top": {
+          "style": "thin",
+          "color": "00E0E6E8"
+        },
+        "bottom": {
+          "style": "thin",
+          "color": "00E0E6E8"
+        }
+      },
+      "alignment": {
+        "horizontal": "left",
+        "vertical": "center",
+        "wrapText": true,
+        "shrinkToFit": false,
+        "textRotation": 0,
+        "indent": 0
+      },
+      "numberFormat": "builtin:0",
+      "protection": null
+    },
+    "87a3843877d3f72707aa253417d2ae2d69257be75dfed5aac1abd23cfa4db0c8": {
+      "font": {
+        "name": "Carlito",
+        "sizePoints": 11,
+        "bold": true,
+        "italic": false,
+        "underline": null,
+        "color": "FF385723"
+      },
+      "fill": {
+        "patternType": "solid",
+        "foreground": "FFE2F0D9",
+        "background": null
+      },
+      "border": {
+        "left": {
+          "style": "thin",
+          "color": "FFC6D5B4"
+        },
+        "right": {
+          "style": "thin",
+          "color": "FFC6D5B4"
+        },
+        "top": {
+          "style": "thin",
+          "color": "FFC6D5B4"
+        },
+        "bottom": {
+          "style": "thin",
+          "color": "FFC6D5B4"
+        }
+      },
+      "alignment": {
+        "horizontal": "center",
+        "vertical": "center",
+        "wrapText": false,
+        "shrinkToFit": false,
+        "textRotation": 0,
+        "indent": 0
+      },
+      "numberFormat": "0",
+      "protection": null
+    },
+    "880aa0e1dacc9707a2215a288820a37c181b736b4d957865c2b6901038ff00d6": {
+      "font": {
+        "name": "Microsoft YaHei",
+        "sizePoints": 18,
+        "bold": true,
+        "italic": false,
+        "underline": null,
+        "color": "00FFFFFF"
+      },
+      "fill": {
+        "patternType": "solid",
+        "foreground": "00567D27",
+        "background": null
+      },
+      "border": {},
+      "alignment": {
+        "horizontal": "center",
+        "vertical": "center",
+        "wrapText": true,
+        "shrinkToFit": false,
+        "textRotation": 0,
+        "indent": 0
+      },
+      "numberFormat": "builtin:0",
+      "protection": null
+    },
+    "8a3b34dfc4c305fdc4f3975fa32eb8a45845c922a41ce64f035e55f39b0de762": {
+      "font": {
+        "name": "Carlito",
+        "sizePoints": 10,
+        "bold": false,
+        "italic": false,
+        "underline": null,
+        "color": "FF222222"
+      },
+      "fill": {
+        "patternType": "none",
+        "foreground": null,
+        "background": null
+      },
+      "border": {
+        "left": {
+          "style": "thin",
+          "color": "FFD9EAD3"
+        },
+        "right": {
+          "style": "thin",
+          "color": "FFD9EAD3"
+        },
+        "top": {
+          "style": "thin",
+          "color": "FFD9EAD3"
+        },
+        "bottom": {
+          "style": "thin",
+          "color": "FFD9EAD3"
+        }
+      },
+      "alignment": {
+        "horizontal": "center",
+        "vertical": "center",
+        "wrapText": false,
+        "shrinkToFit": false,
+        "textRotation": 0,
+        "indent": 0
+      },
+      "numberFormat": "builtin:0",
+      "protection": null
+    },
+    "9cd710e9aa571d7f0425cff39ab3029ee2445afcd6e55f51cf3d3a86b55ef75f": {
+      "font": {
+        "name": "Carlito",
+        "sizePoints": 11,
+        "bold": true,
+        "italic": false,
+        "underline": null,
+        "color": "001F4E78"
+      },
+      "fill": {
+        "patternType": "solid",
+        "foreground": "00DDEBF7",
+        "background": null
+      },
+      "border": {
+        "left": {
+          "style": "thin",
+          "color": "00C6D5B4"
+        },
+        "right": {
+          "style": "thin",
+          "color": "00C6D5B4"
+        },
+        "top": {
+          "style": "thin",
+          "color": "00C6D5B4"
+        },
+        "bottom": {
+          "style": "thin",
+          "color": "00C6D5B4"
+        }
+      },
+      "alignment": {
+        "horizontal": "right",
+        "vertical": "center",
+        "wrapText": false,
+        "shrinkToFit": false,
+        "textRotation": 0,
+        "indent": 0
+      },
+      "numberFormat": "builtin:0",
+      "protection": null
+    },
+    "a241a703a5ac20c1e172934ab62796132b63e5ff5ccf1fdf439f09e6584f644e": {
+      "font": {
+        "name": "Carlito",
+        "sizePoints": 11,
+        "bold": true,
+        "italic": false,
+        "underline": null,
+        "color": null
+      },
+      "fill": {
+        "patternType": "solid",
+        "foreground": "FFE2F0D9",
+        "background": null
+      },
+      "border": {},
+      "alignment": {
+        "horizontal": "center",
+        "vertical": "center",
+        "wrapText": false,
+        "shrinkToFit": false,
+        "textRotation": 0,
+        "indent": 0
+      },
+      "numberFormat": "builtin:0",
+      "protection": null
+    },
+    "a3e9a90cf3dadbb1e02d1ccf07c1d372fa4e1c1ca7503ba1778b3ded36f697dd": {
+      "font": {
+        "name": "Carlito",
+        "sizePoints": 11,
+        "bold": true,
+        "italic": false,
+        "underline": null,
+        "color": "FF1F4E78"
+      },
+      "fill": {
+        "patternType": "solid",
+        "foreground": "FFDDEBF7",
+        "background": null
+      },
+      "border": {},
+      "alignment": {
+        "horizontal": "center",
+        "vertical": "center",
+        "wrapText": false,
+        "shrinkToFit": false,
+        "textRotation": 0,
+        "indent": 0
+      },
+      "numberFormat": "builtin:0",
+      "protection": null
+    },
+    "a5c29ddc46c08083bcc5f021b06e762dd2af84d310523b2f2b1bd08deb2db699": {
+      "font": {
+        "name": "Microsoft YaHei",
+        "sizePoints": 10,
+        "bold": false,
+        "italic": false,
+        "underline": null,
+        "color": "FF263238"
+      },
+      "fill": {
+        "patternType": "none",
+        "foreground": null,
+        "background": null
+      },
+      "border": {
+        "left": {
+          "style": "thin",
+          "color": "FFE0E6E8"
+        },
+        "right": {
+          "style": "thin",
+          "color": "FFE0E6E8"
+        },
+        "top": {
+          "style": "thin",
+          "color": "FFE0E6E8"
+        },
+        "bottom": {
+          "style": "thin",
+          "color": "FFE0E6E8"
+        }
+      },
+      "alignment": {
+        "horizontal": "left",
+        "vertical": "center",
+        "wrapText": true,
+        "shrinkToFit": false,
+        "textRotation": 0,
+        "indent": 0
+      },
+      "numberFormat": "builtin:0",
+      "protection": null
+    },
+    "ad2f953e7c5383f4d03fa7298e39a91f41091c5c44205718780df686e79fe180": {
+      "font": {
+        "name": "Carlito",
+        "sizePoints": 11,
+        "bold": true,
+        "italic": false,
+        "underline": null,
+        "color": null
+      },
+      "fill": {
+        "patternType": "solid",
+        "foreground": "FFDDEBF7",
+        "background": null
+      },
+      "border": {},
+      "alignment": {
+        "horizontal": "center",
+        "vertical": "center",
+        "wrapText": false,
+        "shrinkToFit": false,
+        "textRotation": 0,
+        "indent": 0
+      },
+      "numberFormat": "builtin:0",
+      "protection": null
+    },
+    "b20265518b6d764a3843f35b6cda3f9f32bc5092c76c846681630b56fa9403e3": {
+      "font": {
+        "name": "Microsoft YaHei",
+        "sizePoints": 9,
+        "bold": false,
+        "italic": false,
+        "underline": null,
+        "color": "FF4C5962"
+      },
+      "fill": {
+        "patternType": "solid",
+        "foreground": "FFFFFCF4",
+        "background": null
+      },
+      "border": {
+        "left": {
+          "style": "thin",
+          "color": "FFD7DDE0"
+        },
+        "right": {
+          "style": "thin",
+          "color": "FFD7DDE0"
+        },
+        "top": {
+          "style": "thin",
+          "color": "FFD7DDE0"
+        },
+        "bottom": {
+          "style": "thin",
+          "color": "FFD7DDE0"
+        }
+      },
+      "alignment": {
+        "horizontal": "center",
+        "vertical": "center",
+        "wrapText": true,
+        "shrinkToFit": false,
+        "textRotation": 0,
+        "indent": 0
+      },
+      "numberFormat": "mm-dd",
+      "protection": null
+    },
+    "b20ae4ff6774787a0b6b97b429259c259bbf23f808d3c89334fe6395dc8c3242": {
+      "font": {
+        "name": "Carlito",
+        "sizePoints": 11,
+        "bold": false,
+        "italic": false,
+        "underline": null,
+        "color": null
+      },
+      "fill": {
+        "patternType": "none",
+        "foreground": null,
+        "background": null
+      },
+      "border": {},
+      "alignment": {
+        "horizontal": null,
+        "vertical": null,
+        "wrapText": false,
+        "shrinkToFit": false,
+        "textRotation": 0,
+        "indent": 0
+      },
+      "numberFormat": "builtin:0",
+      "protection": null
+    },
+    "bfc9bdf24b5fc0b23d1da50f8966920a0d49f62de71e9da2027155a6cbd2f131": {
+      "font": {
+        "name": "Carlito",
+        "sizePoints": 11,
+        "bold": true,
+        "italic": false,
+        "underline": null,
+        "color": "FFFFFFFF"
+      },
+      "fill": {
+        "patternType": "solid",
+        "foreground": "FF6B8E23",
+        "background": null
+      },
+      "border": {
+        "left": {
+          "style": "thin",
+          "color": "FFCFD8DC"
+        },
+        "right": {
+          "style": "thin",
+          "color": "FFCFD8DC"
+        },
+        "top": {
+          "style": "thin",
+          "color": "FFCFD8DC"
+        },
+        "bottom": {
+          "style": "thin",
+          "color": "FFCFD8DC"
+        }
+      },
+      "alignment": {
+        "horizontal": "center",
+        "vertical": "center",
+        "wrapText": true,
+        "shrinkToFit": false,
+        "textRotation": 0,
+        "indent": 0
+      },
+      "numberFormat": "builtin:0",
+      "protection": null
+    },
+    "d31a28dd65534200d7e35a954696e728b593430df770c0dd518b40b17ee51cd6": {
+      "font": {
+        "name": "Microsoft YaHei",
+        "sizePoints": 10,
+        "bold": false,
+        "italic": false,
+        "underline": null,
+        "color": "00607080"
+      },
+      "fill": {
+        "patternType": "solid",
+        "foreground": "00EEF5E8",
+        "background": null
+      },
+      "border": {},
+      "alignment": {
+        "horizontal": "center",
+        "vertical": "center",
+        "wrapText": true,
+        "shrinkToFit": false,
+        "textRotation": 0,
+        "indent": 0
+      },
+      "numberFormat": "builtin:0",
+      "protection": null
+    },
+    "de51af03e67498079066d1c6aa18bd84aeb4a479e9a1a54a2f7078b567536e7c": {
+      "font": {
+        "name": "Microsoft YaHei",
+        "sizePoints": 9,
+        "bold": false,
+        "italic": false,
+        "underline": null,
+        "color": "FF4C5962"
+      },
+      "fill": {
+        "patternType": "solid",
+        "foreground": "FFF5F8FA",
+        "background": null
+      },
+      "border": {
+        "left": {
+          "style": "thin",
+          "color": "FFD7DDE0"
+        },
+        "right": {
+          "style": "thin",
+          "color": "FFD7DDE0"
+        },
+        "top": {
+          "style": "thin",
+          "color": "FFD7DDE0"
+        },
+        "bottom": {
+          "style": "thin",
+          "color": "FFD7DDE0"
+        }
+      },
+      "alignment": {
+        "horizontal": null,
+        "vertical": "center",
+        "wrapText": true,
+        "shrinkToFit": false,
+        "textRotation": 0,
+        "indent": 0
+      },
+      "numberFormat": "builtin:0",
+      "protection": null
+    },
+    "e498577d7a6d8c80f4f89bc0a410b5fd99c7fd35bb1ec33f94f0f96c1adb1bb2": {
+      "font": {
+        "name": "Microsoft YaHei",
+        "sizePoints": 10,
+        "bold": false,
+        "italic": false,
+        "underline": null,
+        "color": "FF263238"
+      },
+      "fill": {
+        "patternType": "none",
+        "foreground": null,
+        "background": null
+      },
+      "border": {
+        "left": {
+          "style": "thin",
+          "color": "FFE0E6E8"
+        },
+        "right": {
+          "style": "thin",
+          "color": "FFE0E6E8"
+        },
+        "top": {
+          "style": "thin",
+          "color": "FFE0E6E8"
+        },
+        "bottom": {
+          "style": "thin",
+          "color": "FFE0E6E8"
+        }
+      },
+      "alignment": {
+        "horizontal": "center",
+        "vertical": "center",
+        "wrapText": true,
+        "shrinkToFit": false,
+        "textRotation": 0,
+        "indent": 0
+      },
+      "numberFormat": "0",
+      "protection": null
+    },
+    "e85553dea9c2625f238935aa22202f831ffa0f17f869fa6f40cc2139cf9cc399": {
+      "font": {
+        "name": "Microsoft YaHei",
+        "sizePoints": 10,
+        "bold": false,
+        "italic": false,
+        "underline": null,
+        "color": "00263238"
+      },
+      "fill": {
+        "patternType": "solid",
+        "foreground": "00FFFFFF",
+        "background": null
+      },
+      "border": {
+        "left": {
+          "style": "thin",
+          "color": "00E0E6E8"
+        },
+        "right": {
+          "style": "thin",
+          "color": "00E0E6E8"
+        },
+        "top": {
+          "style": "thin",
+          "color": "00E0E6E8"
+        },
+        "bottom": {
+          "style": "thin",
+          "color": "00E0E6E8"
+        }
+      },
+      "alignment": {
+        "horizontal": "center",
+        "vertical": "center",
+        "wrapText": true,
+        "shrinkToFit": false,
+        "textRotation": 0,
+        "indent": 0
+      },
+      "numberFormat": "builtin:0",
+      "protection": null
+    },
+    "e9b7d6e9131841aa75926df3686c22921fbb61abff453a9c94c3055268bcb081": {
+      "font": {
+        "name": "Carlito",
+        "sizePoints": 11,
+        "bold": true,
+        "italic": false,
+        "underline": null,
+        "color": "FF385723"
+      },
+      "fill": {
+        "patternType": "solid",
+        "foreground": "FFE2F0D9",
+        "background": null
+      },
+      "border": {
+        "left": {
+          "style": "thin",
+          "color": "FFC6D5B4"
+        },
+        "right": {
+          "style": "thin",
+          "color": "FFC6D5B4"
+        },
+        "top": {
+          "style": "thin",
+          "color": "FFC6D5B4"
+        },
+        "bottom": {
+          "style": "thin",
+          "color": "FFC6D5B4"
+        }
+      },
+      "alignment": {
+        "horizontal": "center",
+        "vertical": "center",
+        "wrapText": false,
+        "shrinkToFit": false,
+        "textRotation": 0,
+        "indent": 0
+      },
+      "numberFormat": "builtin:0",
+      "protection": null
+    },
+    "ea5d06e70a54dabd0f6ba9dd28fd892819d21518c5576a8a499561157feb183e": {
+      "font": {
+        "name": "Microsoft YaHei",
+        "sizePoints": 9,
+        "bold": false,
+        "italic": false,
+        "underline": null,
+        "color": "FF4C5962"
+      },
+      "fill": {
+        "patternType": "solid",
+        "foreground": "FFFFF7E6",
+        "background": null
+      },
+      "border": {
+        "left": {
+          "style": "thin",
+          "color": "FFD7DDE0"
+        },
+        "right": {
+          "style": "thin",
+          "color": "FFD7DDE0"
+        },
+        "top": {
+          "style": "thin",
+          "color": "FFD7DDE0"
+        },
+        "bottom": {
+          "style": "thin",
+          "color": "FFD7DDE0"
+        }
+      },
+      "alignment": {
+        "horizontal": "center",
+        "vertical": "center",
+        "wrapText": true,
+        "shrinkToFit": false,
+        "textRotation": 0,
+        "indent": 0
+      },
+      "numberFormat": "mm-dd",
+      "protection": null
+    },
+    "eba7ca43a2bbcc0706c286d27e35af5e9035e6131662dad9b1cc6b654847025d": {
+      "font": {
+        "name": "仿宋",
+        "sizePoints": 14,
+        "bold": false,
+        "italic": false,
+        "underline": null,
+        "color": "FFFFFFFF"
+      },
+      "fill": {
+        "patternType": "solid",
+        "foreground": "FFB68C02",
+        "background": null
+      },
+      "border": {},
+      "alignment": {
+        "horizontal": "center",
+        "vertical": "center",
+        "wrapText": true,
+        "shrinkToFit": false,
+        "textRotation": 0,
+        "indent": 0
+      },
+      "numberFormat": "builtin:0",
+      "protection": null
+    },
+    "ebe509bf397ba344ead8488b1a4c898583b5cdb80fb51ce9649955c41dbab224": {
+      "font": {
+        "name": "Microsoft YaHei",
+        "sizePoints": 9,
+        "bold": false,
+        "italic": false,
+        "underline": null,
+        "color": "FF4C5962"
+      },
+      "fill": {
+        "patternType": "solid",
+        "foreground": "FFFFF7E6",
+        "background": null
+      },
+      "border": {
+        "left": {
+          "style": "thin",
+          "color": "FFD7DDE0"
+        },
+        "right": {
+          "style": "thin",
+          "color": "FFD7DDE0"
+        },
+        "top": {
+          "style": "thin",
+          "color": "FFD7DDE0"
+        },
+        "bottom": {
+          "style": "thin",
+          "color": "FFD7DDE0"
+        }
+      },
+      "alignment": {
+        "horizontal": null,
+        "vertical": "center",
+        "wrapText": true,
+        "shrinkToFit": false,
+        "textRotation": 0,
+        "indent": 0
+      },
+      "numberFormat": "builtin:0",
+      "protection": null
+    },
+    "ec12d34c0dfb1d5a8f0136bf7730d0286d08aaeb291369776b9ffdb76070f274": {
+      "font": {
+        "name": "Microsoft YaHei",
+        "sizePoints": 10,
+        "bold": false,
+        "italic": false,
+        "underline": null,
+        "color": "00263238"
+      },
+      "fill": {
+        "patternType": "solid",
+        "foreground": "00FFFFFF",
+        "background": null
+      },
+      "border": {
+        "left": {
+          "style": "thin",
+          "color": "00E0E6E8"
+        },
+        "right": {
+          "style": "thin",
+          "color": "00E0E6E8"
+        },
+        "top": {
+          "style": "thin",
+          "color": "00E0E6E8"
+        },
+        "bottom": {
+          "style": "thin",
+          "color": "00E0E6E8"
+        }
+      },
+      "alignment": {
+        "horizontal": "right",
+        "vertical": "center",
+        "wrapText": false,
+        "shrinkToFit": false,
+        "textRotation": 0,
+        "indent": 0
+      },
+      "numberFormat": "builtin:0",
+      "protection": null
+    },
+    "ecf54fb268faae60674ddd8038931f424c9bbb69a0e6367e4605a6f8493a844e": {
+      "font": {
+        "name": "Microsoft YaHei",
+        "sizePoints": 18,
+        "bold": true,
+        "italic": false,
+        "underline": null,
+        "color": "FFFFFFFF"
+      },
+      "fill": {
+        "patternType": "solid",
+        "foreground": "FF567D27",
+        "background": null
+      },
+      "border": {},
+      "alignment": {
+        "horizontal": "center",
+        "vertical": "center",
+        "wrapText": false,
+        "shrinkToFit": false,
+        "textRotation": 0,
+        "indent": 0
+      },
+      "numberFormat": "builtin:0",
+      "protection": null
+    },
+    "ed806afeed4209f1e76778533d5e58cbea1b056fe9792dd812cbe332d9385664": {
+      "font": {
+        "name": "Microsoft YaHei",
+        "sizePoints": 9,
+        "bold": false,
+        "italic": false,
+        "underline": null,
+        "color": "FF4C5962"
+      },
+      "fill": {
+        "patternType": "solid",
+        "foreground": "FFFFFCF4",
+        "background": null
+      },
+      "border": {
+        "left": {
+          "style": "thin",
+          "color": "FFD7DDE0"
+        },
+        "right": {
+          "style": "thin",
+          "color": "FFD7DDE0"
+        },
+        "top": {
+          "style": "thin",
+          "color": "FFD7DDE0"
+        },
+        "bottom": {
+          "style": "thin",
+          "color": "FFD7DDE0"
+        }
+      },
+      "alignment": {
+        "horizontal": null,
+        "vertical": "center",
+        "wrapText": true,
+        "shrinkToFit": false,
+        "textRotation": 0,
+        "indent": 0
+      },
+      "numberFormat": "builtin:0",
+      "protection": null
+    },
+    "f2644c3c07c141f67f9b6d89216085472371d2fefa6f37bf366e0a25b6f923ac": {
+      "font": {
+        "name": "Carlito",
+        "sizePoints": 11,
+        "bold": true,
+        "italic": false,
+        "underline": null,
+        "color": null
+      },
+      "fill": {
+        "patternType": "solid",
+        "foreground": "FFFCE4D6",
+        "background": null
+      },
+      "border": {},
+      "alignment": {
+        "horizontal": "center",
+        "vertical": "center",
+        "wrapText": false,
+        "shrinkToFit": false,
+        "textRotation": 0,
+        "indent": 0
+      },
+      "numberFormat": "builtin:0",
+      "protection": null
+    },
+    "f3798e8455a88f8233469c4d9b15b13ce83bdae2c9e02d8a23010f1440e1aa91": {
+      "font": {
+        "name": "Carlito",
+        "sizePoints": 16,
+        "bold": true,
+        "italic": false,
+        "underline": null,
+        "color": null
+      },
+      "fill": {
+        "patternType": "solid",
+        "foreground": "FFFCE4D6",
+        "background": null
+      },
+      "border": {},
+      "alignment": {
+        "horizontal": "center",
+        "vertical": "center",
+        "wrapText": false,
+        "shrinkToFit": false,
+        "textRotation": 0,
+        "indent": 0
+      },
+      "numberFormat": "0",
+      "protection": null
+    },
+    "fa5cb827c3f12e9f8951bdfe66abfab24e4f284aa12735edf36ec559d2dd41d4": {
+      "font": {
+        "name": "Microsoft YaHei",
+        "sizePoints": 9,
+        "bold": false,
+        "italic": false,
+        "underline": null,
+        "color": "FF4C5962"
+      },
+      "fill": {
+        "patternType": "solid",
+        "foreground": "FFFFFCF4",
+        "background": null
+      },
+      "border": {
+        "left": {
+          "style": "thin",
+          "color": "FFD7DDE0"
+        },
+        "right": {
+          "style": "thin",
+          "color": "FFD7DDE0"
+        },
+        "top": {
+          "style": "thin",
+          "color": "FFD7DDE0"
+        },
+        "bottom": {
+          "style": "thin",
+          "color": "FFD7DDE0"
+        }
+      },
+      "alignment": {
+        "horizontal": "center",
+        "vertical": "center",
+        "wrapText": true,
+        "shrinkToFit": false,
+        "textRotation": 0,
+        "indent": 0
+      },
+      "numberFormat": "builtin:0",
+      "protection": null
+    },
+    "fac6e20c1b471b805d264dd155aff1f1cbf7b073171681e3bba0cf91e377146b": {
+      "font": {
+        "name": "Microsoft YaHei",
+        "sizePoints": 10,
+        "bold": false,
+        "italic": false,
+        "underline": null,
+        "color": "FF263238"
+      },
+      "fill": {
+        "patternType": "none",
+        "foreground": null,
+        "background": null
+      },
+      "border": {
+        "left": {
+          "style": "thin",
+          "color": "FFE0E6E8"
+        },
+        "right": {
+          "style": "thin",
+          "color": "FFE0E6E8"
+        },
+        "top": {
+          "style": "thin",
+          "color": "FFE0E6E8"
+        },
+        "bottom": {
+          "style": "thin",
+          "color": "FFE0E6E8"
+        }
+      },
+      "alignment": {
+        "horizontal": "right",
+        "vertical": "center",
+        "wrapText": false,
+        "shrinkToFit": false,
+        "textRotation": 0,
+        "indent": 0
+      },
+      "numberFormat": "0",
+      "protection": null
     }
   },
-  "tokens": {
-    "colors": {
-      "greenPrimaryArgb": "FFB68D01",
-      "bluePrimaryArgb": "FF4472C4",
-      "companyPaidWarningArgb": "FFF4B183",
-      "whiteArgb": "FFFFFFFF",
-      "blackArgb": "FF000000"
-    },
-    "borders": {
-      "grid": {
-        "left": "thin",
-        "right": "thin",
-        "top": "thin",
-        "bottom": "thin",
-        "colorArgb": "FF000000"
-      },
-      "none": {
-        "left": "none",
-        "right": "none",
-        "top": "none",
-        "bottom": "none",
-        "colorArgb": "FF000000"
-      }
-    }
-  },
-  "themeRoles": {
-    "green-base": {
-      "primaryFillArgb": "FFB68D01",
-      "title": "greenPrimaryArgb",
-      "header": "greenPrimaryArgb",
-      "summaryCard": "greenPrimaryArgb",
-      "personBlockHeader": "greenPrimaryArgb",
-      "companyPaidBlockHeader": "companyPaidWarningArgb"
-    },
-    "blue-role-override": {
-      "inherits": "green-base",
-      "overrides": {
-        "primaryFillArgb": "FF4472C4",
-        "title": "bluePrimaryArgb",
-        "header": "bluePrimaryArgb",
-        "summaryCard": "bluePrimaryArgb",
-        "personBlockHeader": "bluePrimaryArgb",
-        "fontColorArgb": "FFFFFFFF"
-      },
-      "unchangedRoles": [
-        "companyPaidBlockHeader",
-        "businessCell",
-        "mergedBusinessAnchor",
-        "narrative"
-      ]
-    }
-  },
-  "numberFormats": {
-    "integer": "0",
-    "ordinaryFraction": "0.00",
-    "explicitThreeDecimals": "0.000",
-    "date": "mm-dd",
-    "groupTotalPolicy": "maximum-explicit-precision-in-group"
-  },
-  "mergeContract": {
-    "businessGroupColumns": [
-      "D",
-      "E",
-      "F"
-    ],
-    "requireIdenticalRangeAcrossBusinessGroupColumns": true,
-    "groupKey": [
-      "personOrSubject",
-      "classification",
-      "rowType",
-      "settlement"
-    ],
-    "dateChangeDoesNotSplitBusinessGroup": true,
-    "singleRowGroupIsNotMerged": true,
-    "groupTotalFormula": "SUM(C{start}:C{end})",
-    "clearNonAnchorValueFormulaRichText": true,
-    "verifyNonAnchorOOXMLIsEmpty": true,
-    "anchorRole": "mergedBusinessAnchor",
-    "forbidCrossing": [
-      "personBlock",
-      "subjectBlock",
-      "classification",
-      "rowType",
-      "settlement",
-      "header",
-      "narrative",
-      "pageBreak"
-    ],
-    "dateColumn": {
-      "column": "A",
-      "allowMergeOnlyForConsecutiveEqualConfirmedDates": true,
-      "independentFromBusinessGroupRange": true
-    },
-    "explicitRowHeightRequired": true,
-    "largeMergePreviewThreshold": {
-      "rowCountGreaterThan": 7,
-      "totalHeightPointsGreaterThan": 210,
-      "action": "render-warning-preview-without-auto-split"
-    }
-  },
-  "layout": {
-    "machineValues": {
-      "fontName": "仿宋",
-      "fontSizePoints": 14,
-      "bodyHorizontalAlignment": "center",
-      "bodyVerticalAlignment": "middle",
-      "recentBusinessFillArgb": "FFFFFFFF",
-      "standardBusinessRowHeightPoints": 30,
-      "rootColumnWidthsAtoF": [
-        17.375,
-        26.625,
-        32.508335,
-        18.375,
-        26.508333,
-        28.508333
-      ]
-    },
-    "columnWidths": {
-      "ledgerRoot": {
-        "A": 17.375,
-        "B": 26.625,
-        "C": 32.508335,
-        "D": 18.375,
-        "E": 26.508333,
-        "F": 28.508333
-      },
-      "currentDetail": {
-        "A": 17.375,
-        "B": 26.625,
-        "C": 32.508335,
-        "D": 18.375,
-        "E": 26.508333,
-        "F": 28.508333
-      }
-    },
-    "columnPolicies": {
-      "ledgerRoot": {
-        "A": {"wrapText": false, "horizontalAlignment": "center"},
-        "B": {"wrapText": true, "horizontalAlignment": "center"},
-        "C": {"wrapText": false, "horizontalAlignment": "center"},
-        "D": {"wrapText": true, "horizontalAlignment": "center"},
-        "E": {"wrapText": false, "horizontalAlignment": "center"},
-        "F": {"wrapText": true, "horizontalAlignment": "center"}
-      },
-      "currentDetail": {
-        "A": {"wrapText": false, "horizontalAlignment": "center"},
-        "B": {"wrapText": true, "horizontalAlignment": "center"},
-        "C": {"wrapText": false, "horizontalAlignment": "center"},
-        "D": {"wrapText": true, "horizontalAlignment": "center"},
-        "E": {"wrapText": true, "horizontalAlignment": "center"},
-        "F": {"wrapText": true, "horizontalAlignment": "center"}
-      }
-    },
-    "rowHeightAlgorithm": {
-      "defaultBusinessRowPoints": 30,
-      "lineHeightPoints": 21,
-      "verticalPaddingPoints": 6,
-      "characterUnits": {
-        "ascii": 1,
-        "cjkOrFullWidth": 2,
-        "explicitNewline": "new-line"
-      },
-      "unitsPerExcelColumnWidth": 1.6,
-      "wrappedLineCount": "sum(max(1,ceil(lineCharacterUnits/floor(columnWidth*1.6))))",
-      "singleCellRequiredHeight": "max(30,wrappedLineCount*21+6)",
-      "mergedBlockRule": "requiredTotal=max(rowCount*30,maxAnchorRequiredHeight); setEachRowHeight=ceil(requiredTotal/rowCount*4)/4"
-    },
-    "requireExplicitColumnWidths": true,
-    "requireExplicitMergedBlockRowHeights": true,
-    "preserveBordersAtGroupBoundaries": true,
-    "freezePaneAndPrintSettingsFollowBaseContract": true,
-    "formalTitleForbiddenTokens": [
-      "候选",
-      "修正版",
-      "待核",
-      "待确认"
-    ],
-    "freezePanes": {
-      "ledgerRoot": {
-        "xiaohongshu": "A2",
-        "company": "A5",
-        "residence": "A5"
-      },
-      "currentDetail": "below-detected-header-row"
-    }
-  },
-  "print": {
-    "orientation": "landscape",
-    "paperSize": "A4",
-    "fitToWidthPages": 1,
-    "fitToHeightPages": 0,
-    "printColumns": "A:F",
-    "horizontalCentered": true,
-    "repeatHeaderRows": "detected-header-rows",
-    "forbidBusinessMergeAcrossManualPageBreak": true
-  },
-  "allowedProfileOverrides": {
-    "xiaohongshu": "green-base",
-    "company": "blue-role-override",
-    "residence": "blue-role-override"
-  },
-  "driftPolicy": {
-    "STYLE_DRIFT": {
-      "examples": [
-        "font",
-        "fill",
-        "border",
-        "role-color"
+  "templates": {
+    "current-detail": {
+      "asset": "assets/templates/xiaohongshu/current-detail.xlsx",
+      "assetSha256": "bd079debb29891193bd85f42d19ea9e46d483ab94de78f7bb66413cbba8a54dd",
+      "sheetName": "本次报销明细",
+      "referenceRole": "current-detail",
+      "semanticColumns": [
+        "日期",
+        "支出明细",
+        "单笔金额",
+        "费用组合计",
+        "备注 / 分类",
+        "报销属性"
       ],
-      "action": "build-repair-candidate-before-ledger-candidate"
-    },
-    "LAYOUT_DRIFT": {
-      "examples": [
-        "column-width",
-        "row-height",
-        "alignment",
-        "merge-topology",
-        "print-setting"
+      "requiredRoles": [
+        "title",
+        "subtitle",
+        "summaryLabel",
+        "companySummaryLabel",
+        "feeSummaryLabel",
+        "summaryValue",
+        "companySummaryValue",
+        "feeSummaryValue",
+        "header",
+        "groupLabel",
+        "groupTotal",
+        "date",
+        "text",
+        "amount",
+        "feeTotal",
+        "classification",
+        "settlement",
+        "description",
+        "companyNote",
+        "feeNote"
       ],
-      "action": "block-publish-and-build-repair-candidate"
-    },
-    "STRUCTURE_DRIFT": {
-      "examples": [
-        "missing-column",
-        "inserted-column",
-        "moved-header",
-        "missing-editable-sheet",
-        "ambiguous-sheet"
+      "moneyNumberFormats": [
+        "0",
+        "0.0",
+        "0.00",
+        "0.000"
       ],
-      "action": "stop-profile-before-evidence-processing"
+      "roleSignatures": {
+        "title": "ecf54fb268faae60674ddd8038931f424c9bbb69a0e6367e4605a6f8493a844e",
+        "subtitle": "0b131c9a008aba1450fb9e5092c132eb06f53dff32859fa90795996c901a8140",
+        "summaryLabel": "a241a703a5ac20c1e172934ab62796132b63e5ff5ccf1fdf439f09e6584f644e",
+        "companySummaryLabel": "f2644c3c07c141f67f9b6d89216085472371d2fefa6f37bf366e0a25b6f923ac",
+        "feeSummaryLabel": "ad2f953e7c5383f4d03fa7298e39a91f41091c5c44205718780df686e79fe180",
+        "summaryValue": "260595096a31cada514e2b08296f835a6eb6f8aa494fbd6713dbcdf802a220dc",
+        "companySummaryValue": "f3798e8455a88f8233469c4d9b15b13ce83bdae2c9e02d8a23010f1440e1aa91",
+        "feeSummaryValue": "29a869ff3cb24da9a27d4f9bb46bf2d87fdec26b7443c1c5e90c2d2c391fa6b3",
+        "header": "bfc9bdf24b5fc0b23d1da50f8966920a0d49f62de71e9da2027155a6cbd2f131",
+        "groupLabel": "e9b7d6e9131841aa75926df3686c22921fbb61abff453a9c94c3055268bcb081",
+        "groupTotal": "87a3843877d3f72707aa253417d2ae2d69257be75dfed5aac1abd23cfa4db0c8",
+        "date": "5690bfd70b83c4778da2cc31883a8af0a459e582e450536f4086e6a4b088814d",
+        "text": "a5c29ddc46c08083bcc5f021b06e762dd2af84d310523b2f2b1bd08deb2db699",
+        "amount": "fac6e20c1b471b805d264dd155aff1f1cbf7b073171681e3bba0cf91e377146b",
+        "feeTotal": "e498577d7a6d8c80f4f89bc0a410b5fd99c7fd35bb1ec33f94f0f96c1adb1bb2",
+        "classification": "010ab5f7453194e87348cef3df11a35400bfda3f5127c2317660ecff0ff68df0",
+        "settlement": "010ab5f7453194e87348cef3df11a35400bfda3f5127c2317660ecff0ff68df0",
+        "description": "b20ae4ff6774787a0b6b97b429259c259bbf23f808d3c89334fe6395dc8c3242",
+        "companyNote": "21c6b8aaebb5e75c56be0d92c83d905835ccd6304fb10b9da6928d4601dbc939",
+        "feeNote": "a3e9a90cf3dadbb1e02d1ccf07c1d372fa4e1c1ca7503ba1778b3ded36f697dd"
+      },
+      "roleSignaturesDigest": "60ca4f60bc9a01f384392727c305c3063b8c4bdd65700df514efabb2f240151b",
+      "layout": {
+        "columns": [
+          {
+            "min": 1,
+            "max": 1,
+            "width": 13,
+            "hidden": false,
+            "bestFit": false,
+            "style": null
+          },
+          {
+            "min": 2,
+            "max": 2,
+            "width": 40,
+            "hidden": false,
+            "bestFit": false,
+            "style": null
+          },
+          {
+            "min": 3,
+            "max": 3,
+            "width": 15,
+            "hidden": false,
+            "bestFit": false,
+            "style": null
+          },
+          {
+            "min": 4,
+            "max": 4,
+            "width": 16,
+            "hidden": false,
+            "bestFit": false,
+            "style": null
+          },
+          {
+            "min": 5,
+            "max": 5,
+            "width": 24,
+            "hidden": false,
+            "bestFit": false,
+            "style": null
+          },
+          {
+            "min": 6,
+            "max": 6,
+            "width": 38,
+            "hidden": false,
+            "bestFit": false,
+            "style": null
+          }
+        ],
+        "requiredMerges": [
+          "A1:F1",
+          "A2:F2",
+          "A3:B3",
+          "C3:D3",
+          "E3:F3",
+          "A4:B4",
+          "C4:D4",
+          "E4:F4",
+          "A5:C5",
+          "D5:F5"
+        ],
+        "fixedStyleCells": {
+          "A1": "title",
+          "A2": "subtitle",
+          "A3": "summaryLabel",
+          "C3": "companySummaryLabel",
+          "E3": "feeSummaryLabel",
+          "A4": "summaryValue",
+          "C4": "companySummaryValue",
+          "E4": "feeSummaryValue",
+          "A5": "companyNote",
+          "D5": "feeNote",
+          "A6": "header",
+          "A7": "date",
+          "B7": "text",
+          "C7": "amount",
+          "D7": "feeTotal",
+          "E7": "classification",
+          "F7": "settlement"
+        },
+        "showGridLines": false,
+        "pane": "none"
+      },
+      "outputPolicy": {
+        "titleRowHeightPoints": 32,
+        "headerRowHeightPoints": 26,
+        "standardDataRowHeightPoints": 24,
+        "longTextRowHeightPoints": 42,
+        "descriptionRowHeightPoints": 28,
+        "showGridLines": false,
+        "generatedPane": {
+          "ySplit": "6",
+          "topLeftCell": "A7",
+          "activePane": "bottomLeft",
+          "state": "frozen"
+        },
+        "print": {
+          "orientation": "landscape",
+          "paperSize": "9",
+          "fitToWidth": "1",
+          "fitToHeight": "0"
+        }
+      },
+      "codeRoleCoverage": {
+        "consumer": "scripts/build_reimbursement_artifacts.mjs",
+        "direct": {
+          "title": [
+            "styles.title"
+          ],
+          "subtitle": [
+            "styles.subtitle"
+          ],
+          "summaryLabel": [
+            "styles.summaryLabel"
+          ],
+          "companySummaryLabel": [
+            "styles.companySummaryLabel"
+          ],
+          "feeSummaryLabel": [
+            "styles.feeSummaryLabel"
+          ],
+          "header": [
+            "styles.header"
+          ],
+          "groupLabel": [
+            "styles.groupLabel"
+          ],
+          "date": [
+            "styles.date"
+          ],
+          "text": [
+            "styles.text"
+          ],
+          "classification": [
+            "styles.classification"
+          ],
+          "settlement": [
+            "styles.settlement"
+          ],
+          "description": [
+            "styles.description"
+          ],
+          "companyNote": [
+            "styles.companyNote"
+          ],
+          "feeNote": [
+            "styles.feeNote"
+          ]
+        },
+        "moneyFamilies": {
+          "summaryValue": [
+            "\"summaryValue\""
+          ],
+          "companySummaryValue": [
+            "\"companySummaryValue\""
+          ],
+          "feeSummaryValue": [
+            "\"feeSummaryValue\""
+          ],
+          "groupTotal": [
+            "\"groupTotal\""
+          ],
+          "amount": [
+            "\"amount\""
+          ],
+          "feeTotal": [
+            "\"feeTotal\""
+          ]
+        },
+        "templateOnly": []
+      }
+    },
+    "screenshot-map": {
+      "asset": "assets/templates/xiaohongshu/screenshot-map.xlsx",
+      "assetSha256": "cd29b440cdf06005a5a7b408a991c1f67d9d937b7ab8dbc5607f5562dfeeffc7",
+      "sheetName": "报销明细对应截图表",
+      "referenceRole": "screenshot-map",
+      "semanticColumns": [
+        "日期",
+        "支出人/主体",
+        "项目",
+        "金额",
+        "备注",
+        "图1",
+        "图2",
+        "图3"
+      ],
+      "requiredRoles": [
+        "header",
+        "oddDate",
+        "oddText",
+        "oddAmount",
+        "oddNote",
+        "image",
+        "evenDate",
+        "evenText",
+        "evenAmount",
+        "evenNote"
+      ],
+      "moneyNumberFormats": [
+        "0",
+        "0.0",
+        "0.00",
+        "0.000"
+      ],
+      "roleSignatures": {
+        "header": "4a8dc411946fcaac5f53c0199e1eeb29bff9e3e88f8b6767c65f2dc79bd5799b",
+        "oddDate": "b20265518b6d764a3843f35b6cda3f9f32bc5092c76c846681630b56fa9403e3",
+        "oddText": "fa5cb827c3f12e9f8951bdfe66abfab24e4f284aa12735edf36ec559d2dd41d4",
+        "oddAmount": "247c2cd28a68e7c76acb6d74f1b2b1c01b6345ea667b4b897ffcf2e7600c439d",
+        "oddNote": "ed806afeed4209f1e76778533d5e58cbea1b056fe9792dd812cbe332d9385664",
+        "image": "de51af03e67498079066d1c6aa18bd84aeb4a479e9a1a54a2f7078b567536e7c",
+        "evenDate": "ea5d06e70a54dabd0f6ba9dd28fd892819d21518c5576a8a499561157feb183e",
+        "evenText": "023fb2ac8e91dc10ccb67c0f8141a8200b9a326ef2d6b14c9f96ae0827f60262",
+        "evenAmount": "17f563944d7536b458e7ff80ea7f64ae4591349ce2dcfab9ac954b837512cddf",
+        "evenNote": "ebe509bf397ba344ead8488b1a4c898583b5cdb80fb51ce9649955c41dbab224"
+      },
+      "roleSignaturesDigest": "4e69e277c20fc63529c0a6cb7e745ddaeef3e059af209e21dbf05ddaddb808f3",
+      "layout": {
+        "columns": [
+          {
+            "min": 1,
+            "max": 1,
+            "width": 12.5,
+            "hidden": false,
+            "bestFit": false,
+            "style": null
+          },
+          {
+            "min": 2,
+            "max": 2,
+            "width": 15,
+            "hidden": false,
+            "bestFit": false,
+            "style": null
+          },
+          {
+            "min": 3,
+            "max": 3,
+            "width": 40,
+            "hidden": false,
+            "bestFit": false,
+            "style": null
+          },
+          {
+            "min": 4,
+            "max": 4,
+            "width": 13,
+            "hidden": false,
+            "bestFit": false,
+            "style": null
+          },
+          {
+            "min": 5,
+            "max": 5,
+            "width": 48,
+            "hidden": false,
+            "bestFit": false,
+            "style": null
+          },
+          {
+            "min": 6,
+            "max": 8,
+            "width": 42,
+            "hidden": false,
+            "bestFit": false,
+            "style": null
+          }
+        ],
+        "requiredMerges": [],
+        "fixedStyleCells": {
+          "A1": "header",
+          "E1": "header"
+        },
+        "showGridLines": false,
+        "pane": "none"
+      },
+      "outputPolicy": {
+        "headerRowHeightPoints": 28.5,
+        "noImageRowHeightPoints": 60,
+        "imageRowHeightPoints": 172.5,
+        "imageColumnsStartAt": "F",
+        "imageColumnWidth": 42,
+        "imageBoxPixels": {
+          "width": 320,
+          "height": 220,
+          "fit": "contain",
+          "align": "center"
+        },
+        "bodyOddFillArgb": "FFFFFCF4",
+        "bodyEvenFillArgb": "FFFFF7E6",
+        "imageFillArgb": "FFF5F8FA",
+        "showGridLines": false
+      },
+      "codeRoleCoverage": {
+        "consumer": "scripts/build_reimbursement_artifacts.mjs",
+        "direct": {
+          "header": [
+            "templateStyles.header"
+          ],
+          "oddDate": [
+            "templateStyles.oddDate"
+          ],
+          "oddText": [
+            "templateStyles.oddText"
+          ],
+          "oddNote": [
+            "templateStyles.oddNote"
+          ],
+          "image": [
+            "templateStyles.image"
+          ],
+          "evenDate": [
+            "templateStyles.evenDate"
+          ],
+          "evenText": [
+            "templateStyles.evenText"
+          ],
+          "evenNote": [
+            "templateStyles.evenNote"
+          ]
+        },
+        "moneyFamilies": {
+          "oddAmount": [
+            "\"oddAmount\""
+          ],
+          "evenAmount": [
+            "\"evenAmount\""
+          ]
+        },
+        "templateOnly": []
+      }
+    },
+    "supplement-detail": {
+      "asset": "assets/templates/xiaohongshu/supplement-detail.xlsx",
+      "assetSha256": "55e5eb420a1c5573c349462cf33670c874f7d5adfd105635f1e953953b7b2f86",
+      "sheetName": "补报明细",
+      "referenceRole": "supplement-detail",
+      "semanticColumns": [
+        "日期",
+        "支出明细",
+        "单笔金额",
+        "费用组合计",
+        "备注 / 分类",
+        "报销属性"
+      ],
+      "requiredRoles": [
+        "title",
+        "subtitle",
+        "summaryLabel",
+        "companySummaryLabel",
+        "feeSummaryLabel",
+        "summaryValue",
+        "companySummaryValue",
+        "feeSummaryValue",
+        "header",
+        "groupLabel",
+        "groupTotal",
+        "date",
+        "text",
+        "amount",
+        "feeTotal",
+        "classification",
+        "settlement",
+        "spacer",
+        "footerLabel",
+        "footerValue"
+      ],
+      "moneyNumberFormats": [
+        "0",
+        "0.0",
+        "0.00",
+        "0.000"
+      ],
+      "roleSignatures": {
+        "title": "47bedff020bacc7abccc12b7362d7b5cbe484c58b835153dd231e116f10f9884",
+        "subtitle": "1187387332a43ad15984aab4b2be872350de60c760d219d22c7deb20bd566d4b",
+        "summaryLabel": "50a473a8b896cf32f070ad9bbfce32fadfa5cae8e38d543cfdc6f302209ca91f",
+        "companySummaryLabel": "50a473a8b896cf32f070ad9bbfce32fadfa5cae8e38d543cfdc6f302209ca91f",
+        "feeSummaryLabel": "50a473a8b896cf32f070ad9bbfce32fadfa5cae8e38d543cfdc6f302209ca91f",
+        "summaryValue": "764b146b0ebc1cc491a54f803950915f41fd6e8e4bd09344c21a76caae0e7cb2",
+        "companySummaryValue": "764b146b0ebc1cc491a54f803950915f41fd6e8e4bd09344c21a76caae0e7cb2",
+        "feeSummaryValue": "764b146b0ebc1cc491a54f803950915f41fd6e8e4bd09344c21a76caae0e7cb2",
+        "header": "4d74ed58283165038c33724c270a7804cf9a26c6bd5365f242ed2e01744dc94f",
+        "groupLabel": "8a3b34dfc4c305fdc4f3975fa32eb8a45845c922a41ce64f035e55f39b0de762",
+        "groupTotal": "764b146b0ebc1cc491a54f803950915f41fd6e8e4bd09344c21a76caae0e7cb2",
+        "date": "010d6d63974d618aadcc0757d18747fc1ebe935f5bdd001be63227299c23392b",
+        "text": "0aacaf3e9b6afd33881f21309eb1c74b26c0eea6b20a9d8ed372abb1381c12f4",
+        "amount": "764b146b0ebc1cc491a54f803950915f41fd6e8e4bd09344c21a76caae0e7cb2",
+        "feeTotal": "764b146b0ebc1cc491a54f803950915f41fd6e8e4bd09344c21a76caae0e7cb2",
+        "classification": "8a3b34dfc4c305fdc4f3975fa32eb8a45845c922a41ce64f035e55f39b0de762",
+        "settlement": "8a3b34dfc4c305fdc4f3975fa32eb8a45845c922a41ce64f035e55f39b0de762",
+        "spacer": "b20ae4ff6774787a0b6b97b429259c259bbf23f808d3c89334fe6395dc8c3242",
+        "footerLabel": "265c97f7fde4499fa0d5ef36e09c33b00240c569c3a2994edb47f1f41bf98876",
+        "footerValue": "00bf1c31c7fa5f1f4e35a3d9f5dfeb491fbf6f4096cb5bd9c26680239469a4dd"
+      },
+      "roleSignaturesDigest": "a7a88606472d936dc4a7f0951c60405c418a1d075be926a4c5600701ee5ab670",
+      "layout": {
+        "columns": [
+          {
+            "min": 1,
+            "max": 1,
+            "width": 12,
+            "hidden": false,
+            "bestFit": false,
+            "style": null
+          },
+          {
+            "min": 2,
+            "max": 2,
+            "width": 32,
+            "hidden": false,
+            "bestFit": false,
+            "style": null
+          },
+          {
+            "min": 3,
+            "max": 3,
+            "width": 13,
+            "hidden": false,
+            "bestFit": false,
+            "style": null
+          },
+          {
+            "min": 4,
+            "max": 4,
+            "width": 15,
+            "hidden": false,
+            "bestFit": false,
+            "style": null
+          },
+          {
+            "min": 5,
+            "max": 5,
+            "width": 22,
+            "hidden": false,
+            "bestFit": false,
+            "style": null
+          },
+          {
+            "min": 6,
+            "max": 6,
+            "width": 28,
+            "hidden": false,
+            "bestFit": false,
+            "style": null
+          }
+        ],
+        "requiredMerges": [
+          "A1:F1",
+          "A2:F2",
+          "A3:F3"
+        ],
+        "fixedStyleCells": {
+          "A1": "title",
+          "A2": "subtitle",
+          "A3": "summaryLabel",
+          "A4": "header",
+          "A5": "date",
+          "B5": "text",
+          "C5": "amount",
+          "D5": "feeTotal",
+          "E5": "classification",
+          "F5": "settlement"
+        },
+        "showGridLines": false,
+        "pane": "none"
+      },
+      "outputPolicy": {
+        "titleRowHeightPoints": 34,
+        "subtitleRowHeightPoints": 28,
+        "longSubtitleRowHeightPoints": 30,
+        "summaryRowHeightPoints": 24,
+        "headerRowHeightPoints": 24,
+        "standardDataRowHeightPoints": 30,
+        "longTextRowHeightPoints": 38,
+        "footerRowHeightPoints": 28,
+        "showGridLines": false,
+        "generatedPane": {
+          "ySplit": "4",
+          "topLeftCell": "A5",
+          "activePane": "bottomLeft",
+          "state": "frozen"
+        }
+      },
+      "codeRoleCoverage": {
+        "consumer": "scripts/build_reimbursement_artifacts.mjs",
+        "direct": {
+          "title": [
+            "function supplementProjection",
+            "styles.title"
+          ],
+          "subtitle": [
+            "function supplementProjection",
+            "styles.subtitle"
+          ],
+          "summaryLabel": [
+            "function supplementProjection",
+            "styles.summaryLabel"
+          ],
+          "header": [
+            "function supplementProjection",
+            "styles.header"
+          ],
+          "date": [
+            "function supplementProjection",
+            "styles.date"
+          ],
+          "text": [
+            "function supplementProjection",
+            "styles.text"
+          ],
+          "classification": [
+            "function supplementProjection",
+            "styles.classification"
+          ],
+          "settlement": [
+            "function supplementProjection",
+            "styles.settlement"
+          ],
+          "footerLabel": [
+            "function supplementProjection",
+            "styles.footerLabel"
+          ]
+        },
+        "moneyFamilies": {
+          "amount": [
+            "function supplementProjection",
+            "\"amount\""
+          ],
+          "feeTotal": [
+            "function supplementProjection",
+            "\"feeTotal\""
+          ],
+          "footerValue": [
+            "function supplementProjection",
+            "\"footerValue\""
+          ]
+        },
+        "templateOnly": [
+          "companySummaryLabel",
+          "feeSummaryLabel",
+          "summaryValue",
+          "companySummaryValue",
+          "feeSummaryValue",
+          "groupLabel",
+          "groupTotal",
+          "spacer"
+        ]
+      }
+    },
+    "ledger-batch-preview": {
+      "asset": "assets/templates/xiaohongshu/ledger-batch-preview.xlsx",
+      "assetSha256": "9d02904b6dc87e5c2f4bfd22d191fe0c1df05dc547723313b00924bae0829faa",
+      "sheetName": "本批总表增量",
+      "referenceRole": "ledger-batch-preview",
+      "semanticColumns": [
+        "日期",
+        "支出明细",
+        "支出金额",
+        "合计",
+        "支出人",
+        "备注"
+      ],
+      "requiredRoles": [
+        "headerDate",
+        "headerText",
+        "headerAmount",
+        "date",
+        "text",
+        "amount",
+        "total",
+        "person",
+        "classification"
+      ],
+      "moneyNumberFormats": [
+        "0",
+        "0.0",
+        "0.00",
+        "0.000"
+      ],
+      "roleSignatures": {
+        "headerDate": "62add124b9f20fbae27fdb1bf66880400fdc9b1aea58295c20e41db24c81793a",
+        "headerText": "eba7ca43a2bbcc0706c286d27e35af5e9035e6131662dad9b1cc6b654847025d",
+        "headerAmount": "4449c105155746398c44078042846a65c6230380222ce78de1088e48b5819e90",
+        "date": "4285579109cdc1d0240ce4f8d8bb592c6fcfb36a6e9fec51d9d3d6f91366c7c1",
+        "text": "037816b6caa631f80ed04f2a0434693a2dcc856d0a7bbbf3c7caf35c50ee4e3f",
+        "amount": "41896b8c1129e25646ee63706a159f28b126ab361e3558e51f75695bbc0dc417",
+        "total": "41896b8c1129e25646ee63706a159f28b126ab361e3558e51f75695bbc0dc417",
+        "person": "037816b6caa631f80ed04f2a0434693a2dcc856d0a7bbbf3c7caf35c50ee4e3f",
+        "classification": "037816b6caa631f80ed04f2a0434693a2dcc856d0a7bbbf3c7caf35c50ee4e3f"
+      },
+      "roleSignaturesDigest": "da9f85da626a60b98024a1a92b668dcd793d8bdd78a8dbcc5dd4fcc9e43329d6",
+      "layout": {
+        "columns": [
+          {
+            "min": 1,
+            "max": 1,
+            "width": 17.372726440429688,
+            "hidden": false,
+            "bestFit": false,
+            "style": 1
+          },
+          {
+            "min": 2,
+            "max": 2,
+            "width": 26.627273559570312,
+            "hidden": false,
+            "bestFit": false,
+            "style": 1
+          },
+          {
+            "min": 3,
+            "max": 3,
+            "width": 32.509090423583984,
+            "hidden": false,
+            "bestFit": false,
+            "style": 1
+          },
+          {
+            "min": 4,
+            "max": 4,
+            "width": 18.372726440429688,
+            "hidden": false,
+            "bestFit": false,
+            "style": 1
+          },
+          {
+            "min": 5,
+            "max": 5,
+            "width": 26.509090423583984,
+            "hidden": false,
+            "bestFit": false,
+            "style": 1
+          },
+          {
+            "min": 6,
+            "max": 6,
+            "width": 28.509090423583984,
+            "hidden": false,
+            "bestFit": false,
+            "style": 1
+          }
+        ],
+        "requiredMerges": [],
+        "fixedStyleCells": {
+          "A1": "headerDate",
+          "B1": "headerText",
+          "C1": "headerAmount",
+          "A2": "date",
+          "B2": "text",
+          "C2": "amount",
+          "D2": "total",
+          "E2": "person",
+          "F2": "classification"
+        },
+        "showGridLines": false,
+        "pane": "none"
+      },
+      "outputPolicy": {
+        "headerRowHeightPoints": 21.95,
+        "standardDataRowHeightPoints": 30,
+        "showGridLines": false
+      },
+      "codeRoleCoverage": {
+        "consumer": "scripts/build_root_workbook_candidate.mjs",
+        "direct": {
+          "headerDate": [
+            "roles.headerDate"
+          ],
+          "headerText": [
+            "roles.headerText"
+          ],
+          "headerAmount": [
+            "roles.headerAmount"
+          ],
+          "date": [
+            "roles.date"
+          ],
+          "text": [
+            "roles.text"
+          ],
+          "person": [
+            "roles.person"
+          ],
+          "classification": [
+            "roles.classification"
+          ]
+        },
+        "moneyFamilies": {
+          "amount": [
+            "family(\"amount\")"
+          ],
+          "total": [
+            "family(\"total\")"
+          ]
+        },
+        "templateOnly": []
+      }
+    },
+    "compact-disbursement": {
+      "asset": "assets/templates/disbursement/compact-disbursement.xlsx",
+      "assetSha256": "d2ef7985037f7f9a0d0e1d49f8ba6c090ac105885608cfecc5c69727bae7bc7d",
+      "sheetName": "发放核对表",
+      "referenceRole": "compact-disbursement",
+      "semanticColumns": [
+        "姓名/事项",
+        "小红书报销",
+        "公司报销",
+        "驻所报销",
+        "工资类别",
+        "工资",
+        "应发合计",
+        "实际发放",
+        "方式",
+        "状态",
+        "凭证/备注"
+      ],
+      "requiredRoles": [
+        "title",
+        "subtitle",
+        "header",
+        "text",
+        "amount",
+        "status",
+        "summaryLabel",
+        "summaryAmount"
+      ],
+      "moneyNumberFormats": [
+        "0",
+        "0.0",
+        "0.00",
+        "0.000"
+      ],
+      "roleSignatures": {
+        "amount": "ec12d34c0dfb1d5a8f0136bf7730d0286d08aaeb291369776b9ffdb76070f274",
+        "header": "7be66ff1187368f3e23e464e3ac6a22b37d4c1e90feceae16eb9d9e2a8e1c01d",
+        "status": "e85553dea9c2625f238935aa22202f831ffa0f17f869fa6f40cc2139cf9cc399",
+        "subtitle": "d31a28dd65534200d7e35a954696e728b593430df770c0dd518b40b17ee51cd6",
+        "summaryAmount": "9cd710e9aa571d7f0425cff39ab3029ee2445afcd6e55f51cf3d3a86b55ef75f",
+        "summaryLabel": "52e7f5775899c1e2900388ad0eee35c32c4fd8a6ee27243c3f75edb3cddee6e2",
+        "text": "823e3c9213a596e14dbf55b669f7b3d147c477248d845554ece50cfe53e12be7",
+        "title": "880aa0e1dacc9707a2215a288820a37c181b736b4d957865c2b6901038ff00d6"
+      },
+      "roleSignaturesDigest": "5a9b7ca4ff18a21e8b0b9c8e5e4742c26c1d2dc4bfaf2a5fc6dee16c927c8c57",
+      "layout": {
+        "columns": [
+          {
+            "min": 1,
+            "max": 1,
+            "width": 18,
+            "hidden": false,
+            "bestFit": false,
+            "style": null
+          },
+          {
+            "min": 2,
+            "max": 2,
+            "width": 13,
+            "hidden": false,
+            "bestFit": false,
+            "style": null
+          },
+          {
+            "min": 3,
+            "max": 3,
+            "width": 13,
+            "hidden": false,
+            "bestFit": false,
+            "style": null
+          },
+          {
+            "min": 4,
+            "max": 4,
+            "width": 13,
+            "hidden": false,
+            "bestFit": false,
+            "style": null
+          },
+          {
+            "min": 5,
+            "max": 5,
+            "width": 13,
+            "hidden": false,
+            "bestFit": false,
+            "style": null
+          },
+          {
+            "min": 6,
+            "max": 6,
+            "width": 13,
+            "hidden": false,
+            "bestFit": false,
+            "style": null
+          },
+          {
+            "min": 7,
+            "max": 7,
+            "width": 14,
+            "hidden": false,
+            "bestFit": false,
+            "style": null
+          },
+          {
+            "min": 8,
+            "max": 8,
+            "width": 14,
+            "hidden": false,
+            "bestFit": false,
+            "style": null
+          },
+          {
+            "min": 9,
+            "max": 9,
+            "width": 12,
+            "hidden": false,
+            "bestFit": false,
+            "style": null
+          },
+          {
+            "min": 10,
+            "max": 10,
+            "width": 16,
+            "hidden": false,
+            "bestFit": false,
+            "style": null
+          },
+          {
+            "min": 11,
+            "max": 11,
+            "width": 32,
+            "hidden": false,
+            "bestFit": false,
+            "style": null
+          }
+        ],
+        "requiredMerges": [
+          "A1:K1",
+          "A3:K3",
+          "A15:K15"
+        ],
+        "fixedStyleCells": {
+          "A1": "title",
+          "B2": "subtitle",
+          "A16": "header",
+          "A17": "text",
+          "B17": "amount",
+          "J17": "status",
+          "A47": "summaryLabel",
+          "B47": "summaryAmount"
+        },
+        "generatedFixedStyleCells": {
+          "A1": "title",
+          "B2": "subtitle",
+          "A16": "header",
+          "A17": "text",
+          "B17": "amount",
+          "J17": "status"
+        },
+        "dynamicStyleRows": [
+          {
+            "anchorColumn": "A",
+            "anchorRole": "summaryLabel",
+            "cells": {
+              "A": "summaryLabel",
+              "B": "summaryAmount"
+            }
+          }
+        ],
+        "showGridLines": false,
+        "pane": {
+          "ySplit": "16",
+          "topLeftCell": "A17",
+          "activePane": "bottomLeft",
+          "state": "frozen"
+        }
+      },
+      "outputPolicy": {
+        "headerRow": 16,
+        "dataStartRow": 17,
+        "dataEndRow": 46,
+        "summaryRow": 47,
+        "generatedDataEndRow": "dynamic",
+        "generatedSummaryRow": "last-data-row+1",
+        "visibleStatuses": [
+          "已核销",
+          "待凭证",
+          "待现金确认",
+          "异常待说明",
+          "非本批",
+          "已忽略尾差"
+        ],
+        "worksheetCount": 1,
+        "visibleWorksheetCount": 1,
+        "hiddenWorksheetCount": 0,
+        "autoFilter": "A16:K46",
+        "printArea": "A1:K47",
+        "repeatHeaderRow": 16,
+        "orientation": "landscape",
+        "paperSize": "9",
+        "fitToWidth": "1",
+        "fitToHeight": "2"
+      }
     }
   }
 }

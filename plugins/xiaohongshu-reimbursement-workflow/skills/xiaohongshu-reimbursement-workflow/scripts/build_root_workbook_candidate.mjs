@@ -216,13 +216,13 @@ function saxAttribute(tag, localName) {
 }
 
 function scanWorksheetIndex(worksheetXml, { captureDates }) {
-  const parser = sax.parser(true, { position: false, strictEntities: true, trim: false, normalize: false, xmlns: false });
-  const rows = []; const mergeRefs = []; let inSheetData = false; let currentRow = null; let currentCell = null; let capturedText = ""; let captureValue = false; let parseError = null; let priorLogicalRow = 0;
+  const parser = sax.parser(true, { position: true, strictEntities: true, trim: false, normalize: false, xmlns: false });
+  const rows = []; const mergeRefs = []; let inSheetData = false; let sheetDataPrefix = null; let sheetDataInnerStart = null; let sheetDataInnerEnd = null; let currentRow = null; let currentCell = null; let capturedText = ""; let captureValue = false; let parseError = null; let priorLogicalRow = 0;
   parser.onerror = (error) => { parseError ??= error; };
   parser.ondoctype = () => { parseError ??= new Error("DOCTYPE is forbidden"); };
   parser.onopentag = (tag) => {
     const local = tag.local ?? tag.name.split(":").at(-1);
-    if (local === "sheetData") { inSheetData = true; return; }
+    if (local === "sheetData") { inSheetData = true; sheetDataPrefix = tag.name.slice(0, tag.name.length - local.length); sheetDataInnerStart = parser.position; return; }
     if (local === "mergeCell") {
       const ref = saxAttribute(tag, "ref");
       if (ref) mergeRefs.push(ref);
@@ -235,7 +235,7 @@ function scanWorksheetIndex(worksheetXml, { captureDates }) {
       const coordinateSafe = rawNumber === undefined || (Number.isSafeInteger(explicitNumber) && explicitNumber > 0);
       const number = coordinateSafe && explicitNumber !== null ? explicitNumber : priorLogicalRow + 1;
       const spanStart = /^(\d+):\d+$/u.exec(saxAttribute(tag, "spans") ?? "")?.[1];
-      currentRow = { number, ordinal: rows.length, explicitCoordinate: explicitNumber !== null && coordinateSafe, coordinateSafe, height: saxAttribute(tag, "ht") ?? null, hasBusinessPayload: false, dateValue: null, styles: new Map(), nextColumn: spanStart ? Number(spanStart) : 1, hasImplicitCellCoordinate: false };
+      currentRow = { number, ordinal: rows.length, explicitCoordinate: explicitNumber !== null && coordinateSafe, coordinateSafe, start: parser.startTagPosition - 1, height: saxAttribute(tag, "ht") ?? null, hasBusinessPayload: false, dateValue: null, styles: new Map(), nextColumn: spanStart ? Number(spanStart) : 1, hasImplicitCellCoordinate: false };
       return;
     }
     if (local === "c" && currentRow) {
@@ -260,12 +260,17 @@ function scanWorksheetIndex(worksheetXml, { captureDates }) {
     if (local === "v" && captureValue && currentRow) currentRow.dateValue = capturedText;
     if (local === "v" || local === "f" || local === "is") { captureValue = false; capturedText = ""; }
     if (local === "c") currentCell = null;
-    if (local === "row") { if (!currentRow) fail("managed worksheet has an unmatched row close."); priorLogicalRow = Math.max(priorLogicalRow, currentRow.number); rows.push(currentRow); currentRow = null; }
-    if (local === "sheetData") inSheetData = false;
+    if (local === "row") {
+      if (!currentRow) fail("managed worksheet has an unmatched row close.");
+      currentRow.end = parser.position; currentRow.xml = worksheetXml.slice(currentRow.start, currentRow.end);
+      priorLogicalRow = Math.max(priorLogicalRow, currentRow.number); rows.push(currentRow); currentRow = null;
+    }
+    if (local === "sheetData") { sheetDataInnerEnd = parser.startTagPosition - 1; inSheetData = false; }
   };
   try { parser.write(worksheetXml).close(); } catch (error) { parseError ??= error; }
   if (parseError) fail(`managed worksheet XML is malformed: ${parseError.message}`, parseError);
-  return { rows, mergeRefs };
+  if (sheetDataPrefix === null || sheetDataInnerStart === null || sheetDataInnerEnd === null || sheetDataInnerEnd < sheetDataInnerStart) fail("managed worksheet has no complete sheetData.");
+  return { rows, mergeRefs, structural: { prefix: sheetDataPrefix, innerStart: sheetDataInnerStart, innerEnd: sheetDataInnerEnd, rows } };
 }
 
 function locateSheetData(worksheetXml) {
@@ -297,7 +302,7 @@ function scanMergeRefs(worksheetXml) {
   return [...worksheetXml.matchAll(/<(?:[A-Za-z_][\w.-]*:)?mergeCell\b[^>]*\bref\s*=\s*"([A-Z]{1,3}[1-9]\d*:[A-Z]{1,3}[1-9]\d*)"[^>]*\/\s*>/giu)].map((match) => match[1]);
 }
 
-function scanCurrentAppendIndex(worksheetXml) {
+function scanStructuralPatchIndex(worksheetXml, { captureDates = false } = {}) {
   const structural = locateSheetDataRows(worksheetXml); const rows = [];
   for (const source of structural.rows) {
     const rowTag = /^<(?:[A-Za-z_][\w.-]*:)?row\b[^>]*>/iu.exec(source.xml)?.[0] ?? source.xml; const rowAttrs = attributes(rowTag);
@@ -311,6 +316,10 @@ function scanCurrentAppendIndex(worksheetXml) {
       if (column <= 6) {
         row.styles.set(column, Number(cellAttrs.get("s") ?? "0"));
         if (/<(?:[A-Za-z_][\w.-]*:)?(?:v|f|is)\b/iu.test(match[0])) row.hasBusinessPayload = true;
+        if (captureDates && column === 1) {
+          const dateValue = /<(?:[A-Za-z_][\w.-]*:)?v\b[^>]*>([\s\S]*?)<\/(?:[A-Za-z_][\w.-]*:)?v\s*>/iu.exec(match[0])?.[1];
+          if (dateValue !== undefined) row.dateValue = unxml(dateValue);
+        }
       }
     }
     rows.push(row);
@@ -761,9 +770,12 @@ function verifySupplementSuffixTransform(beforeXml, afterXml, insertions, batchR
 
 function patchWorksheet(worksheetXml, transactions, date1904, stylesXml, sheetName) {
   const captureDates = transactions.some((transaction) => transaction.reportingKind === "supplement");
-  const currentIndex = captureDates ? null : scanCurrentAppendIndex(worksheetXml);
-  const indexed = currentIndex ?? scanWorksheetIndex(worksheetXml, { captureDates: true });
-  const bounds = currentIndex?.structural ?? locateSheetData(worksheetXml);
+  // The independent worker below still performs the strict SAX audit. During
+  // construction, reuse the structural row index that is also required for the
+  // byte-local patch so supplement dates do not trigger a second full XML walk.
+  const patchIndex = scanStructuralPatchIndex(worksheetXml, { captureDates });
+  const indexed = patchIndex;
+  const bounds = patchIndex.structural;
   const insertionPlan = buildInsertions(transactions, indexed.rows, date1904, indexed.mergeRefs);
   const insertions = insertionPlan.insertions;
   const renderedInsertions = new Map(); const batchRowXmlByRow = new Map(); const allBatchRows = []; const newMerges = []; const transformInsertions = []; let priorCount = 0; let styleRowsInspected = 0; let appendBoundary = null;
@@ -772,13 +784,13 @@ function patchWorksheet(worksheetXml, transactions, date1904, stylesXml, sheetNa
     const standard = standardStyleRow(indexed.rows, insertion.beforeRow, indexed.mergeRefs, stylesXml);
     const rendered = renderBatchRows(insertion.transactions, firstRow, standard.styles, standard.height, date1904, bounds.prefix);
     renderedInsertions.set(insertion.beforeRow, rendered); allBatchRows.push(...rendered.batchRows); newMerges.push(...rendered.merges); priorCount += insertion.transactions.length;
-    const styleWitness = currentIndex ? structuralRowWitness(currentIndex.structural.rows[standard.sourceOrdinal]) : null;
+    const styleWitness = captureDates ? null : structuralRowWitness(patchIndex.structural.rows[standard.sourceOrdinal]);
     transformInsertions.push({ beforeRow: insertion.beforeRow, rowCount: insertion.transactions.length, candidateStartRow: firstRow, candidateEndRow: firstRow + insertion.transactions.length - 1, transactionIds: insertion.transactions.map((item) => item.id), styleSource: { row: standard.sourceRow, height: standard.height, styles: standard.styles, witness: styleWitness } });
     for (const [index, batchRow] of rendered.batchRows.entries()) batchRowXmlByRow.set(batchRow.row, rendered.rows[index]);
     styleRowsInspected += standard.inspectedRowCount;
   }
   const rewrittenHistoricalRows = captureDates ? indexed.rows.filter((row) => insertionShift(row.number, insertions) > 0) : [];
-  let changed; let baselineStructural = currentIndex?.structural ?? null;
+  let changed; let baselineStructural = patchIndex.structural;
   if (rewrittenHistoricalRows.length === 0) {
     const appended = insertions.flatMap((insertion) => renderedInsertions.get(insertion.beforeRow).rows).join("");
     const lastBusinessOrdinal = Math.max(-1, ...indexed.rows.filter((row) => row.number === insertionPlan.businessTailRow && row.hasBusinessPayload).map((row) => row.ordinal));
@@ -786,14 +798,14 @@ function patchWorksheet(worksheetXml, transactions, date1904, stylesXml, sheetNa
     let insertionOffset = bounds.innerEnd;
     if (trailingRows.length) {
       for (const row of trailingRows) if (row.explicitCoordinate && row.number <= insertionPlan.appendRow) fail(`auxiliary row ${row.number} conflicts with append row ${insertionPlan.appendRow}.`);
-      const structural = currentIndex?.structural ?? locateSheetDataRows(worksheetXml);
+      const structural = patchIndex.structural;
       if (structural.rows.length !== indexed.rows.length) fail(`managed worksheet SAX and structural row indexes differ (${indexed.rows.length}/${structural.rows.length}).`);
       insertionOffset = structural.rows[lastBusinessOrdinal + 1]?.start ?? bounds.innerEnd;
     }
-    if (!captureDates) appendBoundary = { baselineInsertionOffset: insertionOffset, tail: structuralRowWitness(currentIndex.structural.rows[lastBusinessOrdinal]), trailing: structuralRowWitness(currentIndex.structural.rows[lastBusinessOrdinal + 1]) };
+    if (!captureDates) appendBoundary = { baselineInsertionOffset: insertionOffset, tail: structuralRowWitness(patchIndex.structural.rows[lastBusinessOrdinal]), trailing: structuralRowWitness(patchIndex.structural.rows[lastBusinessOrdinal + 1]) };
     changed = `${worksheetXml.slice(0, insertionOffset)}${appended}${worksheetXml.slice(insertionOffset)}`;
   } else {
-    const structural = locateSheetDataRows(worksheetXml); baselineStructural = structural;
+    const structural = patchIndex.structural; baselineStructural = structural;
     if (structural.rows.length !== indexed.rows.length || structural.rows.some((row, index) => row.number !== indexed.rows[index].number)) fail(`managed worksheet SAX and structural row indexes differ (${indexed.rows.length}/${structural.rows.length}).`);
     for (const row of indexed.rows) if (insertionShift(row.number, insertions) > 0 && (!row.explicitCoordinate || !row.coordinateSafe || row.hasImplicitCellCoordinate)) fail(`supplement cannot safely shift coordinate-implicit row ${row.number}.`);
     const affectedNumbers = indexed.rows.filter((row) => insertionShift(row.number, insertions) > 0).map((row) => row.number);
@@ -928,7 +940,7 @@ async function createPreviewWorkbook({ transactions, date1904, template }) {
   zip.file("xl/workbook.xml", `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="${sheetName}" sheetId="1" r:id="rId1"/></sheets></workbook>`);
   zip.file("xl/_rels/workbook.xml.rels", `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>${themeBytes ? '<Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme" Target="theme/theme1.xml"/>' : ""}</Relationships>`);
   zip.file("xl/styles.xml", stylesBytes); if (themeBytes) zip.file("xl/theme/theme1.xml", themeBytes); zip.file("xl/worksheets/sheet1.xml", worksheet);
-  return { bytes: await zip.generateAsync({ type: "nodebuffer", compression: "DEFLATE", compressionOptions: { level: 6 }, platform: "DOS" }), sheetName, endRow: ordered.length + 1, rangeAddress: `A1:F${ordered.length + 1}` };
+  return { bytes: await zip.generateAsync({ type: "nodebuffer", compression: "STORE", platform: "DOS" }), sheetName, endRow: ordered.length + 1, rangeAddress: `A1:F${ordered.length + 1}` };
 }
 
 async function writeExclusive(filePath, bytes) {
@@ -973,7 +985,7 @@ function createLocalPatchCertificate({ artifact, baselineStable, candidate, mana
   return deepFreeze({ ...body, certificateDigest: canonicalDigest(body) });
 }
 
-async function buildCandidate(artifact, certificate, stagingRoot, { onOwned, testHooks } = {}) {
+async function buildCandidateCore(artifact, certificate, stagingRoot, { onOwned, testHooks } = {}) {
   const traceStarted = performance.now(); const trace = [];
   const stable = await readStableBinaryFile(artifact.baselinePath, { maxBytes: MAX_STABLE_BINARY_BYTES });
   if (stable.sha256 !== artifact.baselineSha256 || stable.size !== artifact.baselineSize) fail(`${artifact.profileId} baseline SHA/size changed.`);
@@ -996,14 +1008,20 @@ async function buildCandidate(artifact, certificate, stagingRoot, { onOwned, tes
   trace.push(["candidate-central", performance.now() - traceStarted]);
   const untouched = compareUnchangedEntries(baselineFacts, candidateFacts, new Set([managed.worksheetPart, managed.workbookPart]));
   const localPatchCertificate = createLocalPatchCertificate({ artifact, baselineStable: stable, candidate, managed, updatedWorkbookXml, patch, baselineFacts, candidateFacts, untouched });
-  const previewTemplate = await loadTemplateAsset("ledger-batch-preview");
   const previewTransactions = projectCandidateBatchRows(patch.xml, patch.projection, managed.date1904, patch);
-  const preview = await createPreviewWorkbook({ transactions: previewTransactions, date1904: managed.date1904, template: previewTemplate });
-  const previewState = await writeExclusive(path.join(stagingRoot, `${artifact.profileId}-本批总表增量.xlsx`), preview.bytes);
+  if (process.env.XHS_CANDIDATE_TRACE === "1") process.stderr.write(`candidate-build-core-trace ${JSON.stringify([...trace, ["complete", performance.now() - traceStarted]])}\n`);
+  return { artifact, candidate, localPatchCertificate, previewInput: { transactions: previewTransactions, date1904: managed.date1904 } };
+}
+
+async function buildCandidatePreview(item, stagingRoot, { onOwned, testHooks } = {}) {
+  const traceStarted = performance.now();
+  const previewTemplate = await loadTemplateAsset("ledger-batch-preview");
+  const preview = await createPreviewWorkbook({ ...item.previewInput, template: previewTemplate });
+  const previewState = await writeExclusive(path.join(stagingRoot, `${item.artifact.profileId}-本批总表增量.xlsx`), preview.bytes);
   onOwned?.(previewState);
-  if (testHooks?.afterCandidatePreviewWritten) await testHooks.afterCandidatePreviewWritten({ profileId: artifact.profileId, preview: { ...previewState } });
-  if (process.env.XHS_CANDIDATE_TRACE === "1") process.stderr.write(`candidate-build-trace ${JSON.stringify([...trace, ["complete", performance.now() - traceStarted]])}\n`);
-  return { artifact, candidate, localPatchCertificate, preview: { ...previewState, sheetName: preview.sheetName, endRow: preview.endRow, rangeAddress: preview.rangeAddress } };
+  if (testHooks?.afterCandidatePreviewWritten) await testHooks.afterCandidatePreviewWritten({ profileId: item.artifact.profileId, preview: { ...previewState } });
+  if (process.env.XHS_CANDIDATE_TRACE === "1") process.stderr.write(`candidate-preview-trace ${JSON.stringify([["complete", performance.now() - traceStarted]])}\n`);
+  return { ...previewState, sheetName: preview.sheetName, endRow: preview.endRow, rangeAddress: preview.rangeAddress };
 }
 
 export function computeRootWorkbookAuditRequestDigest(request) { const body = clone(object(request, "audit request")); delete body.requestDigest; return canonicalDigest(body); }
@@ -1148,7 +1166,7 @@ function auditLocalWorksheetPatch({ baselineXml, candidateXml, transactions, dat
   const projection = { ...projectionBody, batchProjectionDigest: canonicalDigest(projectionBody) };
   if (canonicalDigest(projection) !== canonicalDigest(certificate.projection)) fail("candidate local patch projection differs from its independently audited projection.");
   const maxRow = Math.max(1, ...indexed.rows.filter((row) => row.hasBusinessPayload).map((row) => row.number + insertionShift(row.number, insertions)), ...allBatchRows.map((item) => item.row));
-  const coordinateTransform = verifySupplementSuffixTransform(baselineXml, candidateXml, insertions, allBatchRows, batchMergeRefs, { maxRow, sheetName, afterStructural: candidateStructural });
+  const coordinateTransform = verifySupplementSuffixTransform(baselineXml, candidateXml, insertions, allBatchRows, batchMergeRefs, { maxRow, sheetName, beforeStructural: indexed.structural, afterStructural: candidateStructural });
   detailTrace.push(["coordinate-transform", performance.now() - detailTraceStarted]);
   const transformBody = {
     kind: "root-workbook-local-coordinate-transform-v1", indexMode: projection.locality.indexMode, date1904, appendRow: insertionPlan.appendRow,
@@ -1180,7 +1198,8 @@ async function auditOne(binding, certificate, registry) {
   const baselineFacts = centralEntryFacts(baselineZip); const candidateFacts = centralEntryFacts(candidateZip);
   const packageBinding = localPatchCertificate.package;
   if (baselineFacts.factsDigest !== packageBinding.baselineFactsDigest || candidateFacts.factsDigest !== packageBinding.candidateFactsDigest || baselineFacts.partCount !== packageBinding.baselinePartCount || candidateFacts.partCount !== packageBinding.candidatePartCount || baselineFacts.inventoryDigest !== packageBinding.baselineInventoryDigest || candidateFacts.inventoryDigest !== packageBinding.candidateInventoryDigest) fail(`${binding.profileId} ZIP central metadata differs from the local patch certificate.`);
-  const baselineManaged = await resolveManagedSheet(baselineZip, profile); const candidateManaged = await resolveManagedSheet(candidateZip, profile);
+  const baselineManaged = await resolveManagedSheet(baselineZip, profile);
+  const candidateManaged = await resolveManagedSheet(candidateZip, profile);
   trace.push(["managed-parts", performance.now() - traceStarted]);
   if (baselineManaged.worksheetPart !== candidateManaged.worksheetPart || baselineManaged.workbookPart !== candidateManaged.workbookPart) fail("candidate managed part identity changed.");
   if (baselineManaged.worksheetPart !== localPatchCertificate.managedParts.worksheet.name || baselineManaged.workbookPart !== localPatchCertificate.managedParts.workbook.name) fail("local patch certificate managed part identity differs.");
@@ -1269,6 +1288,66 @@ export async function runRootWorkbookAuditWorker({ requestPath, requestBody, req
   });
 }
 
+export function prestartRootWorkbookAuditWorker({ timeoutMs = DEFAULT_WORKER_TIMEOUT_MS, stdoutMaxBytes = MAX_WORKER_STDOUT_BYTES } = {}) {
+  const worker = new Worker(pathToFileURL(BUILDER_PATH), {
+    execArgv: [],
+    workerData: { kind: "root-workbook-audit-thread-session-v1" },
+    resourceLimits: { maxOldGenerationSizeMb: 256, maxYoungGenerationSizeMb: 64 },
+  });
+  let state = "starting"; let timer; let readyResolve; let readyReject; let runResolve; let runReject;
+  const ready = new Promise((resolve, reject) => { readyResolve = resolve; readyReject = reject; });
+  // A build failure may terminate the session before the candidate path exists.
+  // Keep that lifecycle rejection observed even when no audit request is sent.
+  void ready.catch(() => {});
+  const closeWithError = (error) => {
+    if (state === "closed") return;
+    const prior = state; state = "closed"; clearTimeout(timer);
+    if (prior === "starting") readyReject(error);
+    else if (prior === "running") runReject(error);
+    void worker.terminate();
+  };
+  timer = setTimeout(() => closeWithError(new Error("audit worker startup timed out")), timeoutMs);
+  worker.on("message", (message) => {
+    if (state === "starting") {
+      if (message?.kind !== "root-workbook-audit-thread-ready-v1") return closeWithError(new Error("audit worker startup protocol is invalid"));
+      clearTimeout(timer); state = "ready"; readyResolve(); return;
+    }
+    if (state !== "running" || message?.kind !== "root-workbook-audit-thread-result-v1") return closeWithError(new Error("audit worker response protocol is invalid"));
+    clearTimeout(timer); state = "closed";
+    if (!message.ok) runReject(new Error(`audit worker failed: ${message.error ?? "unknown error"}`));
+    else {
+      const out = `${JSON.stringify(message.response)}\n`;
+      if (Buffer.byteLength(out) > stdoutMaxBytes) runReject(new Error("audit worker stdout exceeded its bounded limit"));
+      else runResolve({ ...message.response, rawStdout: out });
+    }
+    void worker.terminate();
+  });
+  worker.once("error", (error) => closeWithError(error));
+  worker.once("exit", (code) => { if (state !== "closed") closeWithError(new Error(`audit worker exited with code ${code}`)); });
+  return Object.freeze({
+    ready,
+    async run({ requestPath, requestBody, requestFileSha256, requestNonce } = {}) {
+      await ready;
+      if (state !== "ready") fail("prestarted audit worker is unavailable.");
+      const absoluteRequest = requestBody ? null : path.resolve(text(requestPath, "worker requestPath")); sha(requestFileSha256, "worker requestFileSha256"); if (!TOKEN_RE.test(requestNonce ?? "")) fail("worker requestNonce is invalid.");
+      if (requestBody && sha256Bytes(jsonBytes(requestBody)) !== requestFileSha256) fail("in-memory audit request SHA differs.");
+      state = "running";
+      return new Promise((resolve, reject) => {
+        runResolve = resolve; runReject = reject;
+        timer = setTimeout(() => closeWithError(new Error("audit worker timed out")), timeoutMs);
+        worker.postMessage({ kind: "root-workbook-audit-thread-request-v1", request: { requestPath: absoluteRequest, requestBody: requestBody ? clone(requestBody) : null, requestFileSha256, requestNonce } });
+      });
+    },
+    async terminate() {
+      if (state === "closed") return;
+      const prior = state; state = "closed"; clearTimeout(timer);
+      if (prior === "starting") readyReject(new Error("audit worker terminated before startup completed"));
+      else if (prior === "running") runReject(new Error("audit worker terminated before the audit completed"));
+      await worker.terminate();
+    },
+  });
+}
+
 async function cleanupOwned(owned, stagingRoot) {
   const preserved = []; const failures = [];
   for (const entry of [...owned].reverse()) { try { const current = await readStableBinaryFile(entry.path).catch(() => null); if (!current) continue; if (current.sha256 !== entry.sha256 || current.size !== entry.size) { preserved.push(entry.path); continue; } await fs.unlink(entry.path); } catch (error) { failures.push({ path: entry.path, error }); } }
@@ -1280,17 +1359,31 @@ function candidateFilename(profile, revision) { return `${profile.archiveStem}_�
 function planFilename(profile, revision) { return `${profile.archiveStem}_候选修订${revision}.root-plan.json`; }
 
 export async function buildRootWorkbookCandidates(request, { testHooks } = {}) {
-  const registry = await loadProfileRegistry(); const checked = validateBuildRequest(clone(request), registry); const stagingRoot = path.join(path.resolve(os.tmpdir()), `${STAGING_PREFIX}${checked.stagingToken}`); const owned = [];
+  const registry = await loadProfileRegistry(); const checked = validateBuildRequest(clone(request), registry); const stagingRoot = path.join(path.resolve(os.tmpdir()), `${STAGING_PREFIX}${checked.stagingToken}`); const owned = []; let auditSession = null;
   try {
     await fs.mkdir(stagingRoot, { recursive: false });
     const marker = await writeExclusive(path.join(stagingRoot, ".codex-xhs-owner.json"), jsonBytes({ kind: "root-workbook-staging-owner-v2", stagingToken: checked.stagingToken, pid: process.pid })); owned.push(marker);
-    const builtSet = await mapSettledLimit(checked.artifacts, 3, (artifact) => buildCandidate(artifact, checked.certificate, stagingRoot, { onOwned: (entry) => owned.push(entry), testHooks })); const built = builtSet.settled.map((entry) => entry.value);
+    if (!testHooks?.runRootWorkbookAuditWorker) {
+      auditSession = prestartRootWorkbookAuditWorker();
+      if (testHooks?.afterAuditWorkerPrestarted) await testHooks.afterAuditWorkerPrestarted();
+    }
+    const builtSet = await mapSettledLimit(checked.artifacts, 3, (artifact) => buildCandidateCore(artifact, checked.certificate, stagingRoot, { onOwned: (entry) => owned.push(entry), testHooks })); const builtCores = builtSet.settled.map((entry) => entry.value);
     const requestNonce = crypto.randomBytes(32).toString("hex");
-    const workerRequest = { kind: ROOT_WORKBOOK_AUDIT_REQUEST_KIND, requestNonce, reimbursementFactsCertificate: checked.certificate.raw, profiles: built.map((item) => ({ profileId: item.artifact.profileId, baselinePath: item.artifact.baselinePath, baselineSha256: item.artifact.baselineSha256, candidatePath: item.candidate.path, candidateSha256: item.candidate.sha256, localPatchCertificate: item.localPatchCertificate })) };
+    const workerRequest = { kind: ROOT_WORKBOOK_AUDIT_REQUEST_KIND, requestNonce, reimbursementFactsCertificate: checked.certificate.raw, profiles: builtCores.map((item) => ({ profileId: item.artifact.profileId, baselinePath: item.artifact.baselinePath, baselineSha256: item.artifact.baselineSha256, candidatePath: item.candidate.path, candidateSha256: item.candidate.sha256, localPatchCertificate: item.localPatchCertificate })) };
     workerRequest.requestDigest = computeRootWorkbookAuditRequestDigest(workerRequest);
     const requestBytes = jsonBytes(workerRequest); const requestFileSha256 = sha256Bytes(requestBytes); let requestPath;
     if (testHooks?.afterWorkerRequestWritten) { const requestEntry = await writeExclusive(path.join(stagingRoot, `.audit-request.${requestNonce}.json`), requestBytes); owned.push(requestEntry); requestPath = requestEntry.path; await testHooks.afterWorkerRequestWritten({ requestPath, requestBody: clone(workerRequest) }); }
-    const raw = await runRootWorkbookAuditWorker({ requestPath, requestBody: requestPath ? undefined : workerRequest, requestFileSha256, requestNonce }); const { rawStdout: _rawStdout, ...response } = raw;
+    const auditRunner = testHooks?.runRootWorkbookAuditWorker ?? runRootWorkbookAuditWorker;
+    const [previewSettled, auditSettled] = await Promise.allSettled([
+      mapSettledLimit(builtCores, 3, (item) => buildCandidatePreview(item, stagingRoot, { onOwned: (entry) => owned.push(entry), testHooks })),
+      auditSession
+        ? auditSession.run({ requestPath, requestBody: requestPath ? undefined : workerRequest, requestFileSha256, requestNonce })
+        : auditRunner({ requestPath, requestBody: requestPath ? undefined : workerRequest, requestFileSha256, requestNonce }),
+    ]);
+    if (previewSettled.status === "rejected" || auditSettled.status === "rejected") throw previewSettled.reason ?? auditSettled.reason;
+    const previews = previewSettled.value.settled.map((entry) => entry.value);
+    const built = builtCores.map((item, index) => ({ ...item, preview: previews[index] }));
+    const { rawStdout: _rawStdout, ...response } = auditSettled.value;
     const auditBatch = validateRootWorkbookAuditBatch(response, { requestDigest: workerRequest.requestDigest, requestFileSha256, requestNonce, profileIds: checked.profileIds, profileBindings: workerRequest.profiles, certificate: checked.certificate.raw });
     const committed = [];
     for (const [index, item] of built.entries()) {
@@ -1306,18 +1399,19 @@ export async function buildRootWorkbookCandidates(request, { testHooks } = {}) {
     }
     return deepFreeze({ kind: ROOT_WORKBOOK_BUILD_RESULT_KIND, requiresGate1Binding: true, stagingRoot, stagingToken: checked.stagingToken, requestDigest: workerRequest.requestDigest, requestFileSha256, auditBatchDigest: canonicalDigest(auditBatch), artifacts: committed, ownedFiles: owned.map((item) => ({ path: item.path, sha256: item.sha256, size: item.size })) });
   } catch (reason) {
+    if (auditSession) await auditSession.terminate().catch(() => {});
     const cleanup = await cleanupOwned(owned, stagingRoot); const message = reason instanceof Error ? reason.message : String(reason);
     if (cleanup.preserved.length || cleanup.failures.length) fail(`${message}; cleanup incomplete: ${[...cleanup.preserved, ...cleanup.failures.map((item) => item.path)].join(", ")}`);
     throw reason;
   }
 }
 
-async function executeAuditWorker({ requestPath: rawRequestPath, requestBody, requestFileSha256, requestNonce }) {
+async function executeAuditWorker({ requestPath: rawRequestPath, requestBody, requestFileSha256, requestNonce }, preloadedRegistry = null) {
   const expectedSha = sha(requestFileSha256, "audit worker expected request SHA"); const expectedNonce = text(requestNonce, "audit worker expected nonce");
   const snapshot = requestBody ? { value: clone(requestBody), sha256: sha256Bytes(jsonBytes(requestBody)) } : await readStableUtf8JsonFile(path.resolve(rawRequestPath), { maxBytes: MAX_JSON_BYTES });
   if (snapshot.sha256 !== expectedSha) fail("audit request file SHA differs.");
   const request = validateAuditRequest(snapshot.value); if (request.requestNonce !== expectedNonce) fail("audit request nonce differs.");
-  const registry = await loadProfileRegistry(); const certificate = validateCertificate(request.reimbursementFactsCertificate, registry); const expectedOrder = registry.profileOrder.filter((profileId) => request.profiles.some((item) => item.profileId === profileId)); if (canonicalDigest(expectedOrder) !== canonicalDigest(request.profiles.map((item) => item.profileId))) fail("audit profiles are outside registry order.");
+  const registry = preloadedRegistry ?? await loadProfileRegistry(); const certificate = validateCertificate(request.reimbursementFactsCertificate, registry); const expectedOrder = registry.profileOrder.filter((profileId) => request.profiles.some((item) => item.profileId === profileId)); if (canonicalDigest(expectedOrder) !== canonicalDigest(request.profiles.map((item) => item.profileId))) fail("audit profiles are outside registry order.");
   const settled = await mapSettledLimit(request.profiles, 3, (profile) => auditOne(profile, certificate, registry));
   return { kind: ROOT_WORKBOOK_AUDIT_BATCH_KIND, requestDigest: request.requestDigest, requestFileSha256: snapshot.sha256, requestNonce: request.requestNonce, audits: settled.settled.map((entry) => entry.value) };
 }
@@ -1333,7 +1427,21 @@ async function main() {
   const input = await readStableUtf8JsonFile(path.resolve(args[1]), { maxBytes: MAX_JSON_BYTES }); process.stdout.write(`${JSON.stringify(await buildRootWorkbookCandidates(input.value))}\n`);
 }
 
-if (!isMainThread && workerData?.kind === "root-workbook-audit-thread-v1") {
+if (!isMainThread && workerData?.kind === "root-workbook-audit-thread-session-v1") {
+  loadProfileRegistry().then((registry) => {
+    parentPort.postMessage({ kind: "root-workbook-audit-thread-ready-v1" });
+    parentPort.once("message", (message) => {
+      if (message?.kind !== "root-workbook-audit-thread-request-v1") {
+        parentPort.postMessage({ kind: "root-workbook-audit-thread-result-v1", ok: false, error: "audit worker request protocol is invalid" });
+        return;
+      }
+      executeAuditWorker(message.request, registry).then(
+        (response) => parentPort.postMessage({ kind: "root-workbook-audit-thread-result-v1", ok: true, response }),
+        (error) => parentPort.postMessage({ kind: "root-workbook-audit-thread-result-v1", ok: false, error: error instanceof Error ? error.message : String(error) }),
+      );
+    });
+  }, (error) => parentPort.postMessage({ kind: "root-workbook-audit-thread-result-v1", ok: false, error: error instanceof Error ? error.message : String(error) }));
+} else if (!isMainThread && workerData?.kind === "root-workbook-audit-thread-v1") {
   executeAuditWorker(workerData).then((response) => parentPort.postMessage({ ok: true, response })).catch((error) => parentPort.postMessage({ ok: false, error: error instanceof Error ? error.message : String(error) }));
 } else if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
   main().catch((error) => { process.stderr.write(`${JSON.stringify({ error: error instanceof Error ? error.message : String(error) })}\n`); process.exitCode = 1; });
