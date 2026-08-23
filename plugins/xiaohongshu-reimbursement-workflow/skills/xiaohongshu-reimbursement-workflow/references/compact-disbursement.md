@@ -81,7 +81,7 @@ node scripts/run_compact_disbursement_workflow.mjs --archive <request.json>
 
 这个 request 是当前任务的内部运行输入，不是让用户手动准备的业务材料。其 kind 固定为 `compact-disbursement-archive-v1`，字段严格只有 `kind`、64 位小写十六进制 `stagingToken`、`manifestPath` 和 `manifestSha256`。不得加入审批文本、状态路径、门禁摘要或其他分步发布字段。
 
-一次调用必须完整执行：owner/目录身份绑定 → fresh 来源全审计 → 候选生成或安全恢复 → 候选逐行/逐凭证完整审计 → 再次 fresh 来源与候选完整复核 → 发布输入指纹前后 TOCTOU 核对 → task-owned stage 复制与独立审计 → 在 stage 审计完成后再次复核完整发布输入身份 → 原子改名 → 最终三项完整复核 → allowlist 清理并返回 receipt。最后一次发布输入复核必须覆盖全部 `boundSourcePaths` 和候选三项，不能只复核 stage；任一来源、事实、目录身份、候选或 stage 变化都立即停止，不发布部分结果。
+一次调用必须完整执行：严格校验外层 request → 已有 workflow root 时先核 owner、无现场时不提前创建目录 → 首次 fresh 来源全审计与输出父目录身份绑定 → 创建或恢复 owner → 候选生成或安全恢复 → 候选逐行/逐凭证完整审计 → 再次 fresh 来源与候选完整复核 → 发布输入指纹前后 TOCTOU 核对 → task-owned stage 复制与独立审计 → 在 stage 审计完成后再次复核完整发布输入身份 → 原子改名 → 最终三项完整复核 → allowlist 清理并返回 receipt。不同请求复用已有 token 必须在读取其 manifest/source 前因 owner 不匹配而拒绝；新 token 的无效 manifest 不得留下 workflow root。最后一次发布输入复核必须覆盖全部 `boundSourcePaths` 和候选三项，不能只复核 stage；任一来源、事实、目录身份、候选或 stage 变化都立即停止，不发布部分结果。
 
 ## 最终形状、恢复与清理
 
