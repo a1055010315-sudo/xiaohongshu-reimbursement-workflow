@@ -300,12 +300,20 @@ function runs(items, keySelector) {
   return result;
 }
 
-function validateTabularRows({ add, sheet, expected, startRow, profileId, artifact, person, transactionResults }) {
+function reimbursementAttribute(transaction, evidenceFiles) {
+  const settlementText = transaction.settlement === "company_paid_no_reimbursement" ? "对公已付不实报" : "实报";
+  const hasVoucher = transaction.evidence.some((evidenceId) => evidenceFiles.get(evidenceId)?.usage === "voucher");
+  return `${settlementText}；${hasVoucher ? "有截图" : "无截图"}`;
+}
+
+function validateTabularRows({ add, sheet, expected, startRow, profileId, artifact, person, transactionResults, evidenceFiles }) {
   const cells = cellMap(sheet);
   const dateRuns = runs(expected, (item) => item.date);
   const feeRuns = runs(expected, (item) => JSON.stringify([item.classification, item.settlement]));
+  const attributeRuns = runs(expected, (item) => reimbursementAttribute(item, evidenceFiles));
   const dateByStart = new Map(dateRuns.map((run) => [run.start, run]));
   const feeByStart = new Map(feeRuns.map((run) => [run.start, run]));
+  const attributeByStart = new Map(attributeRuns.map((run) => [run.start, run]));
   for (const [index, transaction] of expected.entries()) {
     const row = startRow + index;
     const location = `${artifact}!${row}`;
@@ -323,7 +331,7 @@ function validateTabularRows({ add, sheet, expected, startRow, profileId, artifa
       sourceAmount: transaction.sourceAmount,
       person: transaction.person,
       classification: transaction.classification,
-      settlement: transaction.settlement === "company_paid_no_reimbursement" ? "对公已付不实报" : "实报",
+      settlement: reimbursementAttribute(transaction, evidenceFiles),
     };
     compare(add, actual, wanted, { code: "transaction-row-mismatch", profileId, transactionId: transaction.id, artifact, location });
     markTransactionCheck(transactionResults, transaction.id, artifact, { row });
@@ -336,7 +344,11 @@ function validateTabularRows({ add, sheet, expected, startRow, profileId, artifa
       requireFormula(add, formulaCell, `SUM(C${row}:C${endRow})`, { profileId, transactionId: transaction.id, artifact, location: `D${row}` });
       const expectedTotal = sum(expected.slice(feeRun.start, feeRun.end + 1), (item) => item.sourceMilliunits);
       compare(add, amount(asAmount(cellScalar(formulaCell), `${artifact}!D${row}`)), amount(expectedTotal), { code: "formula-total-mismatch", profileId, transactionId: transaction.id, artifact, location: `D${row}` });
-      if (endRow > row) for (const column of [4, 5, 6]) requireMerge(add, sheet, mergeRef(column, row, column, endRow), { profileId, transactionId: transaction.id, artifact, location });
+      if (endRow > row) for (const column of [4, 5]) requireMerge(add, sheet, mergeRef(column, row, column, endRow), { profileId, transactionId: transaction.id, artifact, location });
+    }
+    const attributeRun = attributeByStart.get(index);
+    if (attributeRun && attributeRun.end > attributeRun.start) {
+      requireMerge(add, sheet, mergeRef(6, row, 6, row + attributeRun.end - attributeRun.start), { profileId, transactionId: transaction.id, artifact, location });
     }
   }
 }
@@ -830,7 +842,7 @@ async function freshReviewSources(sourceByRef, usedMediaFiles, observations, add
   return results;
 }
 
-function validateDetail(add, sheet, transactions, profileId, transactionResults) {
+function validateDetail(add, sheet, transactions, profileId, transactionResults, evidenceFiles) {
   const cells = cellMap(sheet);
   const employeeTotal = sum(transactions.filter((item) => item.settlement === "employee_reimbursement"), (item) => item.reimbursementMilliunits);
   const mainTotal = sum(transactions.filter((item) => item.reportingKind === "current"), (item) => item.reimbursementMilliunits);
@@ -854,14 +866,14 @@ function validateDetail(add, sheet, transactions, profileId, transactionResults)
     const end = start + section.transactions.length - 1;
     requireFormula(add, cells.get(`F${row}`), `SUM(C${start}:C${end})`, { profileId, artifact: "detail", location: `F${row}` });
     compare(add, amount(asAmount(cellScalar(cells.get(`F${row}`)), `detail.F${row}`)), amount(sum(section.transactions, (item) => item.sourceMilliunits)), { code: "detail-person-group-total-mismatch", profileId, transactionId: section.transactions[0]?.id, artifact: "detail", location: `F${row}` });
-    validateTabularRows({ add, sheet, expected: section.transactions, startRow: start, profileId, artifact: "detail", person: section.person, transactionResults });
+    validateTabularRows({ add, sheet, expected: section.transactions, startRow: start, profileId, artifact: "detail", person: section.person, transactionResults, evidenceFiles });
     row = end + 1;
   }
   const actualDataRows = sheet.rows.filter((item) => item.index >= 7 && item.cells.some((cell) => cell.column === 3 && cellScalar(cell) !== null)).length;
   compare(add, actualDataRows, transactions.length, { code: "detail-transaction-count-mismatch", profileId, artifact: "detail" });
 }
 
-function validateSupplement(add, sheet, expected, metadata, profileId, transactionResults) {
+function validateSupplement(add, sheet, expected, metadata, profileId, transactionResults, evidenceFiles) {
   const cells = cellMap(sheet);
   const ordered = [...expected].sort((left, right) => left.date.localeCompare(right.date) || left.sourceOrder - right.sourceOrder);
   const start = ordered[0]?.date ?? null;
@@ -890,7 +902,7 @@ function validateSupplement(add, sheet, expected, metadata, profileId, transacti
   requireMerge(add, sheet, `C${footerRow}:F${footerRow}`, { profileId, artifact: "supplement", location: `C${footerRow}` });
   requireFormula(add, cells.get(`C${footerRow}`), `SUM(C5:C${footerRow - 1})`, { profileId, artifact: "supplement", location: `C${footerRow}` });
   compare(add, amount(asAmount(cellScalar(cells.get(`C${footerRow}`)), `supplement.C${footerRow}`)), amount(expectedSource), { code: "supplement-formula-total-mismatch", profileId, artifact: "supplement", location: `C${footerRow}` });
-  validateTabularRows({ add, sheet, expected: ordered, startRow: 5, profileId, artifact: "supplement", person: metadata.person, transactionResults });
+  validateTabularRows({ add, sheet, expected: ordered, startRow: 5, profileId, artifact: "supplement", person: metadata.person, transactionResults, evidenceFiles });
   const actualDataRows = sheet.rows.filter((item) => item.index >= 5 && item.index < footerRow && item.cells.some((cell) => cell.column === 3 && cellScalar(cell) !== null)).length;
   compare(add, actualDataRows, ordered.length, { code: "supplement-transaction-count-mismatch", profileId, artifact: "supplement" });
   const trailingBusinessRows = sheet.rows.filter((item) => item.index > footerRow && item.cells.some((cell) => cellScalar(cell) !== null)).map((item) => item.index);
@@ -1343,7 +1355,7 @@ export async function auditFullCorrespondence(rawInput, { hooks } = {}) {
       const loadedByKey = new Map(loadTasks.map((task, index) => [task.key, loaded.settled[index].value]));
 
       const detailFacts = loadedByKey.get("detail");
-      validateDetail(add, sheetByName(detailFacts.facts, presentation.detail.sheetName, "detail"), profileTransactions, profileId, transactionResults);
+      validateDetail(add, sheetByName(detailFacts.facts, presentation.detail.sheetName, "detail"), profileTransactions, profileId, transactionResults, files);
 
       const screenshot = loadedByKey.get("screenshot");
       validateScreenshot(add, screenshot, profileTransactions, files, profileId, presentation.screenshot, transactionResults);
@@ -1361,7 +1373,7 @@ export async function auditFullCorrespondence(rawInput, { hooks } = {}) {
           continue;
         }
         const workbook = loadedByKey.get(`supplement:${index}`);
-        validateSupplement(add, sheetByName(workbook.facts, supplement.sheetName, "supplement"), plan.expected, supplement, profileId, transactionResults);
+        validateSupplement(add, sheetByName(workbook.facts, supplement.sheetName, "supplement"), plan.expected, supplement, profileId, transactionResults, files);
         supplementResults.push({ profileId, person: supplement.person, start: supplement.start, end: supplement.end, count: supplement.count, amount: supplement.amount, sourceAmount: supplement.sourceAmount, reimbursementAmount: supplement.reimbursementAmount, reasons: [...supplement.reasons], path: supplement.path });
       }
       for (const [person, expected] of supplementsByPerson) add("missing", "supplement-workbook-missing", { profileId, artifact: "supplement", person, expectedCount: expected.length });

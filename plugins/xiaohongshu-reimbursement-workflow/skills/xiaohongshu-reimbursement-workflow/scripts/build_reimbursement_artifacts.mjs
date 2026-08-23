@@ -388,7 +388,16 @@ function detailDescription(transactions) {
   return `说明：本表按人员分类；主期${mainCount}笔；${supplementFact}；主期与补报分开标注；${evidenceFact}。`;
 }
 
-function detailProjection(profile, period, transactions, styles, { suffix = "", subtitle = undefined, template } = {}) {
+function hasVoucherEvidence(transaction, evidenceById) {
+  return transaction.evidence.some((evidenceId) => evidenceById.get(evidenceId)?.usage === "voucher");
+}
+
+function reimbursementAttribute(transaction, evidenceById) {
+  const settlementText = transaction.settlement === "company_paid_no_reimbursement" ? "对公已付不实报" : "实报";
+  return `${settlementText}；${hasVoucherEvidence(transaction, evidenceById) ? "有截图" : "无截图"}`;
+}
+
+function detailProjection(profile, period, transactions, styles, { suffix = "", subtitle = undefined, template, evidenceById } = {}) {
   const mergePolicy = template?.definition.outputMergePolicy ?? {};
   const groups = new Map();
   for (const transaction of transactions) {
@@ -444,8 +453,10 @@ function detailProjection(profile, period, transactions, styles, { suffix = "", 
     row += 1;
     const dateRuns = contiguousRuns(ordered, (item) => item.date);
     const feeRuns = contiguousRuns(ordered, (item) => JSON.stringify([item.classification, item.settlement]));
+    const attributeRuns = contiguousRuns(ordered, (item) => reimbursementAttribute(item, evidenceById));
     const dateByStart = new Map(dateRuns.map((run) => [run.start, run]));
     const feeByStart = new Map(feeRuns.map((run) => [run.start, run]));
+    const attributeByStart = new Map(attributeRuns.map((run) => [run.start, run]));
     for (const [index, transaction] of ordered.entries()) {
       const cells = [];
       const dateRun = dateByStart.get(index);
@@ -459,11 +470,16 @@ function detailProjection(profile, period, transactions, styles, { suffix = "", 
         const runItems = ordered.slice(feeRun.start, feeRun.end + 1);
         const endRow = row + feeRun.end - feeRun.start;
         cells.push(
-          moneyFormulaCell(`D${row}`, `SUM(C${row}:C${endRow})`, formatMilliunits(sumMilliunits(runItems)), styles, "feeTotal"),
-          textCell(`E${row}`, transaction.classification, styles.classification),
-          textCell(`F${row}`, transaction.settlement === "company_paid_no_reimbursement" ? "对公已付不实报" : "实报", styles.settlement),
+        moneyFormulaCell(`D${row}`, `SUM(C${row}:C${endRow})`, formatMilliunits(sumMilliunits(runItems)), styles, "feeTotal"),
+        textCell(`E${row}`, transaction.classification, styles.classification),
         );
-        if (mergePolicy.expenseGroup && endRow > row) for (const column of ["D", "E", "F"]) merges.push(`${column}${row}:${column}${endRow}`);
+        if (mergePolicy.expenseGroup && endRow > row) for (const column of ["D", "E"]) merges.push(`${column}${row}:${column}${endRow}`);
+      }
+      const attributeRun = attributeByStart.get(index);
+      if (attributeRun) {
+        const endRow = row + attributeRun.end - attributeRun.start;
+        cells.push(textCell(`F${row}`, reimbursementAttribute(transaction, evidenceById), styles.settlement));
+        if (mergePolicy.expenseGroup && endRow > row) merges.push(`F${row}:F${endRow}`);
       }
       const longText = Array.from(transaction.project).length > 24 || Array.from(transaction.classification).length > 14;
       rows.push(rowXml(row, cells, { height: longText ? outputRowHeight(template, "longText", 42) : outputRowHeight(template, "default", 24) }));
@@ -496,7 +512,7 @@ function detailProjection(profile, period, transactions, styles, { suffix = "", 
   };
 }
 
-function supplementProjection(period, transactions, styles, { subtitle, template }) {
+function supplementProjection(period, transactions, styles, { subtitle, template, evidenceById }) {
   const mergePolicy = template.definition.outputMergePolicy;
   const person = transactions[0].person;
   const total = sumMilliunits(transactions);
@@ -512,6 +528,7 @@ function supplementProjection(period, transactions, styles, { subtitle, template
   const ordered = [...transactions].sort((left, right) => left.date.localeCompare(right.date) || left.sourceOrder - right.sourceOrder);
   const dateStarts = new Map(contiguousRuns(ordered, (item) => item.date).map((run) => [run.start, run]));
   const expenseStarts = new Map(contiguousRuns(ordered, (item) => JSON.stringify([item.classification, item.settlement])).map((run) => [run.start, run]));
+  const attributeStarts = new Map(contiguousRuns(ordered, (item) => reimbursementAttribute(item, evidenceById)).map((run) => [run.start, run]));
   let row = 5;
   for (const [index, transaction] of ordered.entries()) {
     const cells = [];
@@ -525,13 +542,17 @@ function supplementProjection(period, transactions, styles, { subtitle, template
     if (expenseRun) {
       const runItems = ordered.slice(expenseRun.start, expenseRun.end + 1);
       const endRow = row + expenseRun.end - expenseRun.start;
-      const settlementText = transaction.settlement === "company_paid_no_reimbursement" ? "对公已付不实报" : "实报";
       cells.push(
         moneyFormulaCell(`D${row}`, `SUM(C${row}:C${endRow})`, formatMilliunits(sumMilliunits(runItems)), styles, "feeTotal"),
         textCell(`E${row}`, transaction.classification, styles.classification),
-        textCell(`F${row}`, settlementText, styles.settlement),
       );
-      if (mergePolicy.expenseGroup && endRow > row) for (const column of ["D", "E", "F"]) merges.push(`${column}${row}:${column}${endRow}`);
+      if (mergePolicy.expenseGroup && endRow > row) for (const column of ["D", "E"]) merges.push(`${column}${row}:${column}${endRow}`);
+    }
+    const attributeRun = attributeStarts.get(index);
+    if (attributeRun) {
+      const endRow = row + attributeRun.end - attributeRun.start;
+      cells.push(textCell(`F${row}`, reimbursementAttribute(transaction, evidenceById), styles.settlement));
+      if (mergePolicy.expenseGroup && endRow > row) merges.push(`F${row}:F${endRow}`);
     }
     const longText = Array.from(transaction.project).length > 18 || Array.from(transaction.classification).length > 12;
     rows.push(rowXml(row, cells, { height: longText ? outputRowHeight(template, "longText", 38) : outputRowHeight(template, "default", template.definition.templateRowHeight) }));
@@ -1041,7 +1062,7 @@ export async function buildReimbursementArtifacts(rawRequest, { testHooks } = {}
       const selectedAnnotations = summaryAnnotations.filter((annotation) => annotation.profileId === profileId);
       if (selected.length === 0) fail(`${profileId} has no reimbursement and must not emit files.`);
       const supplements = supplementSummary(selected);
-      const detail = detailProjection(profile, period, selected, templates.currentDetail.styleRoles, { suffix: supplements.suffix, template: templates.currentDetail });
+      const detail = detailProjection(profile, period, selected, templates.currentDetail.styleRoles, { suffix: supplements.suffix, template: templates.currentDetail, evidenceById: evidence });
       const screenshot = screenshotProjection(profile, selected, evidence, templates.screenshotMap.styleRoles, templates.screenshotMap);
       const summary = renderProfileSummary(profile, mainPeriod, selected, supplements, selectedAnnotations, templates.summaryText);
       const safePeriod = safeSegment(period);
@@ -1093,7 +1114,7 @@ export async function buildReimbursementArtifacts(rawRequest, { testHooks } = {}
           supplement.period,
           supplement.transactions,
           templates.supplementDetail.styleRoles,
-          { subtitle: `补报明细｜原因：${supplement.reasons.join("；")}`, template: templates.supplementDetail },
+          { subtitle: `补报明细｜原因：${supplement.reasons.join("；")}`, template: templates.supplementDetail, evidenceById: evidence },
         );
         const supplementName = supplement.start === supplement.end
           ? `${safeSegment(supplement.person)}_${compactDate(supplement.start)}_小红书补报明细.xlsx`
