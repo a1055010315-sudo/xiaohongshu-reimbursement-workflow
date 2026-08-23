@@ -1,41 +1,57 @@
 # 实施所有权
 
-状态：S00、S01 所有权已结案；S02-S06 待分配。
+状态：S00-S05 已完成并集成；S06 由主对话独占集成分支写入。
 
 ## 规则
 
-- 一个单元开始前必须记录 owner、branch/worktree、base、允许修改的路径和明确排除项。
-- 未冻结契约不得由实现单元自行补写为既成事实。
-- 同一路径同时只能有一个写入所有者；跨单元需要通过 handoff 明确移交。
-- 来源 marketplace、安装缓存和 Codex 配置始终只读。
-- 真实财务目录不属于开发或测试输入。
+- 一个单元开始前记录 owner、branch/worktree、base、允许修改路径和明确排除项。
+- 同一路径同时只能有一个 writer；跨单元通过 handoff 移交。
+- 来源 marketplace、安装缓存、`config.toml` 和真实财务目录始终只读。
+- 测试只使用合成或脱敏 fixture。
+- 本期只取消发放核销内部 sidecar 启动门槛；普通报销 Gate 1/Gate 2 与整体性能优化不属于实现范围。
 
-## 当前分配
+## 已完成分配
 
-| 单元 | owner | 状态 | 写入范围 |
+| 单元 | owner / branch | 状态 | 主要写入范围 |
 | --- | --- | --- | --- |
-| S00 | baseline unit | complete | 独占创建整个新开发仓库；完成后停止修改 |
-| S01 | contract unit | complete | 独占 v2 contract 模块/测试及本次指定实施文档；完成后停止修改 |
-| S02 | unassigned | pending | 未冻结 |
-| S03 | unassigned | pending | 未冻结 |
-| S04 | unassigned | pending | 未冻结 |
-| S05 | unassigned | pending | 未冻结 |
-| S06 | unassigned | pending | 未冻结 |
+| S00 | baseline / `s00-baseline` | complete | 新开发仓库、两处已知 cache 修正、基线文档 |
+| S01 | contract / `s01-contract` | complete | v2 structural contract、契约测试和冻结文档 |
+| S02 | published archive / `s02-published-archive` | complete | published source auditor、专属测试和交接 |
+| S03 | fresh/salary / `s03-fresh-salary` | complete | fresh/salary auditor、专属测试和交接 |
+| S04 | integration / `s04-integration` | complete | v1/v2 dispatcher、统一 audit、runner/fixture/E2E |
+| S05 | docs / `s05-docs` | complete | Skill、reference、README、prompt、迁移文档 |
+| S05 fixes | isolated review fixes | complete | voucher/owner-first 与真实 published archive 修正 |
+| S06 | master / `vnext/integration` | in_progress | cachebuster、发布记录、`dist` 候选和验证证据 |
 
-S00 的实际业务脚本写入仅限从 cache 原样吸收以下两个文件：
+S02/S03 从 `493c702` 并行，S04 集成提交 `e06898b`，主分支集成至 `cda49e3`。S06 期间只有主对话可以修改 `vnext/integration`；`s06_release_preflight` 仅做 GPT-5.6-sol/xhigh 只读审查。
+
+## 普通报销边界
+
+S00 基线已单独吸收安装缓存中两处普通报销修正：
 
 - `audit_full_correspondence.mjs`
 - `build_reimbursement_artifacts.mjs`
 
-其余 S00 写入均为 marketplace 完整导入、Git 元数据或 `docs/implementation` 状态/交接文档。
+本期相对 S00 基线没有修改：
 
-## S01 冻结写入范围
+- `run_reimbursement_workflow.mjs`
+- `build_gate_binding.mjs`
+- `audit_full_correspondence.mjs`
+- `references/gate2-full-correspondence.md`
 
-- branch：`s01-contract`
-- worktree：`C:\Users\a1055\plugins\development\xhs-worktrees\S01-contract`
-- base：`baseline/s00-v0.5.0-codex.20260822170308`（peeled `8a09a77c4a7cef2845e4bff8825162b620544ecc`）
-- 新增独占模块：`plugins/xiaohongshu-reimbursement-workflow/skills/xiaohongshu-reimbursement-workflow/scripts/disbursement_manifest_v2_contract.mjs`
-- 新增独占测试：`plugins/xiaohongshu-reimbursement-workflow/skills/xiaohongshu-reimbursement-workflow/tests/disbursement-manifest-v2-contract.test.mjs`
-- 文档：`contracts/manifest-v2.md`、`contracts/ownership.md`、`contracts/test-matrix.md`、`handoffs/S01.md`、`INDEX.md`
+`audit_batch_manifest.mjs` 只有 optional ordinary-manifest attestation 的 deferred no-follow 安全修正：deferred 模式不再 stat/read manifest 声明的未注册历史路径，并明确报告 `declaredPathVerification`。普通报销非 deferred 路径仍 fresh 读取并校验 SHA，Gate 语义不变。
 
-S01 明确没有 `disbursement_manifest.mjs`、runner、archive、生产 fixture、版本/cachebuster、打包或安装所有权。S02/S03 可消费 S01 导出的冻结接口，但若需改变字段或结构，必须先显式重开 contract 所有权，不能在解析器中暗改 schema。
+## S06 允许与排除
+
+允许：
+
+- plugin-creator helper 生成的单一 cachebuster；
+- README 与 `docs/implementation` 发布记录；
+- `dist` 中最终 ZIP 和 SHA256 sidecar。
+
+排除：
+
+- 候选缓存复用、文件并发、PDF Worker、减少审计次数或其他性能重构；
+- 修改 marketplace entry、`config.toml`、安装 cache 或运行安装/升级；
+- 读取、枚举、搜索或打包真实财务目录；
+- 将测试临时目录、Junction/reparse、恢复目录、任务内部 request/manifest 或秘密放入候选。

@@ -1,68 +1,52 @@
 # 测试矩阵
 
-状态：S00 基线已执行；S01 v2 结构契约测试已冻结并通过。
+状态：S00-S05 实现与回归已完成；S06 在同一生产代码树上执行发布候选复验。
 
-## S00 发放测试
+## 运行时
 
-- 测试文件发现规则：`tests/disbursement-*.test.mjs`
-- 文件数：4
-- 顶层 `test(...)` 声明数：29
-- Node test runner 最终真实计数：38（含 9 个嵌套子测试）
-- 最终结果：38 pass，0 fail，0 skipped
-- 最终耗时：17,391.252 ms
-- Node：Codex bundled Node `v24.19.0`
+- Node：`C:\Users\a1055\.cache\codex-runtimes\codex-primary-runtime\dependencies\node\bin\node.exe`
+- Python：`C:\Users\a1055\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe`
+- 测试材料：只使用合成或脱敏 fixture；不读取真实财务目录。
 
-四个测试文件：
+## 历史基线
 
-- `disbursement-candidate-audit.test.mjs`
-- `disbursement-domain.test.mjs`
-- `disbursement-pdf-security.test.mjs`
-- `disbursement-production-e2e.test.mjs`
+S00 的四个原发放测试文件使用 bundled Node 运行：38 pass，0 fail，0 skip。基线 tag 为 `baseline/s00-v0.5.0-codex.20260822170308`。
 
-Codex 本地 Node 镜像将 `node_modules` 放在 `bin/node_modules`，而来源加载器的 CJS 固定路径从 Node 父级读取。S00 未修改加载器，而是为测试建立并在结束后删除临时运行视图：Node 为 bundled `node.exe` 的硬链接，运行视图与 skill 根的 `node_modules` 均为指向 primary runtime 依赖根的临时 junction。
+## 当前集成树
 
-### 运行记录
+预发布生产代码 HEAD：`cda49e30bfbc88c5c14d170cfc75ee1d8e0c9ba7`。
 
-1. 直接运行本地 bundled Node：runner 只装载出 7 项，4 pass、3 个测试文件加载失败；错误为 `Bundled runtime dependency root is unavailable`，加载器寻找的父级 `node_modules` 不存在。
-2. 首个临时 Junction 指向 bundled Node 自身的 `bin/node_modules`：仍为 7 项、4 pass、3 个文件加载失败；该依赖集合没有 `jszip`。
-3. Junction 改指 Codex primary runtime 完整依赖根：真实 38 项运行到 37 pass、1 fail；唯一失败是加密 PDF fixture 按临时 Node 的相对位置找不到 bundled Python/pypdf。
-4. 使用测试已支持的固定变量 `XHS_BUNDLED_PYTHON` 指向 Codex primary runtime Python：同一 38 项全部通过。
+| 组 | 结果 | 说明 |
+| --- | --- | --- |
+| 全部 `disbursement-*.test.mjs` | 137 pass / 0 fail / 0 skip | v1、v2 contract、published、fresh/salary、PDF、安全链、恢复、E2E、等价输出 |
+| 其余普通报销与共享基础设施 | 386 pass / 0 fail / 2 skip | Gate、发布/恢复、workbook、模板、布局、并发与共享原语 |
+| 总计 | 523 pass / 0 fail / 2 skip | 当前全集成回归 |
 
-以上失败均为运行时定位/fixture 依赖证据，没有修改实现来规避。WindowsApps 内的原始 packaged `node.exe` 还曾因系统 ACL 无法直接启动；最终使用的本地 Codex runtime Node 与其版本一致。
+两个 skip：
 
-最终执行命令等价于：
+1. Windows 当前权限不支持 leaf symlink/reparse fixture；同类 ancestor/reparse 拒绝测试通过。
+2. candidate benchmark 默认关闭；本期明确不实施性能优化，也不生成新的性能结论。
 
-```powershell
-$env:XHS_BUNDLED_PYTHON = 'C:\Users\a1055\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe'
-& 'C:\Users\a1055\plugins\development\xiaohongshu-finance-disbursement-vnext\.tmp-s00-codex-node\bin\node.exe' --test --test-reporter=tap `
-  'C:\Users\a1055\plugins\development\xiaohongshu-finance-disbursement-vnext\plugins\xiaohongshu-reimbursement-workflow\skills\xiaohongshu-reimbursement-workflow\tests\disbursement-candidate-audit.test.mjs' `
-  'C:\Users\a1055\plugins\development\xiaohongshu-finance-disbursement-vnext\plugins\xiaohongshu-reimbursement-workflow\skills\xiaohongshu-reimbursement-workflow\tests\disbursement-domain.test.mjs' `
-  'C:\Users\a1055\plugins\development\xiaohongshu-finance-disbursement-vnext\plugins\xiaohongshu-reimbursement-workflow\skills\xiaohongshu-reimbursement-workflow\tests\disbursement-pdf-security.test.mjs' `
-  'C:\Users\a1055\plugins\development\xiaohongshu-finance-disbursement-vnext\plugins\xiaohongshu-reimbursement-workflow\skills\xiaohongshu-reimbursement-workflow\tests\disbursement-production-e2e.test.mjs'
-```
+## 需求覆盖
 
-临时 Node 与 bundled Node 的 SHA-256 均为 `b8983a7a4af031048d92632291bb53989aed5411d62e02f25b78daaddc2a10ea`。测试完成后，两个 junction、Node 硬链接及临时目录均已删除。
+| 契约/能力 | 主要测试 | 状态 |
+| --- | --- | --- |
+| manifest v2 exact schema、版本分派、fileId/路径绑定 | `disbursement-manifest-v2-contract.test.mjs` | pass |
+| published archive 无 manifest/receipt、可选 attestation、allowlist、多 profile、零图片、差额 review-bound | `disbursement-reimbursement-published-archive-v2.test.mjs` | pass |
+| fresh evidence、工资 workbook/image 无 certificate、可选 attestation、歧义 fail-closed | `disbursement-fresh-source-v2.test.mjs` | pass |
+| v1 严格兼容与弃用 warning、v1/v2 等价最终字节 | `disbursement-production-e2e.test.mjs` | pass |
+| 单次 `--archive`、旧 prepare/finalize/approvalText 拒绝 | `disbursement-production-e2e.test.mjs` | pass |
+| 双次来源读取、TOCTOU、candidate/stage 替换、原子发布、最终审计和恢复 | `disbursement-production-e2e.test.mjs` / `disbursement-pdf-security.test.mjs` / `publish-crash-recovery.test.mjs` | pass |
+| voucher 声明 kind 与真实 image/PDF 绑定 | `disbursement-pdf-security.test.mjs` | pass |
+| owner-first 与非法新 token 不留恢复目录 | `disbursement-production-e2e.test.mjs` | pass |
+| 普通报销 Gate 1/Gate 2 隔离 | 普通 Gate/runner/full-correspondence 回归与基线 diff | pass |
 
-## S01 manifest v2 结构契约
+## 静态与包验证
 
-- 测试文件：`tests/disbursement-manifest-v2-contract.test.mjs`
-- 同跑现有无外部包 domain 测试：`tests/disbursement-domain.test.mjs`
-- 命令：`node --test --test-reporter=tap <contract-test> <domain-test>`
-- 结果：37 pass，0 fail，0 skipped；其中 v2 contract 33 项、现有 domain 4 项。
-- 耗时：104.9305 ms。
-- 测试为纯合成 JSON/纯 domain；未读取真实财务目录，未创建生产 fixture。
+- 修改/新增生产 `.mjs`：`node --check`。
+- Skill：skill-creator `quick_validate.py`。
+- Plugin：plugin-creator `validate_plugin.py`。
+- source diff：`git diff --check`。
+- 发布 ZIP：SHA256 sidecar、严格顶层清单、全新目录解压后重复 Skill/Plugin/static 校验。
 
-覆盖：reimbursement-only（`published_archive` 和 `fresh_evidence`）、salary-only、mixed、unknown fields、kind/version 错配、v1/v2 混用、重复 ID、未知 fileId、同一路径文件身份冲突、非法 mode、三类可选 attestation 缺失通过、提供合法绑定通过、提供未知/错误 usage 绑定拒绝、task-internal sourceReview 完整绑定、非法日期和金额精度。
-
-## 后续矩阵
-
-| 契约/能力 | 单元 | 测试 | 状态 |
-| --- | --- | --- | --- |
-| manifest v2 结构 | S01 | `disbursement-manifest-v2-contract.test.mjs` | frozen/pass |
-| 报销来源/可选佐证 fresh 验证 | S02 | TBD | 待实现 |
-| 工资来源/可选 certificate fresh 验证 | S03 | TBD | 待实现 |
-| v2 业务闭合与入口分派 | S04 | TBD | 待实现 |
-| 兼容/迁移 | TBD | TBD | 未冻结 |
-| 失败恢复 | TBD | TBD | 未冻结 |
-
-不得把 TBD 行视为已实现能力。S01 的 pass 只证明纯结构契约，不证明文件内容、来源事实或业务闭合正确。
+S06 最终候选路径、SHA256、source commit 和解压复验结果记录在 `handoffs/S06.md`。不得把窄测试、未启用 benchmark 或“没有发现失败”当成整体性能优化完成证据。

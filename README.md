@@ -37,11 +37,12 @@
 | `0.5.0+codex.20260819174146` | 历史已验证基线 | 原版含私有回归样例，因此不公开原字节；GitHub 提供删除私有测试并泛化示例的 [`portable1` 脱敏便携包](https://github.com/a1055010315-sudo/xiaohongshu-reimbursement-workflow/releases/tag/v0.5.0-codex.20260819174146-portable1)，运行脚本保持一致，并附 SHA256。 |
 | `0.5.0+codex.20260820094210` | 历史模板预发布包 | 首次加入四个脱敏报销工作簿模板，并区分空白模板结构与成品动态合并/行高；该[预发布包](https://github.com/a1055010315-sudo/xiaohongshu-reimbursement-workflow/releases/tag/v0.5.0-codex.20260820094210)未经过用户业务验收。 |
 | `0.5.0+codex.20260821194339` | 历史已验证版本 | 保留普通报销 Gate 1/Gate 2，并加入隔离的单次无人工 Gate 发放归档；这是既有版本记录，不再标为本仓库“当前候选”。 |
-| `0.5.0+codex.20260822170308` | 当前开发基线 manifest | 本次 vNext 文档迁移沿用的既有 manifest 版本；本期不更新 version、不打包、不安装，也不把尚未生成的后续候选写入 README。 |
+| `0.5.0+codex.20260822170308` | 本次开发基线 manifest | vNext 从此版本建立只读基线，并单独保留安装缓存中的两处普通报销修正；它不是当前发布候选。 |
+| `0.5.0+codex.20260823144931` | 本地发布候选（未安装） | 只取消发放核销对原报销 manifest、publish receipt 和工资 certificate 的启动依赖；保留严格 v1、普通报销 Gate 1/Gate 2 和完整安全发布链。候选文件名为 `xiaohongshu-finance-0.5.0+codex.20260823144931.zip`，必须与同名 `.sha256` sidecar 一起核验；这不是已发布的远程 Release。 |
 
 `19174146.portable1` 是隐私脱敏的可迁移运行包，不宣称与含私有测试的本机原版逐字节相同。原版来源证明摘要为 `d070ae296d0606db8a03a5d50f08559eb3a42fccadec7aecbeca20b400ca16b5`，算法为按相对路径排序后，对每项 `relativePath + NUL + SHA256 + NUL + size` 形成清单再计算 SHA256。
 
-从对应 Release 或仓库 `dist/` 下载实际存在、明确命名的 marketplace ZIP 和 `.sha256`，不要使用 GitHub 自动生成的 “Source code” 压缩包，也不要从 README 推断一个尚未生成的新候选版本。先核对校验和，再解压到新的本地目录，并把该解压目录注册为 `xiaohongshu-finance` marketplace 根。不得使用 `personal` marketplace 或旧安装缓存代替所选成品包：
+从对应 Release 或仓库 `dist/` 取得实际存在、明确命名的 marketplace ZIP 和 `.sha256`，不要使用 GitHub 自动生成的 “Source code” 压缩包。先核对校验和，再解压到新的本地目录，并把该解压目录注册为 `xiaohongshu-finance` marketplace 根。不得使用 `personal` marketplace 或旧安装缓存代替所选成品包。本仓库当前 S06 只生成和验证本地候选，未执行下列安装命令：
 
 ### 安装
 
