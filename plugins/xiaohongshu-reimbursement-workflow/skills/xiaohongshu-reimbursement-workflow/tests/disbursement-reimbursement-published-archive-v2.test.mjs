@@ -108,26 +108,23 @@ function builderTransactions() {
   ];
 }
 
-async function createPresentationBuild(root, evidence) {
+async function createPresentationBuild(root, evidence, transactions = builderTransactions()) {
   const manifest = {
     version: 3,
     operation: { mode: "reimbursement-batch" },
     batch: { mainPeriod: PERIOD, summaryAnnotations: [] },
-    files: [{ id: "EVIDENCE", role: "material", path: evidence.path, sha256: evidence.sha256, kind: "image", disposition: "used", usage: "voucher" }],
-    transactions: builderTransactions().map(({ profileId, amount, ...item }) => item),
+    files: evidence ? [{ id: "EVIDENCE", role: "material", path: evidence.path, sha256: evidence.sha256, kind: "image", disposition: "used", usage: "voucher" }] : [],
+    transactions: transactions.map(({ profileId, amount, ...item }) => item),
   };
   const manifestFile = await writeJson(path.join(root, "builder-manifest.json"), manifest);
   const registry = await loadProfileRegistry();
   const factsPreimage = {
     affectedProfileIds: ["xiaohongshu"],
-    transactions: builderTransactions().map(({ evidence: _evidence, ...item }) => item),
+    transactions: transactions.map(({ evidence: _evidence, ...item }) => item),
     summaryAnnotations: [],
   };
   const sourceCoveragePreimage = {
-    transactionSourceRefs: [
-      { transactionId: "TX-CURRENT", sourceRefs: ["UNIT-CURRENT"] },
-      { transactionId: "TX-SUPPLEMENT", sourceRefs: ["UNIT-SUPPLEMENT"] },
-    ],
+    transactionSourceRefs: transactions.map((transaction) => ({ transactionId: transaction.id, sourceRefs: [...transaction.sourceRefs] })),
   };
   const certificateCore = {
     kind: "reimbursement-manifest-facts-v1",
@@ -151,12 +148,12 @@ async function createPresentationBuild(root, evidence) {
   });
 }
 
-async function createSnapshot(detailFile, outputPath) {
+async function createSnapshot(detailFile, outputPath, transactions = builderTransactions()) {
   const detailBytes = await fs.readFile(detailFile.path);
   const zip = await JSZip.loadAsync(detailBytes, { createFolders: false });
   const workbookXml = await zip.file("xl/workbook.xml").async("string");
   zip.file("xl/workbook.xml", workbookXml.replaceAll("本次报销明细", "Sheet1"));
-  const rows = builderTransactions().map((item, index) => {
+  const rows = transactions.map((item, index) => {
     const row = index + 1;
     return `<row r="${row}"><c r="A${row}"><v>${excelSerial(item.date)}</v></c><c r="B${row}" t="inlineStr"><is><t>${xml(item.project)}</t></is></c><c r="C${row}"><v>${item.sourceAmount}</v></c><c r="D${row}"><f>SUM(C${row}:C${row})</f><v>${item.sourceAmount}</v></c><c r="E${row}" t="inlineStr"><is><t>${xml(item.person)}</t></is></c><c r="F${row}" t="inlineStr"><is><t>${xml(item.classification)}</t></is></c></row>`;
   }).join("");
@@ -167,6 +164,57 @@ async function createSnapshot(detailFile, outputPath) {
 
 function sourceFile(id, binding, kind, usage = "published_reimbursement_artifact") {
   return { id, path: binding.path, sha256: binding.sha256, kind, usage: [usage] };
+}
+
+async function createFocusedPublisherFixture(transactions, { includeEvidence }) {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "codex-s05-published-shape-"));
+  const originalEvidence = includeEvidence
+    ? await writeBytes(path.join(root, "builder-evidence.png"), await makePng(70, 140, 210))
+    : null;
+  const presentationBuild = await createPresentationBuild(root, originalEvidence, transactions);
+  try {
+    const presentation = presentationBuild.artifacts[0];
+    const archiveRoot = path.join(root, "2031.4.10-2031.4.15_小红书报销");
+    await fs.mkdir(archiveRoot, { recursive: false });
+    const summary = await copyBound(presentation.summary, path.join(archiveRoot, path.basename(presentation.summary.path)));
+    const detail = await copyBound(presentation.detail, path.join(archiveRoot, path.basename(presentation.detail.path)));
+    const screenshot = await copyBound(presentation.screenshot, path.join(archiveRoot, path.basename(presentation.screenshot.path)));
+    const snapshot = await createSnapshot(detail, path.join(archiveRoot, "小红书支出总表_截至2031.4.15.xlsx"), transactions);
+    const evidence = [];
+    for (const item of presentation.evidenceArchive) {
+      evidence.push(await copyBound(item, path.join(archiveRoot, "报销截图", "小红书报销", item.finalName)));
+    }
+    const bindings = [
+      ["FOCUSED-SUMMARY", summary, "text"],
+      ["FOCUSED-DETAIL", detail, "workbook"],
+      ["FOCUSED-SCREENSHOT", screenshot, "workbook"],
+      ["FOCUSED-SNAPSHOT", snapshot, "workbook"],
+      ...evidence.map((item, index) => [`FOCUSED-EVIDENCE-${index + 1}`, item, "image"]),
+    ];
+    const sourceFiles = bindings.map(([id, binding, kind]) => sourceFile(id, binding, kind));
+    const inputFileIds = sourceFiles.map((file) => file.id);
+    return {
+      root,
+      presentation,
+      input: {
+        sourceFiles,
+        reimbursementSources: [{ id: "FOCUSED-SOURCE", profileId: "xiaohongshu", mode: "published_archive", inputFileIds }],
+        reimbursementReviews: [{
+          id: "FOCUSED-REVIEW",
+          sourceId: "FOCUSED-SOURCE",
+          mode: "published_archive",
+          reviewedFileIds: inputFileIds,
+          facts: {
+            batchId: "focused-batch",
+            reimbursementPeriod: { ...PERIOD },
+            transactions: transactions.map(({ id, date, person, reimbursementAmount }) => ({ id, date, person, reimbursementAmount })),
+          },
+        }],
+      },
+    };
+  } finally {
+    await fs.rm(presentationBuild.stagingRoot, { recursive: true, force: true });
+  }
 }
 
 async function createOriginalManifest(root, snapshot, evidence, overrides = {}) {
@@ -186,7 +234,7 @@ async function createOriginalManifest(root, snapshot, evidence, overrides = {}) 
     operation: { mode: "reimbursement-batch" },
     files: [
       { id: "BASELINE", role: "baseline", path: snapshot.path, sha256: snapshot.sha256 },
-      { id: "EVIDENCE", role: "material", path: evidence.path, sha256: evidence.sha256, kind: "image", disposition: "used", usage: "voucher" },
+      { id: "EVIDENCE", role: "material", path: evidence.path, sha256: overrides.materialSha256 ?? evidence.sha256, kind: "image", disposition: "used", usage: "voucher" },
     ],
     sourceScopes: [{ id: "SCOPE", fileId: "EVIDENCE", locator: "full-image", terminalConfirmed: true, expectedUnitCount: 2 }],
     sourceUnits: [
@@ -204,6 +252,7 @@ async function createOriginalManifest(root, snapshot, evidence, overrides = {}) 
     },
   };
   if (overrides.transactionPerson) manifest.transactions[0].person = overrides.transactionPerson;
+  if (overrides.unknownExpectedField) manifest.expected.unknownAttestationField = true;
   return writeJson(path.join(root, overrides.filename ?? "ordinary-manifest.json"), manifest);
 }
 
@@ -257,6 +306,9 @@ async function createFixture() {
   const attestationOnlyBaseline = await writeBytes(path.join(root, "attestation-only-baseline.xlsx"), Buffer.from("no-follow baseline bytes\n", "utf8"));
   const originalManifest = await createOriginalManifest(root, attestationOnlyBaseline, originalEvidence);
   const conflictingManifest = await createOriginalManifest(root, attestationOnlyBaseline, originalEvidence, { filename: "ordinary-manifest-conflict.json", transactionPerson: "冲突人员" });
+  const mappedManifest = await createOriginalManifest(root, attestationOnlyBaseline, evidence, { filename: "ordinary-manifest-mapped.json" });
+  const badMappedManifest = await createOriginalManifest(root, attestationOnlyBaseline, evidence, { filename: "ordinary-manifest-mapped-bad-sha.json", materialSha256: "0".repeat(64) });
+  const malformedManifest = await createOriginalManifest(root, attestationOnlyBaseline, originalEvidence, { filename: "ordinary-manifest-malformed.json", unknownExpectedField: true });
   const receiptBindings = { root: rootWorkbook, detail, screenshot, summary, supplement, evidence, snapshot };
   const receipt = await createReceipt(root, receiptBindings);
   const invalidReceipt = await createReceipt(root, receiptBindings, { filename: "ordinary-receipt-invalid.json", invalidDigest: true });
@@ -276,11 +328,16 @@ async function createFixture() {
     sourceFile("EXTRA-EVIDENCE", extraEvidence, "image"),
     sourceFile("ORIGINAL-MANIFEST", originalManifest, "json", "original_manifest_attestation"),
     sourceFile("CONFLICTING-MANIFEST", conflictingManifest, "json", "original_manifest_attestation"),
+    sourceFile("MAPPED-MANIFEST", mappedManifest, "json", "original_manifest_attestation"),
+    sourceFile("BAD-MAPPED-MANIFEST", badMappedManifest, "json", "original_manifest_attestation"),
+    sourceFile("MALFORMED-MANIFEST", malformedManifest, "json", "original_manifest_attestation"),
     sourceFile("RECEIPT", receipt, "json", "publish_receipt_attestation"),
     sourceFile("INVALID-RECEIPT", invalidReceipt, "json", "publish_receipt_attestation"),
     sourceFile("CONFLICTING-RECEIPT", conflictingReceipt, "json", "publish_receipt_attestation"),
     sourceFile("REUSED-ROLE-RECEIPT", reusedRoleReceipt, "json", "publish_receipt_attestation"),
   ];
+  await fs.rm(attestationOnlyBaseline.path);
+  await fs.rm(originalEvidence.path);
   return {
     root,
     filesById: new Map(files.map((file) => [file.id, file])),
@@ -347,18 +404,102 @@ test("published archive without original manifest or receipt reconstructs stable
   assert.equal(first.sources[0].reviewBoundFacts.some((item) => item.field === "batchId" && item.corroboration === "none"), true);
 });
 
+test("real publisher zero-evidence shape has no drawing, media, anchors, or evidence archive and remains valid", async () => {
+  const transactions = [{
+    id: "TX-NO-EVIDENCE",
+    profileId: "xiaohongshu",
+    sourceOrder: 1,
+    date: "2031-04-10",
+    person: "无图人员",
+    project: "无图合成事项",
+    label: "无图人员",
+    category: "小红书报销",
+    classification: "运营开支",
+    settlement: "employee_reimbursement",
+    sourceAmount: "10",
+    reimbursementAmount: "10",
+    amount: "10",
+    reportingKind: "current",
+    evidence: [],
+    missingEvidenceConfirmed: true,
+    sourceRefs: ["UNIT-NO-EVIDENCE"],
+  }];
+  const focused = await createFocusedPublisherFixture(transactions, { includeEvidence: false });
+  try {
+    assert.equal(focused.presentation.screenshot.imageCount, 0);
+    assert.equal(focused.presentation.screenshot.uniqueMediaCount, 0);
+    assert.deepEqual(focused.presentation.evidenceArchive, []);
+    const result = await auditDisbursementReimbursementSourcesV2(focused.input);
+    assert.equal(result.sources[0].artifactBindings.some((item) => item.role === "evidence"), false);
+    assert.deepEqual(result.sources[0].transactionBindings[0].evidence, []);
+    assert.equal(result.sources[0].transactionBindings[0].artifactDerived.evidenceState, "no_evidence");
+  } finally {
+    await fs.rm(focused.root, { recursive: true, force: true });
+  }
+});
+
+test("source amount can differ from task-reviewed reimbursement allocation while person and global published totals close", async () => {
+  const transactions = [
+    {
+      id: "TX-ALLOC-1", profileId: "xiaohongshu", sourceOrder: 1, date: "2031-04-10", person: "同一人员", project: "分配事项甲",
+      label: "同一人员", category: "小红书报销", classification: "运营开支", settlement: "employee_reimbursement",
+      sourceAmount: "10", reimbursementAmount: "8", amount: "10", reportingKind: "current", evidence: ["EVIDENCE"], sourceRefs: ["UNIT-ALLOC-1"],
+    },
+    {
+      id: "TX-ALLOC-2", profileId: "xiaohongshu", sourceOrder: 2, date: "2031-04-10", person: "同一人员", project: "分配事项乙",
+      label: "同一人员", category: "小红书报销", classification: "运营开支", settlement: "employee_reimbursement",
+      sourceAmount: "6", reimbursementAmount: "4", amount: "6", reportingKind: "current", evidence: ["EVIDENCE"], sourceRefs: ["UNIT-ALLOC-2"],
+    },
+  ];
+  const focused = await createFocusedPublisherFixture(transactions, { includeEvidence: true });
+  try {
+    const result = await auditDisbursementReimbursementSourcesV2(focused.input);
+    assert.deepEqual(result.sources[0].transactions.map((item) => item.reimbursementAmount), ["8", "4"]);
+    assert.deepEqual(result.sources[0].transactionBindings.map((item) => ({
+      row: item.detail.row,
+      sourceAmount: item.artifactDerived.sourceAmount,
+      reimbursementAmount: item.artifactDerived.reimbursementAmount,
+      authority: item.artifactDerived.reimbursementAmountAuthority,
+    })), [
+      { row: 8, sourceAmount: "10", reimbursementAmount: "8", authority: "sourceReview" },
+      { row: 9, sourceAmount: "6", reimbursementAmount: "4", authority: "sourceReview" },
+    ]);
+    assert.equal(result.sources[0].reviewBoundFacts.some((item) => (
+      item.field === "transactions[].reimbursementAmount"
+      && item.allocationSemantics === "review_bound_not_file_parsed"
+    )), true);
+
+    const conflict = structuredClone(focused.input);
+    conflict.reimbursementReviews[0].facts.transactions[1].reimbursementAmount = "5";
+    await assert.rejects(
+      () => auditDisbursementReimbursementSourcesV2(conflict),
+      /detail workbook E4 reimbursement total is invalid/u,
+    );
+  } finally {
+    await fs.rm(focused.root, { recursive: true, force: true });
+  }
+});
+
 for (const [role, fileId] of [
   ["summary", "SUMMARY"],
   ["detail", "DETAIL"],
   ["screenshot", "SCREENSHOT"],
   ["snapshot", "SNAPSHOT"],
-  ["evidence", "EVIDENCE"],
 ]) {
   test(`missing ${role} role is rejected`, async () => {
     const inputFileIds = fixture.baseInputFileIds.filter((id) => id !== fileId);
-    await assert.rejects(() => auditDisbursementReimbursementSourcesV2(request({ inputFileIds })), new RegExp(`missing required ${role} role`, "u"));
+    const expected = role === "detail" ? /must declare exactly one profile-specific detail workbook/u : new RegExp(`missing required ${role} role`, "u");
+    await assert.rejects(() => auditDisbursementReimbursementSourcesV2(request({ inputFileIds })), expected);
   });
 }
+
+test("image-bearing archive cannot omit its evidence file", async () => {
+  const inputFileIds = fixture.baseInputFileIds.filter((id) => id !== "EVIDENCE");
+  await assert.rejects(
+    () => auditDisbursementReimbursementSourcesV2(request({ inputFileIds })),
+    /zero-evidence screenshot workbook must not bind a drawing part/u,
+  );
+});
 
 test("duplicate formal role is rejected", async () => {
   await assert.rejects(
@@ -391,7 +532,7 @@ for (const [field, mutate] of [
     mutate(transactions);
     await assert.rejects(
       () => auditDisbursementReimbursementSourcesV2(request({ reviewTransactions: transactions })),
-      /cannot close sourceReview transaction/u,
+      /cannot close sourceReview transaction|detail workbook E4 reimbursement total is invalid/u,
     );
   });
 }
@@ -399,7 +540,7 @@ for (const [field, mutate] of [
 test("sourceReview reimbursement period mismatch is rejected", async () => {
   await assert.rejects(
     () => auditDisbursementReimbursementSourcesV2(request({ period: { start: "2031-04-11", end: "2031-04-15" } })),
-    /unknown file role|detail workbook title/u,
+    /must declare exactly one profile-specific detail workbook|unknown file role|detail workbook title/u,
   );
 });
 
@@ -421,8 +562,36 @@ test("original manifest attestation is independently optional and validated no-f
   const result = await auditDisbursementReimbursementSourcesV2(request({ attestations: { originalManifestFileId: "ORIGINAL-MANIFEST" } }));
   assert.equal(result.sources[0].attestations.originalManifest.fileId, "ORIGINAL-MANIFEST");
   assert.equal(result.sources[0].attestations.originalManifest.referencedPathsFollowed, false);
+  assert.equal(result.sources[0].attestations.originalManifest.fileMapping.mappedManifestFileCount, 0);
+  assert.equal(result.sources[0].attestations.originalManifest.fileMapping.allDeclaredManifestPathsMapped, false);
+  assert.equal(result.sources[0].attestations.originalManifest.fileMapping.unregisteredManifestPathsRead, false);
   assert.equal(result.sources[0].attestations.receipt, undefined);
   assert.equal(result.sources[0].reviewBoundFacts[0].corroboration, "original_manifest_attestation");
+});
+
+test("original manifest maps path, SHA, and kind only for an explicitly registered published artifact", async () => {
+  const result = await auditDisbursementReimbursementSourcesV2(request({ attestations: { originalManifestFileId: "MAPPED-MANIFEST" } }));
+  const mapping = result.sources[0].attestations.originalManifest.fileMapping;
+  assert.equal(mapping.scope, "explicit_published_source_files_only");
+  assert.equal(mapping.mappedManifestFileCount, 1);
+  assert.equal(mapping.completePathShaKindMappingCount, 1);
+  assert.deepEqual(mapping.explicitFileMappings[0].verifiedFields, ["path", "sha256", "kind"]);
+  assert.equal(mapping.explicitFileMappings[0].sourceFileId, "EVIDENCE");
+  assert.equal(mapping.allDeclaredManifestPathsMapped, false);
+});
+
+test("ordinary manifest auditor still rejects unknown attestation fields in no-follow mode", async () => {
+  await assert.rejects(
+    () => auditDisbursementReimbursementSourcesV2(request({ attestations: { originalManifestFileId: "MALFORMED-MANIFEST" } })),
+    /original manifest attestation audit failed|unknown field|unknownAttestationField/u,
+  );
+});
+
+test("original manifest explicit published-artifact mapping rejects a wrong declared SHA", async () => {
+  await assert.rejects(
+    () => auditDisbursementReimbursementSourcesV2(request({ attestations: { originalManifestFileId: "BAD-MAPPED-MANIFEST" } })),
+    /SHA conflicts with its explicit published source file/u,
+  );
 });
 
 test("real publisher receipt shape with post-digest cleanup is accepted and binds only explicit paths", async () => {

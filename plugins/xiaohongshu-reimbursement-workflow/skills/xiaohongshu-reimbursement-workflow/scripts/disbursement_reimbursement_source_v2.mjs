@@ -208,12 +208,8 @@ function assertNoBusinessCellsPast(sheet, maxColumn, role) {
   }
 }
 
-function transactionTuple(item) {
-  return JSON.stringify([item.date, item.person, item.reimbursementAmount]);
-}
-
-function artifactTuple(item) {
-  return JSON.stringify([item.date, item.person, item.reimbursementAmount]);
+function transactionIdentityTuple(item) {
+  return JSON.stringify([item.date, item.person]);
 }
 
 function completeTuple(item) {
@@ -293,7 +289,6 @@ function validateDetailWorkbook(binding, profile, period, reviewTransactions) {
         person,
         project: text(cellScalar(cells.get(`B${transactionRow}`)), `detail.B${transactionRow}`),
         sourceAmount,
-        reimbursementAmount: companyPaid ? "0" : sourceAmount,
         classification: text(cellScalar(resolvedCell(sheet, cells, transactionRow, 5)), `detail.E${transactionRow}`),
         settlement: companyPaid ? "company_paid_no_reimbursement" : "employee_reimbursement",
         evidenceState: attribute.endsWith("有截图") ? "has_evidence" : "no_evidence",
@@ -320,7 +315,7 @@ function validateDetailWorkbook(binding, profile, period, reviewTransactions) {
   if (derived.length !== reviewTransactions.length) fail("detail workbook transaction count differs from sourceReview facts.transactions.");
   const queues = new Map();
   for (const transaction of derived) {
-    const key = artifactTuple(transaction);
+    const key = transactionIdentityTuple(transaction);
     if (!queues.has(key)) queues.set(key, []);
     queues.get(key).push(transaction);
   }
@@ -331,10 +326,19 @@ function validateDetailWorkbook(binding, profile, period, reviewTransactions) {
       person: text(raw.person, `sourceReview.transactions[${index}].person`),
       reimbursementAmount: canonicalAmount(raw.reimbursementAmount, `sourceReview.transactions[${index}].reimbursementAmount`),
     };
-    const queue = queues.get(transactionTuple(normalized));
-    if (!queue?.length) fail(`detail workbook cannot close sourceReview transaction ${normalized.id} by date/person/reimbursementAmount.`);
+    const queue = queues.get(transactionIdentityTuple(normalized));
+    if (!queue?.length) fail(`detail workbook cannot close sourceReview transaction ${normalized.id} by date/person and deterministic detail-row identity.`);
     const artifact = queue.shift();
+    const sourceMilliunits = parseDisbursementAmount(artifact.sourceAmount, `${normalized.id}.sourceAmount`, { allowNegative: true });
+    const reimbursementMilliunits = parseDisbursementAmount(normalized.reimbursementAmount, `${normalized.id}.reimbursementAmount`, { allowNegative: true });
+    if (artifact.settlement === "company_paid_no_reimbursement" && reimbursementMilliunits !== 0n) {
+      fail(`sourceReview transaction ${normalized.id} must have zero reimbursement for a company-paid detail row.`);
+    }
+    if (artifact.settlement === "employee_reimbursement" && (sourceMilliunits < 0n) !== (reimbursementMilliunits < 0n)) {
+      fail(`sourceReview transaction ${normalized.id} reimbursement sign differs from its detail source amount.`);
+    }
     artifact.transactionId = normalized.id;
+    artifact.reimbursementAmount = normalized.reimbursementAmount;
     return { normalized, artifact };
   });
   if ([...queues.values()].some((queue) => queue.length > 0)) fail("detail workbook contains transactions absent from sourceReview facts.transactions.");
@@ -382,7 +386,6 @@ function parseSupplementWorkbook(binding, detail, profile) {
       person,
       project: text(cellScalar(cells.get(`B${row}`)), `supplement.B${row}`),
       sourceAmount,
-      reimbursementAmount: attribute.startsWith("对公已付不实报") ? "0" : sourceAmount,
       classification: text(cellScalar(resolvedCell(sheet, cells, row, 5)), `supplement.E${row}`),
       settlement: attribute.startsWith("对公已付不实报") ? "company_paid_no_reimbursement" : "employee_reimbursement",
       supplementRow: row,
@@ -396,7 +399,6 @@ function parseSupplementWorkbook(binding, detail, profile) {
   requireMerge(sheet, `C${footerRow}:F${footerRow}`, `supplement workbook row ${footerRow}`);
   requireFormula(cells.get(`C${footerRow}`), `SUM(C5:C${footerRow - 1})`, `supplement workbook C${footerRow}`);
   const sourceTotal = sumAmounts(rows, (item) => item.sourceAmount);
-  const reimbursementTotal = sumAmounts(rows, (item) => item.reimbursementAmount);
   if (parseDisbursementAmount(cellScalar(cells.get(`C${footerRow}`)), `supplement.C${footerRow}`, { allowNegative: true }) !== sourceTotal) fail("supplement workbook footer total is invalid.");
   const start = [...rows].sort((left, right) => left.date.localeCompare(right.date))[0].date;
   const end = [...rows].sort((left, right) => left.date.localeCompare(right.date)).at(-1).date;
@@ -406,8 +408,6 @@ function parseSupplementWorkbook(binding, detail, profile) {
     ? `${safeSegment(person)}_${displayCompactDate(start)}_小红书补报明细.xlsx`
     : `${safeSegment(person)}_${displayCompactDate(start)}-${displayCompactDate(end)}_小红书补报明细.xlsx`;
   if (path.basename(binding.path) !== expectedFilename) fail("supplement workbook filename differs from its generated person/period binding.");
-  const expectedSummary = `补报实报合计：${amountString(reimbursementTotal)}元｜费用合计：${amountString(sourceTotal)}元｜共${rows.length}笔`;
-  if (cellScalar(cells.get("A3")) !== expectedSummary) fail("supplement workbook A3 totals are invalid.");
   const detailQueues = new Map();
   for (const transaction of detail.derived) {
     const key = completeTuple(transaction);
@@ -420,10 +420,14 @@ function parseSupplementWorkbook(binding, detail, profile) {
     if (candidates.length === 0) fail(`supplement workbook row ${supplement.supplementRow} is absent from the detail workbook.`);
     const selected = candidates[0];
     if (selected.person !== person) fail("supplement workbook person differs from its detail transaction.");
+    supplement.reimbursementAmount = selected.reimbursementAmount;
     selected.supplementBinding = { fileId: binding.fileId, sheetName: sheet.name, row: supplement.supplementRow };
     selected.reportingKind = "supplement";
     matches.push(selected);
   }
+  const reimbursementTotal = sumAmounts(rows, (item) => item.reimbursementAmount);
+  const expectedSummary = `补报实报合计：${amountString(reimbursementTotal)}元｜费用合计：${amountString(sourceTotal)}元｜共${rows.length}笔`;
+  if (cellScalar(cells.get("A3")) !== expectedSummary) fail("supplement workbook A3 totals are invalid.");
   return { person, start, end, count: rows.length, sourceTotal, reimbursementTotal, reasons, sheetName: sheet.name, matches };
 }
 
@@ -503,11 +507,17 @@ function parseDrawingAnchors(xmlBytes, partName) {
   return anchors;
 }
 
-async function loadScreenshotDrawing(binding, sheet) {
+async function loadScreenshotDrawing(binding, sheet, { evidenceExpected }) {
   const worksheetIdentity = binding.facts.workbook.sheets.find((item) => item.name === sheet.name);
   const drawingRelationships = binding.facts.package.relationships.filter((item) => (
     item.sourcePartName === worksheetIdentity.partName && /\/drawing$/u.test(item.type) && item.targetMode === "Internal"
   ));
+  const packageMedia = binding.facts.package.nonStructuralPartNames.filter((name) => /^xl\/media\/[^/]+$/u.test(name)).sort();
+  if (!evidenceExpected) {
+    if (drawingRelationships.length !== 0) fail("zero-evidence screenshot workbook must not bind a drawing part.");
+    if (packageMedia.length !== 0) fail("zero-evidence screenshot workbook must not contain media parts.");
+    return { anchors: [], media: new Map() };
+  }
   if (drawingRelationships.length !== 1) fail("screenshot workbook must bind exactly one internal drawing part.");
   const drawingPart = drawingRelationships[0].resolvedPartName;
   const imageRelationships = binding.facts.package.relationships.filter((item) => (
@@ -536,7 +546,6 @@ async function loadScreenshotDrawing(binding, sheet) {
     anchor.sha256 = media.get(relationship.resolvedPartName).sha256;
   }
   for (const relationship of imageRelationships) if (!usedRelationshipIds.has(relationship.id)) fail(`screenshot drawing image relationship ${relationship.id} is unreferenced.`);
-  const packageMedia = binding.facts.package.nonStructuralPartNames.filter((name) => /^xl\/media\/[^/]+$/u.test(name)).sort();
   const boundMedia = [...new Set(imageRelationships.map((item) => item.resolvedPartName))].sort();
   if (canonicalDigest(packageMedia) !== canonicalDigest(boundMedia)) fail("screenshot workbook contains unbound or missing media parts.");
   return { anchors, media };
@@ -575,7 +584,10 @@ async function validateScreenshotWorkbook(binding, detail, profile, evidenceBind
     if (!queue?.length) fail(`screenshot workbook row ${row} does not close to one detail transaction.`);
     const transaction = queue.shift();
     const note = cellScalar(cells.get(`E${row}`));
-    if (note !== transaction.classification && note !== `${transaction.classification}｜无图片凭证`) fail(`screenshot workbook E${row} differs from detail classification.`);
+    const expectedNote = transaction.evidenceState === "has_evidence"
+      ? transaction.classification
+      : `${transaction.classification}｜无图片凭证`;
+    if (note !== expectedNote) fail(`screenshot workbook E${row} differs from its detail evidence state.`);
     transaction.screenshotRow = row;
     rowToTransaction.set(row, transaction);
   }
@@ -583,7 +595,7 @@ async function validateScreenshotWorkbook(binding, detail, profile, evidenceBind
   for (const row of sheet.rows) {
     if (row.index > detail.derived.length + 1 && row.cells.some((cell) => cell.value !== null || cell.formula !== null)) fail(`screenshot workbook contains extra business row ${row.index}.`);
   }
-  const drawing = await loadScreenshotDrawing(binding, sheet);
+  const drawing = await loadScreenshotDrawing(binding, sheet, { evidenceExpected: evidenceBindings.length > 0 });
   const transactionById = new Map(detail.derived.map((item) => [item.transactionId, item]));
   const names = new Set();
   for (const anchor of drawing.anchors) {
@@ -611,6 +623,12 @@ async function validateScreenshotWorkbook(binding, detail, profile, evidenceBind
       ...anchor,
       fileId: archivedBySha.get(anchor.sha256).fileId,
     }));
+    if (transaction.evidenceState === "has_evidence" && transaction.evidenceBindings.length === 0) {
+      fail(`detail transaction ${transaction.transactionId} claims screenshot evidence but has no drawing anchor.`);
+    }
+    if (transaction.evidenceState === "no_evidence" && transaction.evidenceBindings.length !== 0) {
+      fail(`detail transaction ${transaction.transactionId} claims no screenshot evidence but has drawing anchors.`);
+    }
   }
   return { sheet, drawing };
 }
@@ -739,7 +757,6 @@ function classifyArtifacts(loaded, source, profile, period) {
     if (result[role].length === 0) fail(`published archive is missing required ${role} role.`);
     if (result[role].length > 1) fail(`published archive contains duplicate ${role} roles.`);
   }
-  if (result.evidence.length === 0) fail("published archive is missing required evidence role.");
   if (result.root.length > 1) fail("published archive contains duplicate published root roles.");
   if (result.root.length && !source.attestations?.receiptFileId) fail("published root input is only allowed for an explicit receipt attestation.");
   const archiveRoot = path.dirname(result.detail[0].path);
@@ -788,7 +805,13 @@ async function loadBoundSourceFile(file, field) {
   return loaded;
 }
 
-async function auditOriginalManifestAttestation(binding, source, review, profile) {
+function manifestAttestationKindMatches(manifestKind, publishedKind) {
+  return (manifestKind === "image" && publishedKind === "image")
+    || (manifestKind === "text" && publishedKind === "text")
+    || (manifestKind === "attachment" && publishedKind === "workbook");
+}
+
+async function auditOriginalManifestAttestation(binding, source, review, profile, explicitArchiveByPath) {
   object(binding.json, "original manifest attestation");
   let stdout;
   let stderr;
@@ -811,8 +834,14 @@ async function auditOriginalManifestAttestation(binding, source, review, profile
   const lines = stdout.split(/\r?\n/u).filter(Boolean);
   if (lines.length !== 1) fail("original manifest attestation auditor must return one JSON line.");
   const audit = parseStrictJson(lines[0]);
-  if (audit.ok !== true || audit.fileVerificationMode !== "bound-builders" || audit.manifestFileSha256 !== binding.sha256) {
-    fail("original manifest attestation audit binding is incomplete or changed.");
+  if (
+    audit.ok !== true
+    || audit.fileVerificationMode !== "bound-builders"
+    || audit.declaredPathVerification?.mode !== "no-follow"
+    || audit.declaredPathVerification?.followed !== false
+    || audit.manifestFileSha256 !== binding.sha256
+  ) {
+    fail("original manifest attestation audit binding or no-follow mode is incomplete or changed.");
   }
   if (!audit.affectedProfileIds.includes(source.profileId)) fail("original manifest attestation does not include the reimbursement profile.");
   if (audit.batch?.batchId !== review.facts.batchId) fail("original manifest attestation batchId differs from sourceReview.");
@@ -825,13 +854,46 @@ async function auditOriginalManifestAttestation(binding, source, review, profile
     .map((item) => ({ id: item.id, date: item.date, person: item.person, reimbursementAmount: canonicalAmount(item.reimbursementAmount, `${item.id}.reimbursementAmount`) }))
     .sort((left, right) => left.id.localeCompare(right.id));
   if (canonicalDigest(transactions) !== canonicalDigest(expected)) fail("original manifest attestation transactions conflict with reconstructed/sourceReview facts.");
+
+  const explicitFileMappings = [];
+  for (const raw of binding.json.files) {
+    const filePath = path.resolve(raw.path);
+    const published = explicitArchiveByPath.get(pathKey(filePath));
+    if (!published) continue;
+    if (published.sha256 !== raw.sha256.toLowerCase()) fail(`original manifest attestation file ${raw.id} SHA conflicts with its explicit published source file.`);
+    const declaredKind = raw.role === "material" ? raw.kind : null;
+    if (declaredKind && !manifestAttestationKindMatches(declaredKind, published.kind)) {
+      fail(`original manifest attestation file ${raw.id} kind conflicts with its explicit published source file.`);
+    }
+    explicitFileMappings.push({
+      manifestFileId: raw.id,
+      sourceFileId: published.fileId,
+      path: published.path,
+      sha256: published.sha256,
+      publishedKind: published.kind,
+      declaredManifestKind: declaredKind,
+      verifiedFields: declaredKind ? ["path", "sha256", "kind"] : ["path", "sha256"],
+    });
+  }
+  const completeMappings = explicitFileMappings.filter((item) => item.verifiedFields.includes("kind"));
   return {
     fileId: binding.fileId,
     sha256: binding.sha256,
     manifestDigest: audit.manifestDigest,
     affectedProfileIds: [...audit.affectedProfileIds],
-    mode: "v3-structure-and-archive-facts-no-follow",
+    mode: "v3-full-structure-and-business-facts-no-follow",
     referencedPathsFollowed: false,
+    fileMapping: {
+      scope: "explicit_published_source_files_only",
+      explicitFileMappings,
+      mappedManifestFileCount: explicitFileMappings.length,
+      completePathShaKindMappingCount: completeMappings.length,
+      declaredManifestFileCount: audit.files,
+      explicitPublishedArtifactCount: explicitArchiveByPath.size,
+      allExplicitPublishedArtifactsCompletelyMapped: completeMappings.length === explicitArchiveByPath.size,
+      allDeclaredManifestPathsMapped: explicitFileMappings.length === audit.files,
+      unregisteredManifestPathsRead: false,
+    },
   };
 }
 
@@ -911,7 +973,7 @@ function auditReceiptAttestation(binding, source, review, roles, loadedByPath, m
   return { fileId: binding.fileId, sha256: binding.sha256, receiptDigest: digest, artifactBindings: resolved };
 }
 
-function validateArchiveDirectoryName(roles, profile, period, supplements, detail) {
+function validateArchiveDirectoryName(roles, profile, period, supplements, detail, { sharedArchiveRoot }) {
   const supplementedIds = new Set(supplements.flatMap((item) => item.parsed.matches.map((transaction) => transaction.transactionId)));
   const grouped = new Map();
   for (const transaction of detail.derived) {
@@ -928,7 +990,7 @@ function validateArchiveDirectoryName(roles, profile, period, supplements, detai
     return `${person}${periodText}补报${ordered.length}笔${total}元`;
   }).join("、")}）`;
   const expected = `${displayPeriod(period)}_${profile.targetCategory}${suffix}`;
-  if (path.basename(roles.archiveRoot) !== expected) fail(`published archive directory name must be ${expected}.`);
+  if (!sharedArchiveRoot && path.basename(roles.archiveRoot) !== expected) fail(`published archive directory name must be ${expected}.`);
   return suffix;
 }
 
@@ -944,6 +1006,8 @@ function transactionBindings(detail, roles, profile) {
       project: artifact.project,
       classification: artifact.classification,
       sourceAmount: artifact.sourceAmount,
+      reimbursementAmount: normalized.reimbursementAmount,
+      reimbursementAmountAuthority: "sourceReview",
       settlement: artifact.settlement,
       reportingKind: artifact.reportingKind,
       evidenceState: artifact.evidenceState,
@@ -951,7 +1015,23 @@ function transactionBindings(detail, roles, profile) {
   }));
 }
 
-async function auditPublishedArchiveSource(source, review, fileById, registry) {
+function identifyExplicitArchiveRoot(source, review, fileById, registry) {
+  const profile = registry.profiles[source.profileId];
+  if (!profile) fail(`${source.id} has unknown profile ${source.profileId}.`);
+  const period = {
+    start: normalizeDisbursementIsoDate(review.facts.reimbursementPeriod.start, `${review.id}.reimbursementPeriod.start`),
+    end: normalizeDisbursementIsoDate(review.facts.reimbursementPeriod.end, `${review.id}.reimbursementPeriod.end`),
+  };
+  const detailPattern = new RegExp(`^${escapeRegExp(displayPeriod(period))}_${escapeRegExp(profile.targetCategory)}_本次报销明细(?:（含.+）)?\\.xlsx$`, "u");
+  const candidates = source.inputFileIds
+    .map((fileId) => fileById.get(fileId))
+    .filter((file) => file?.kind === "workbook" && detailPattern.test(path.basename(file.path ?? "")))
+    .map((file) => path.dirname(path.resolve(file.path)));
+  if (candidates.length !== 1) fail(`${source.id} must declare exactly one profile-specific detail workbook to identify its explicit archive root.`);
+  return candidates[0];
+}
+
+async function auditPublishedArchiveSource(source, review, fileById, registry, archiveLayout) {
   if (source.mode !== "published_archive" || review.mode !== "published_archive") fail(`${source.id} is not a published_archive source.`);
   const profile = registry.profiles[source.profileId];
   if (!profile) fail(`${source.id} has unknown profile ${source.profileId}.`);
@@ -976,15 +1056,31 @@ async function auditPublishedArchiveSource(source, review, fileById, registry) {
   const loadedByPath = new Map(loaded.map((item) => [pathKey(item.path), item]));
   if (loadedByPath.size !== loaded.length) fail(`${source.id} explicit source paths are duplicated.`);
   const roles = classifyArtifacts(loaded, source, profile, period);
+  if (!samePath(roles.archiveRoot, archiveLayout.root)) fail(`${source.id} classified archive root differs from its explicit detail workbook root.`);
   const detail = validateDetailWorkbook(roles.detail[0], profile, period, review.facts.transactions);
   const supplements = validateSupplements(roles.supplement, detail, profile, period);
-  const supplementSuffix = validateArchiveDirectoryName(roles, profile, period, supplements, detail);
+  const supplementSuffix = validateArchiveDirectoryName(roles, profile, period, supplements, detail, { sharedArchiveRoot: archiveLayout.shared });
   await validateScreenshotWorkbook(roles.screenshot[0], detail, profile, roles.evidence);
   validateSummary(roles.summary[0], detail, supplements, profile, period);
   validateSnapshot(roles.snapshot[0], detail, profile, period);
+  const explicitArchiveByPath = new Map([
+    roles.summary[0],
+    roles.detail[0],
+    roles.screenshot[0],
+    roles.snapshot[0],
+    ...roles.supplement,
+    ...roles.evidence,
+    ...roles.root,
+  ].map((binding) => [pathKey(binding.path), binding]));
   let originalManifest = null;
   if (source.attestations?.originalManifestFileId) {
-    originalManifest = await auditOriginalManifestAttestation(loadedById.get(source.attestations.originalManifestFileId), source, review, profile);
+    originalManifest = await auditOriginalManifestAttestation(
+      loadedById.get(source.attestations.originalManifestFileId),
+      source,
+      review,
+      profile,
+      explicitArchiveByPath,
+    );
   }
   let receipt = null;
   if (source.attestations?.receiptFileId) {
@@ -1013,6 +1109,10 @@ async function auditPublishedArchiveSource(source, review, fileById, registry) {
     reviewId: review.id,
     batchId: review.facts.batchId,
     reimbursementPeriod: period,
+    archiveRoot: roles.archiveRoot,
+    archiveRootLayout: archiveLayout.shared
+      ? { mode: "shared_multi_profile", profileIds: [...archiveLayout.profileIds] }
+      : { mode: "single_profile", profileIds: [source.profileId] },
     supplementSuffix,
     transactions,
     transactionBindings: transactionBindings(detail, roles, profile),
@@ -1025,7 +1125,8 @@ async function auditPublishedArchiveSource(source, review, fileById, registry) {
     },
     reviewBoundFacts: [
       { field: "batchId", authority: "sourceReview", corroboration: originalManifest ? "original_manifest_attestation" : receipt ? "publish_receipt_attestation" : "none" },
-      { field: "transactions[].id", authority: "sourceReview", corroboration: "screenshot_anchor_when_present_otherwise_date_person_amount_tuple" },
+      { field: "transactions[].id", authority: "sourceReview", corroboration: "screenshot_anchor_when_present_otherwise_date_person_detail_row_order" },
+      { field: "transactions[].reimbursementAmount", authority: "sourceReview", corroboration: "published_summary_person_and_global_totals_only", allocationSemantics: "review_bound_not_file_parsed" },
       { field: "summary.annotations", authority: "sourceReview", corroboration: "amount_line_only" },
       { field: "companyPaid.summaryLabelGrouping", authority: "sourceReview", corroboration: "file_total_only" },
       { field: "supplement.reasons", authority: "published_archive_file_only", corroboration: "not_present_in_sourceReview_v2" },
@@ -1056,11 +1157,30 @@ export async function auditDisbursementReimbursementSourcesV2(rawInput) {
   }
   if (reimbursementSources.length === 0) fail("reimbursementSources must contain at least one published_archive source.");
   const registry = await loadProfileRegistry();
+  const sourceIds = new Set();
+  const rootClaimBySourceId = new Map();
+  const profileIdsByRoot = new Map();
+  for (const source of reimbursementSources) {
+    if (sourceIds.has(source.id)) fail(`reimbursement source ${source.id} is duplicated.`);
+    sourceIds.add(source.id);
+    const review = reviewBySource.get(source.id);
+    if (!review) fail(`sourceReview for ${source.id} is missing.`);
+    const root = identifyExplicitArchiveRoot(source, review, fileById, registry);
+    rootClaimBySourceId.set(source.id, root);
+    const key = pathKey(root);
+    if (!profileIdsByRoot.has(key)) profileIdsByRoot.set(key, new Set());
+    profileIdsByRoot.get(key).add(source.profileId);
+  }
   const sources = [];
   for (const source of reimbursementSources) {
     const review = reviewBySource.get(source.id);
-    if (!review) fail(`sourceReview for ${source.id} is missing.`);
-    sources.push(await auditPublishedArchiveSource(source, review, fileById, registry));
+    const root = rootClaimBySourceId.get(source.id);
+    const profileIds = profileIdsByRoot.get(pathKey(root));
+    sources.push(await auditPublishedArchiveSource(source, review, fileById, registry, {
+      root,
+      shared: profileIds.size > 1,
+      profileIds: registry.profileOrder.filter((profileId) => profileIds.has(profileId)),
+    }));
   }
   if (reviewBySource.size !== sources.length) fail("reimbursementReviews contains a review without a reimbursement source.");
   const body = {

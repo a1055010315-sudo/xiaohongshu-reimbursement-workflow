@@ -227,7 +227,7 @@ S01 只验证字段、整数类型和金额字符串格式；状态组合、逐�
 
 ## 10. 后续接口
 
-S02 接口：接收已通过 `validateDisbursementManifestV2` 的 `sourceFiles + reimbursementSources + sourceReview.reimbursement`；按 mode fresh 读取全部 `reviewedFileIds`，重建 transactions，验证每个已提供 attestation，并返回独立核对结果给 S04。
+S02 接口：接收已通过 `validateDisbursementManifestV2` 的 `sourceFiles + reimbursementSources + sourceReview.reimbursement`；按 mode fresh 读取全部 `reviewedFileIds`，从正式归档重建可独立证明的日期/人员/detail-row/来源额身份，并把 task-internal review 的逐笔实报额与 summary 的逐人及全局实报合计严格闭合。正式归档无法独立证明的逐笔实报分配必须标为 review-bound，不能声称 file-parsed。验证每个已提供 attestation，并返回核对结果给 S04；original manifest 的 no-follow 校验不得读取未注册历史路径，完整路径映射声明只覆盖与本 source 显式发布材料相交的 path/SHA/kind。
 
 S03 接口：接收已通过结构验证的 `sourceFiles + salaryArtifacts + sourceReview.salary`；fresh 解析 workbook/image，重建 payments 与 gross total，验证每个已提供 certificate，并返回独立核对结果给 S04。
 

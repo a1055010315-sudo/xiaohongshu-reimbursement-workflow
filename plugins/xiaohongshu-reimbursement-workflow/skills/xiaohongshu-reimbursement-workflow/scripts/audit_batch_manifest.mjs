@@ -657,13 +657,12 @@ export async function auditBatchManifestFile(manifestPath, { deferOrdinaryFileVe
   }
 
   const verifiedFiles = await mapWithConcurrency(normalizedFiles, 4, async (file) => {
+    if (deferOrdinaryFileVerification) return { ...file, size: null };
     const stat = await fsp.stat(file.path);
     if (!stat.isFile()) throw new Error(`Manifest file is not a regular file: ${file.id}`);
-    if (!deferOrdinaryFileVerification) {
-      const actualSha256 = await sha256File(file.path);
-      if (actualSha256 !== file.sha256) {
-        throw new Error(`SHA256 mismatch for ${file.id}: expected ${file.sha256}, actual ${actualSha256}`);
-      }
+    const actualSha256 = await sha256File(file.path);
+    if (actualSha256 !== file.sha256) {
+      throw new Error(`SHA256 mismatch for ${file.id}: expected ${file.sha256}, actual ${actualSha256}`);
     }
     return { ...file, size: stat.size };
   });
@@ -1204,6 +1203,9 @@ export async function auditBatchManifestFile(manifestPath, { deferOrdinaryFileVe
     operation: operationForDigest,
     files: verifiedFiles.length,
     fileVerificationMode: deferOrdinaryFileVerification ? "bound-builders" : "manifest-auditor",
+    declaredPathVerification: deferOrdinaryFileVerification
+      ? { mode: "no-follow", followed: false, sizeAndContentVerified: false }
+      : { mode: "manifest-auditor", followed: true, sizeAndContentVerified: true },
     transactions: normalizedTransactions.length,
   };
   if (manifest.version >= 2) {

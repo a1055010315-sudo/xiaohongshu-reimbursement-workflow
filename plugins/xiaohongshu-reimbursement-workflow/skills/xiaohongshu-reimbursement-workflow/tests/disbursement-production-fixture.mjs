@@ -100,7 +100,7 @@ async function createPublishedSnapshot(detail, outputPath, profile, transactions
   return writeBound(outputPath, bytes);
 }
 
-async function createPublishedV2Sources({ root, originalManifestFile, profileIds, transactions, material, reimbursementPeriod }) {
+async function createPublishedV2Sources({ originalManifestFile, archiveRoot, profileIds, transactions, material, reimbursementPeriod }) {
   const registry = await loadProfileRegistry();
   const profileIdByName = Object.fromEntries(profileIds.map((profileId) => [DISBURSEMENT_PROFILE_NAMES[profileId], profileId]));
   const builderTransactions = transactions.map((transaction) => ({
@@ -138,13 +138,11 @@ async function createPublishedV2Sources({ root, originalManifestFile, profileIds
   });
   try {
     const results = [];
+    await fs.mkdir(archiveRoot, { recursive: true });
     for (const profileId of profileIds) {
       const profile = registry.profiles[profileId];
       const presentation = presentationBuild.artifacts.find((artifact) => artifact.profileId === profileId);
       if (!presentation) throw new Error(`published v2 fixture lacks presentation for ${profileId}`);
-      const archiveName = `${compactDate(reimbursementPeriod.start)}-${compactDate(reimbursementPeriod.end)}_${profile.targetCategory}`;
-      const archiveRoot = path.join(root, `published-v2-${profileId}`, archiveName);
-      await fs.mkdir(archiveRoot, { recursive: true });
       const summary = await copyBound(presentation.summary, path.join(archiveRoot, path.basename(presentation.summary.path)));
       const detail = await copyBound(presentation.detail, path.join(archiveRoot, path.basename(presentation.detail.path)));
       const screenshot = await copyBound(presentation.screenshot, path.join(archiveRoot, path.basename(presentation.screenshot.path)));
@@ -266,13 +264,16 @@ export async function createCompactDisbursementProductionFixture({
       }
       transactions.push(transaction);
     }
+    const ordinaryArchiveName = profileIds.length === 1
+      ? `${compactDate(reimbursementPeriod.start)}-${compactDate(reimbursementPeriod.end)}_${DISBURSEMENT_PROFILE_NAMES[profileIds[0]]}`
+      : "ordinary-archive";
     originalManifest = {
       version: 3,
       rulesVersion: "compact-disbursement-production-fixture-v1",
       batch: {
         batchId: "synthetic-ordinary-source",
         rootPath: root,
-        archivePath: path.join(root, "ordinary-archive"),
+        archivePath: path.join(root, ordinaryArchiveName),
         period: "2031.4.10-2031.4.15",
         mainPeriod: reimbursementPeriod,
         targetCategory: DISBURSEMENT_PROFILE_NAMES[profileIds[0]],
@@ -308,7 +309,14 @@ export async function createCompactDisbursementProductionFixture({
     receiptFile = await writeJson(path.join(root, "ordinary-publish-receipt.json"), receipt);
   }
   const publishedV2Sources = manifestVersion === 2 && reimbursementMode === "published_archive" && profileIds.length
-    ? await createPublishedV2Sources({ root, originalManifestFile, profileIds, transactions, material, reimbursementPeriod })
+    ? await createPublishedV2Sources({
+        originalManifestFile,
+        archiveRoot: originalManifest.batch.archivePath,
+        profileIds,
+        transactions,
+        material,
+        reimbursementPeriod,
+      })
     : [];
 
   const salaryArtifacts = [];

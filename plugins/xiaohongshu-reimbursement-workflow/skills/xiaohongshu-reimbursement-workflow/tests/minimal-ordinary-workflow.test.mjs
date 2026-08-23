@@ -147,7 +147,7 @@ async function previewRenderer({ request, requestFileSha256 }) {
   return { kind: "ordinary-reimbursement-preview-response-v2", requestNonce: request.requestNonce, requestFileSha256, bindingDigest: request.bindingDigest, enginePeakWorkingSetBytes: 1_000_000, previews };
 }
 
-test("reused manifest audit session rereads changed bytes and recovers after an ordered validation failure", async () => {
+test("reused manifest audit session rereads manifest bytes, never follows deferred paths, and recovers after validation failure", async () => {
   const temp = await fs.mkdtemp(path.join(os.tmpdir(), "codex-xhs-manifest-session-"));
   try {
     const baseline = await makeBaseline(path.join(temp, "小红书支出总表.xlsx"));
@@ -165,6 +165,7 @@ test("reused manifest audit session rereads changed bytes and recovers after an 
     const first = await auditManifestInSession(manifestPath, firstBinding.sha256);
     assert.equal(first.manifestFileSha256, firstBinding.sha256);
     assert.equal(first.fileVerificationMode, "bound-builders");
+    assert.deepEqual(first.declaredPathVerification, { mode: "no-follow", followed: false, sizeAndContentVerified: false });
 
     const revised = structuredClone(base);
     revised.batch.reviewRevision = 2;
@@ -177,11 +178,9 @@ test("reused manifest audit session rereads changed bytes and recovers after an 
     invalidFiles.files[1].path = path.join(temp, "missing-first-context.jpg");
     invalidFiles.files[2].path = path.join(temp, "missing-second-voucher.jpg");
     const invalidFileBinding = await writeManifest(invalidFiles);
-    await assert.rejects(
-      auditManifestInSession(manifestPath, invalidFileBinding.sha256),
-      /missing-first-context\.jpg/u,
-      "parallel file checks must settle before returning the first manifest input-order error",
-    );
+    const noFollow = await auditManifestInSession(manifestPath, invalidFileBinding.sha256);
+    assert.equal(noFollow.manifestFileSha256, invalidFileBinding.sha256);
+    assert.deepEqual(noFollow.declaredPathVerification, { mode: "no-follow", followed: false, sizeAndContentVerified: false });
 
     const invalid = structuredClone(revised);
     invalid.transactions[0].sourceOrder = 0;
@@ -233,6 +232,7 @@ test("minimal ordinary workflow uses manifest v3, local ledger patch, batch prev
     assert.equal(audited.fileVerificationMode, "manifest-auditor");
     const deferredAudit = await auditManifest(manifestPath, ["--defer-ordinary-file-verification"]);
     assert.equal(deferredAudit.fileVerificationMode, "bound-builders");
+    assert.deepEqual(deferredAudit.declaredPathVerification, { mode: "no-follow", followed: false, sizeAndContentVerified: false });
     assert.deepEqual(audited.batch.mainPeriod, { start: "2031-04-10", end: "2031-04-15" });
     assert.equal(audited.normalizedTransactions[1].reportingKind, "supplement");
     assert.equal(audited.reimbursementFactsCertificate.factsPreimage.expectedTotals.uniqueMediaCount, 2);

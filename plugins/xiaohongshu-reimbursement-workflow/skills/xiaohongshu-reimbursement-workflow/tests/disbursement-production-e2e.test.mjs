@@ -131,18 +131,24 @@ test("strict manifest v2 completes reimbursement-only, salary-only, and mixed ar
   }
 });
 
-test("published_archive manifest v2 completes a full archive without original manifest or publish receipt", async () => {
+test("published_archive manifest v2 accepts the real publisher multi-profile shared archive root without attestations", async () => {
   await withProductionSandbox({
     manifestVersion: 2,
     reimbursementMode: "published_archive",
-    profileIds: ["xiaohongshu"],
+    profileIds: ["xiaohongshu", "company"],
     reimbursementTransactionCount: 8,
     includeSalary: false,
     requestedUniqueVoucherCount: 3,
   }, async ({ fixture }) => {
     const receipt = await archiveCompactDisbursementWorkflow(requestFor(fixture));
     await assertStrictFinalArchive(fixture, receipt);
-    assert.equal(fixture.manifest.reimbursementSources[0].attestations, undefined);
+    assert.equal(fixture.manifest.reimbursementSources.every((source) => source.attestations === undefined), true);
+    const detailParents = fixture.manifest.reimbursementSources.map((source) => {
+      const detailId = source.inputFileIds.find((fileId) => fileId.endsWith("-detail"));
+      return path.dirname(fixture.manifest.sourceFiles.find((file) => file.id === detailId).path);
+    });
+    assert.equal(new Set(detailParents).size, 1);
+    assert.equal(path.basename(detailParents[0]), "ordinary-archive");
     assert.equal(receipt.cleanup.removed, true);
   });
 });
