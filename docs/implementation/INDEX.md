@@ -1,6 +1,6 @@
 # 发放 vNext 实施索引
 
-状态：S00 安全开发基线已建立；“取消发放核销内部 JSON 启动门槛”尚未实施。
+状态：S00 安全开发基线已建立；S01 已冻结 manifest v2 纯结构契约，来源解析与入口接入尚未实施。
 
 ## 固定基线
 
@@ -23,7 +23,7 @@
 | 单元 | 状态 | 说明 |
 | --- | --- | --- |
 | S00 | complete | 纯来源导入、两处 cache 修正、基线证据、测试和交接 |
-| S01 | pending | 所有者和范围未冻结 |
+| S01 | complete | v2 exact schema、kind/version 分派、纯结构 validator、合成契约测试与 S02/S03 接口已冻结 |
 | S02 | pending | 所有者和范围未冻结 |
 | S03 | pending | 所有者和范围未冻结 |
 | S04 | pending | 所有者和范围未冻结 |
@@ -34,12 +34,13 @@
 
 - S00 未修改 manifest、runner、archive 或其他业务逻辑。
 - S00 未更新版本/cachebuster，未打包、未安装、未实施提速。
-- manifest v2 尚未冻结；不得把占位文档当作可实现契约。
+- manifest v2 结构已由 S01 冻结；结构通过不代表来源文件、sourceReview 事实或业务闭合已验证。
+- S01 未修改现有 v1 auditor/runner/archive；后续必须严格按 kind/version 分派。
 - 真实财务目录 `C:\Users\a1055\Desktop\luna\04_财务台账` 在 S00 中零读取、零枚举、零搜索。
 
 ## 文档入口
 
-- `contracts/manifest-v2.md`：未冻结的契约状态页。
+- `contracts/manifest-v2.md`：S01 冻结的 v2 schema、结构验证、兼容规则及 S02/S03/S04 接口。
 - `contracts/ownership.md`：所有权与并行修改边界。
 - `contracts/test-matrix.md`：现有基线测试证据。
 - `handoffs/MASTER.md`：单元接续总表。
