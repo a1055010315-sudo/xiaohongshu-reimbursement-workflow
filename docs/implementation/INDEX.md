@@ -1,6 +1,6 @@
 # 发放 vNext 实施索引
 
-状态：S00-S05 已完成 manifest v2 契约、来源审计、入口集成、回归修正和文档迁移；S06 正在生成并验证不安装的发布候选。
+状态：S00-S06 全部完成；manifest v2、来源审计、单次 archive 集成、回归、文档和不安装的发布候选均已闭环。
 
 ## 固定基线
 
@@ -18,6 +18,8 @@
 - S05 文档集成基线：`904ed27dcd03ee90523866f71dbaa7dbf001461d`
 - S06 预发布代码基线：`cda49e30bfbc88c5c14d170cfc75ee1d8e0c9ba7`
 - S06 候选版本：`0.5.0+codex.20260823144931`
+- S06 候选 source commit/tree：`9e9b52142020433af7092c6788562720d766bda6` / `d3f2f186fe9d6620ec634493f197bf5f4fe7c804`
+- S06 候选 SHA256：`94f6de78b2404087ca724b0f3df9ba5b1848558e0972e28adc02b1f86af578e9`
 
 树 SHA-256 的计算口径为：按 ordinal 升序排列相对路径，将每项编码为 `path NUL byteLength NUL fileSha256 LF`，再对 UTF-8 字节流计算 SHA-256；不含 Git 元数据。
 
@@ -31,7 +33,7 @@
 | S03 | complete | fresh reimbursement 与 salary 来源审计；certificate 可选，review-bound 语义诚实保留 |
 | S04 | complete | v2 auditor/runner 集成；v1 弃用 warning 与原单次安全发布链保留 |
 | S05 | complete | Skill、reference、UI 元数据、README 和迁移交接同步到业务材料直入与 v2 默认 |
-| S06 | in_progress | 主对话独占集成分支；cachebuster、ZIP/SHA256、全新目录复验与未安装核对进行中 |
+| S06 | complete | ZIP/SHA256、全量回归、全新目录复验、外部未变核对和 GPT-5.6-sol/xhigh 独立 GO 均完成；未安装 |
 
 ## 当前边界
 

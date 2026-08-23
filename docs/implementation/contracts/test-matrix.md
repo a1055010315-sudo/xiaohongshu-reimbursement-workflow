@@ -1,6 +1,6 @@
 # 测试矩阵
 
-状态：S00-S05 实现与回归已完成；S06 在同一生产代码树上执行发布候选复验。
+状态：S00-S06 已完成；全量回归、静态检查和解压候选复验均绑定固定 source commit。
 
 ## 运行时
 
@@ -14,13 +14,19 @@ S00 的四个原发放测试文件使用 bundled Node 运行：38 pass，0 fail�
 
 ## 当前集成树
 
-预发布生产代码 HEAD：`cda49e30bfbc88c5c14d170cfc75ee1d8e0c9ba7`。
+候选 source commit：`9e9b52142020433af7092c6788562720d766bda6`；生产代码基线为 `cda49e3`。
 
 | 组 | 结果 | 说明 |
 | --- | --- | --- |
 | 全部 `disbursement-*.test.mjs` | 137 pass / 0 fail / 0 skip | v1、v2 contract、published、fresh/salary、PDF、安全链、恢复、E2E、等价输出 |
 | 其余普通报销与共享基础设施 | 386 pass / 0 fail / 2 skip | Gate、发布/恢复、workbook、模板、布局、并发与共享原语 |
 | 总计 | 523 pass / 0 fail / 2 skip | 当前全集成回归 |
+
+实际运行使用 `node --test --test-concurrency=1 --test-reporter=spec` 分两组串行：
+
+- 发放组 7 个文件：duration `41646.746 ms`。
+- 其余组 20 个文件：duration `367841.7422 ms`。
+- Node `v24.19.0`；Python `3.12.13`；`XHS_BUNDLED_PYTHON` 固定到 bundled Python。
 
 两个 skip：
 
@@ -49,4 +55,4 @@ S00 的四个原发放测试文件使用 bundled Node 运行：38 pass，0 fail�
 - source diff：`git diff --check`。
 - 发布 ZIP：SHA256 sidecar、严格顶层清单、全新目录解压后重复 Skill/Plugin/static 校验。
 
-S06 最终候选路径、SHA256、source commit 和解压复验结果记录在 `handoffs/S06.md`。不得把窄测试、未启用 benchmark 或“没有发现失败”当成整体性能优化完成证据。
+S06 解压候选另运行 v2 contract 与模板定向测试：36 pass、0 fail、0 skip；Skill、Plugin、37 个生产脚本静态检查通过。最终候选路径、SHA256、source commit、外部未变和独立 GO 记录在 `handoffs/S06.md`。不得把窄测试、未启用 benchmark 或“没有发现失败”当成整体性能优化完成证据。

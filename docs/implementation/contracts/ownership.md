@@ -1,6 +1,6 @@
 # 实施所有权
 
-状态：S00-S05 已完成并集成；S06 由主对话独占集成分支写入。
+状态：S00-S06 已完成并集成；S06 候选固定后仅追加 docs-only 完成记录。
 
 ## 规则
 
@@ -21,9 +21,9 @@
 | S04 | integration / `s04-integration` | complete | v1/v2 dispatcher、统一 audit、runner/fixture/E2E |
 | S05 | docs / `s05-docs` | complete | Skill、reference、README、prompt、迁移文档 |
 | S05 fixes | isolated review fixes | complete | voucher/owner-first 与真实 published archive 修正 |
-| S06 | master / `vnext/integration` | in_progress | cachebuster、发布记录、`dist` 候选和验证证据 |
+| S06 | master / `vnext/integration` | complete | cachebuster、发布记录、`dist` 候选、验证证据和独立 GO |
 
-S02/S03 从 `493c702` 并行，S04 集成提交 `e06898b`，主分支集成至 `cda49e3`。S06 期间只有主对话可以修改 `vnext/integration`；`s06_release_preflight` 仅做 GPT-5.6-sol/xhigh 只读审查。
+S02/S03 从 `493c702` 并行，S04 集成提交 `e06898b`，代码审查修正集成至 `cda49e3`。S06 候选 source commit 为 `9e9b521`；S06 期间只有主对话修改 `vnext/integration`，`s06_release_preflight` 仅做 GPT-5.6-sol/xhigh 只读审查并给出最终 `GO`。
 
 ## 普通报销边界
 

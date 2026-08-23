@@ -4,7 +4,7 @@
 
 当前主分支：`vnext/integration`
 
-S06 预发布基线：`cda49e30bfbc88c5c14d170cfc75ee1d8e0c9ba7`
+S06 候选 source commit：`9e9b52142020433af7092c6788562720d766bda6`
 
 当前候选版本：`0.5.0+codex.20260823144931`
 
@@ -24,7 +24,7 @@ S06 预发布基线：`cda49e30bfbc88c5c14d170cfc75ee1d8e0c9ba7`
 | S03 | complete | `S03.md` | `83f5389` |
 | S04 | complete | `S04.md` | `e06898b`，集成于 `904ed27` |
 | S05 | complete | `S05.md` | `680400a`，集成及审查修正至 `cda49e3` |
-| S06 | in_progress | `S06.md` | cachebuster、候选构建与独立复验进行中 |
+| S06 | complete | `S06.md` | `9e9b521`；ZIP/SHA256、全量回归、解压复验和独立 GO 已闭环 |
 
 ## 当前验证证据
 
@@ -47,11 +47,12 @@ S06 预发布基线：`cda49e30bfbc88c5c14d170cfc75ee1d8e0c9ba7`
 
 第二次上下文压缩时必须将 `thread_compression_count=2` 和状态改为 `needs-successor`，停止新增设计，只记录 HEAD、dirty files、测试、候选 SHA256 和下一动作后换新主对话。继任名称增加 `R1/R2`，`rollover_generation+1`，压缩计数归零。
 
-## S06 剩余动作
+## S06 完成证据
 
-1. 提交唯一 cachebuster 和发布记录，确保 `git diff --check` 通过。
-2. 复跑静态、Skill、Plugin 和当前树回归验证。
-3. 构建只含 `.agents`、`plugins`、`AGENTS.md`、`README.md` 的 marketplace ZIP 与 SHA256 sidecar。
-4. 解压到全新临时目录，复验 ZIP SHA、版本、validators、文件清单、链接/临时/恢复目录及真实数据泄漏。
-5. 只读核对 marketplace、安装缓存和 `config.toml` 未变化；不安装、不刷新。
-6. 接收 GPT-5.6-sol/xhigh 独立发布预审，逐项 completion audit 后再结束 Goal。
+- 候选：`dist/xiaohongshu-finance-0.5.0+codex.20260823144931.zip`。
+- SHA256：`94f6de78b2404087ca724b0f3df9ba5b1848558e0972e28adc02b1f86af578e9`。
+- 96 个文件与固定 source commit blob 逐一一致；顶层 allowlist、路径、link/reparse、模板和泄漏检查通过。
+- 固定 source commit 上 523 pass、0 fail、2 skip；Skill、Plugin、37 个生产脚本和解压定向测试通过。
+- marketplace/cache/config 起止指纹一致，外部仍为旧版 `0.5.0+codex.20260822170308`，候选未安装。
+- GPT-5.6-sol/xhigh 独立 reviewer 最终结论：`GO`。
+- 详细命令、duration、外部指纹、共享 no-follow 安全例外和清理记录见 `S06.md`。
