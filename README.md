@@ -38,11 +38,12 @@
 | `0.5.0+codex.20260820094210` | 历史模板预发布包 | 首次加入四个脱敏报销工作簿模板，并区分空白模板结构与成品动态合并/行高；该[预发布包](https://github.com/a1055010315-sudo/xiaohongshu-reimbursement-workflow/releases/tag/v0.5.0-codex.20260820094210)未经过用户业务验收。 |
 | `0.5.0+codex.20260821194339` | 历史已验证版本 | 保留普通报销 Gate 1/Gate 2，并加入隔离的单次无人工 Gate 发放归档；这是既有版本记录，不再标为本仓库“当前候选”。 |
 | `0.5.0+codex.20260822170308` | 本次开发基线 manifest | vNext 从此版本建立只读基线，并单独保留安装缓存中的两处普通报销修正；它不是当前发布候选。 |
-| `0.5.0+codex.20260823144931` | 本地发布候选（未安装） | 只取消发放核销对原报销 manifest、publish receipt 和工资 certificate 的启动依赖；保留严格 v1、普通报销 Gate 1/Gate 2 和完整安全发布链。候选文件名为 `xiaohongshu-finance-0.5.0+codex.20260823144931.zip`，必须与同名 `.sha256` sidecar 一起核验；这不是已发布的远程 Release。 |
+| `0.5.0+codex.20260823144931` | 已验证归档修复候选 | 首次发布“取消发放核销内部 sidecar 启动依赖”的候选；保留严格 v1、普通报销 Gate 1/Gate 2 和完整安全发布链，现由下方稳定版本取代。 |
+| `0.5.0+codex.20260823161923` | 当前稳定版本 | 在不夹带整体性能优化的前提下，正式提升上述归档修复候选；普通报销沿用已验证业务实现，发放归档不再要求原报销 manifest、publish receipt 或工资 certificate。成品文件名为 `xiaohongshu-finance-0.5.0+codex.20260823161923.zip`，必须与同名 `.sha256` sidecar 一起核验。 |
 
 `19174146.portable1` 是隐私脱敏的可迁移运行包，不宣称与含私有测试的本机原版逐字节相同。原版来源证明摘要为 `d070ae296d0606db8a03a5d50f08559eb3a42fccadec7aecbeca20b400ca16b5`，算法为按相对路径排序后，对每项 `relativePath + NUL + SHA256 + NUL + size` 形成清单再计算 SHA256。
 
-从对应 Release 或仓库 `dist/` 取得实际存在、明确命名的 marketplace ZIP 和 `.sha256`，不要使用 GitHub 自动生成的 “Source code” 压缩包。先核对校验和，再解压到新的本地目录，并把该解压目录注册为 `xiaohongshu-finance` marketplace 根。不得使用 `personal` marketplace 或旧安装缓存代替所选成品包。本仓库当前 S06 只生成和验证本地候选，未执行下列安装命令：
+从对应 Release 或仓库 `dist/` 取得实际存在、明确命名的 marketplace ZIP 和 `.sha256`，不要使用 GitHub 自动生成的 “Source code” 压缩包。先核对校验和，再解压到新的本地目录，并把该解压目录注册为 `xiaohongshu-finance` marketplace 根。不得使用 `personal` marketplace 或旧安装缓存代替所选成品包。当前稳定版本已经按下列流程完成本地安装验证：
 
 ### 安装
 
