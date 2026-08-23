@@ -3,23 +3,38 @@
 ## 独立模式
 
 - 只有用户明确要求“生成/更新发放归档”时，才进入本模式并运行 `scripts/run_compact_disbursement_workflow.mjs`。
-- 本模式只把已经发布的报销事实、工资最终件、发放凭证和人工处置结论汇成下游核销归档；不执行付款，不重算工资，不修改报销工件或总表。
+- 本模式只把已发布报销成品或 fresh 证据复核出的报销事实、工资最终件、发放凭证和人工处置结论汇成下游核销归档；不执行付款，不重算工资，不修改报销工件或总表。
 - 普通报销始终走 `scripts/run_reimbursement_workflow.mjs`，不得导入发放模块、扫描工资目录、读取发放凭证或生成本模式状态。普通报销的输入、门禁、发布和清理均不因本模式改变。
 
-## 来源与 manifest
+## 业务材料与任务内部 manifest
 
-发放 manifest 固定为 `disbursement-archive-manifest-v1`，顶层只含 `kind`、`version`、`batch`、`reimbursementSources`、`salaryArtifacts`、`vouchers`、`rows`、`expected`。
+用户从明确业务材料开始，不负责制作 manifest、复核 JSON 或 sidecar。可用材料是：
 
-每个报销来源必须同时绑定 `profileId`、原报销 manifest 的绝对路径/SHA256，以及已保存 publish receipt 的绝对路径/SHA256。运行时必须：
+- `published_archive`：用户指出的已发布报销成品，包括该来源实际需要的明细、截图对应表、文字说明、总表快照、条件性补报表和归档凭证；原报销 manifest 与 publish receipt 不是必需启动材料。
+- `fresh_evidence`：用户指出的本次报销原始证据；可以没有原报销 manifest 或 publish receipt attestation。
+- 工资：已定稿的工作簿或图片；可以没有 `salary-final-artifact-v1` certificate。
+- 发放：用户指出的转账、现金或留存证据，以及明确的逐行人工处置决定。
 
-1. 用普通报销审计器重新审计原 manifest，并核对其文件 SHA256、批次和 profile；
-2. 重读 publish receipt，核对 `ordinary-reimbursement-published-v1`、receipt digest、批次、受影响 profile 和唯一对应 output；
-3. 按 receipt 逐件重读已发布的 root、detail、screenshot、summary、snapshot、补报表和原始凭证归档，重算 SHA256；
-4. 三方全部一致后，在运行内部生成 `published-reimbursement-facts-v1` facts certificate，绑定来源 manifest、receipt、全部已发布工件和该 profile 的交易事实。该证书不是外部输入，也不进入最终目录。
+当前任务先把实际要读取的文件收敛为明确清单，fresh 读取并进行语义复核，再在任务内部生成并内嵌 `disbursement-source-review-v2`，随后生成默认的 `disbursement-archive-manifest-v2`、计算 SHA256，并构造严格四字段 archive request。不要让用户手写这些内部 JSON，也不要要求用户扫描目录寻找原 manifest、receipt、certificate 或其他 sidecar；审计器不得枚举父目录、追随未注册路径或用隐式文件扩大发放输入。
 
-工资只能来自已定稿的工作簿或图片。每个 `salaryArtifacts[]` 必须绑定最终件路径/SHA256、月份、工资类别、只读 `storeReference`，以及独立的 `salary-final-artifact-v1` 证书路径/SHA256。证书自身 digest、字段、最终件类型/SHA256和 `grossPayTotal` 必须闭合；对应工资行合计必须等于该证书总额。一个发放批次的在批工资只能有一个月份，工资最终件和证书只引用，不复制进归档。
+v2 manifest 的详细 exact schema 见 [Manifest v2 冻结契约](../../../../../docs/implementation/contracts/manifest-v2.md)。所有来源都在 `sourceFiles` 中以显式路径、SHA256、类型和 usage 注册；报销、工资与凭证结构只引用 file ID。`sourceReview.reviewedFileIds` 必须完整且仅覆盖对应来源输入和已提供的可选佐证。每笔报销交易必须在 `rows[].reimbursementRefs` 中恰好出现一次；每个工资最终件、每份凭证都必须被行引用。`expected` 必须精确闭合行数、在批应发/实发/已核销、唯一凭证数、凭证引用数、尾差合计和工资槽位数。金额使用最多三位小数的定点十进制字符串。
 
-每笔报销 certificate 交易必须在 `rows[].reimbursementRefs` 中恰好出现一次，人员和金额必须与证书一致；每个工资最终件、每份凭证都必须被行引用。`expected` 必须精确闭合行数、在批应发/实发/已核销、唯一凭证数、凭证引用数、尾差合计和工资槽位数。金额使用最多三位小数的定点十进制字符串。
+## Review-bound 信任边界
+
+`sourceReview` 是当前任务根据上述明确文件进行 fresh 语义复核后生成的结构化事实，`producer` 固定为 `task_internal` 并直接内嵌于 manifest。它不是用户提供的独立证明，也不是运行器从文件机械推出全部业务语义的声明。
+
+- `published_archive` 会从正式报销工件机械重建并闭合可证明的日期、人员、金额、表格结构和媒体绑定；无法单凭成品字节推出的批次身份或交易映射继续明确标为 review-bound。
+- fresh 报销图片和工资图片只承诺严格类型、大小、完整像素 decode、SHA 与文件身份验证，语义依据为 `review_bound_no_ocr`；不得宣称插件执行 OCR 并机械识别金额。
+- 没有冻结工资业务 schema 的工作簿只承诺安全、完整的 OOXML 结构解析，语义依据为 `review_bound_no_frozen_salary_schema`；不得宣称插件从单元格布局机械重建 payments 或总额。
+- 当前任务可以基于明确文件形成 review-bound 事实，但遇到人员、金额、期间、工资类别、行归属、处置或凭证对应歧义时必须询问用户并等待明确答案，不能猜测、平均分配或用文件名补足业务语义。
+
+review-bound 不放宽文件绑定或业务闭合：运行器仍 fresh 读取全部注册文件，核对 source review、rows、expected、候选和发布输入，并把语义依据写入审计结果。
+
+## 可选佐证与 v1 迁移
+
+- `published_archive` 可以同时没有原报销 manifest 和 publish receipt；`fresh_evidence` 可以没有这两类 attestation；工资可以没有 certificate。
+- 任一可选 attestation 一旦提供，就必须显式注册并进入该来源的 `reviewedFileIds`，fresh 核 SHA、exact schema、内部 digest、文件绑定和与 `sourceReview` 事实的一致性。损坏、缺字段、错误、复用或冲突一律阻塞；不能因为它可选就忽略。
+- manifest v2 是新任务默认格式。现有 `disbursement-archive-manifest-v1` 仅严格兼容一个发布周期：继续按原 exact schema 和原安全链运行，并返回 `DISBURSEMENT_MANIFEST_V1_DEPRECATED` warning。warning 只用于迁移提示，不增加人工 Gate、确认口令或分步状态；兼容期后不再把 v1 写入新任务。
 
 ## 十五种稳定命名
 
@@ -58,13 +73,13 @@
 
 ## 单次显式归档
 
-发放归档没有人工门禁，也不要求用户发送确认口令。用户明确要求生成或更新发放归档后，只调用一次：
+发放归档没有人工门禁，也不要求用户发送确认口令。用户明确要求生成或更新发放归档后，当前任务先完成明确材料的复核和内部 v2 manifest/request 生成，再只调用一次：
 
 ```text
 node scripts/run_compact_disbursement_workflow.mjs --archive <request.json>
 ```
 
-请求 kind 固定为 `compact-disbursement-archive-v1`，字段严格只有 `kind`、64 位小写十六进制 `stagingToken`、`manifestPath` 和 `manifestSha256`。不得加入审批文本、状态路径、门禁摘要或其他分步发布字段。
+这个 request 是当前任务的内部运行输入，不是让用户手动准备的业务材料。其 kind 固定为 `compact-disbursement-archive-v1`，字段严格只有 `kind`、64 位小写十六进制 `stagingToken`、`manifestPath` 和 `manifestSha256`。不得加入审批文本、状态路径、门禁摘要或其他分步发布字段。
 
 一次调用必须完整执行：owner/目录身份绑定 → fresh 来源全审计 → 候选生成或安全恢复 → 候选逐行/逐凭证完整审计 → 再次 fresh 来源与候选完整复核 → 发布输入指纹前后 TOCTOU 核对 → task-owned stage 复制与独立审计 → 在 stage 审计完成后再次复核完整发布输入身份 → 原子改名 → 最终三项完整复核 → allowlist 清理并返回 receipt。最后一次发布输入复核必须覆盖全部 `boundSourcePaths` 和候选三项，不能只复核 stage；任一来源、事实、目录身份、候选或 stage 变化都立即停止，不发布部分结果。
 
@@ -84,6 +99,7 @@ manifest、内部审计/journal、owner、receipt、facts certificate、工资�
 
 ## O/D 性能评估
 
+- 本期只迁移发放入口、信任边界和兼容说明，没有实施或宣称整体性能优化，也没有生成新的性能结论。
 - O 线固定比较“未修改目标版普通报销”与“加入/优化发放功能后的普通报销”，必须保持普通报销语义输出完全等价；D 线固定比较“首个完整安全、无人工门禁、单次 archive 的发放实现”与“同一冻结输出契约下的优化实现”。旧分步发放实现不得继续充当 D 基线。两线都必须锁定双方版本、skill tree SHA256 和 package tree SHA256。
 - 20% 是默认信息性改善目标，不是验收硬门。冷/热各至少 11 组配对样本、每侧至少 2 次不计时预热；保存原始样本，并报告 p50、p95、MAD、配对 bootstrap 95% 置信区间和改善目标是否达到。O/D 两线通过仍要求 p95 不退化、输出完全等价且冷、热峰值内存增幅均不超过 15%；普通 O 线还必须保持预览 PNG 唯一性。子进程 manifest auditor 和 Excel/COM 渲染进程的内存必须计入端到端边界或单独报告；不得把未计入的子进程资源当作整体 RSS 已达标。
 - 外部人员或模型产生独立观察的等待时间可单列排除；插件控制的来源/媒体 fresh-read 与完整 decode、候选生成、全部独立审计、原子发布、最终三项复核和清理必须纳入 D 线单次 archive 计时。未达到改善目标时如实报告，不得据此继续叠加低收益复杂度；不得改动只读基线、关闭样式检查、减少逐项覆盖、跳过独立复核或信任前一轮语义结果提速。

@@ -1,6 +1,6 @@
 # 三类报销与发放归档工作流
 
-这是面向 Codex 的 skills-only 插件。它用一条 profile 驱动的普通报销流程处理小红书、公司和驻所报销，并提供一条与普通报销隔离的发放归档流程；历史纠错/零增量重排仍走独立路径。
+这是面向 Codex 的 skills-only 插件。它用一条 profile 驱动的普通报销流程处理小红书、公司和驻所报销，并提供一条与普通报销隔离的发放归档流程；发放归档可直接从用户明确指出的报销成品或 fresh 证据、工资最终件、发放凭证和处置决定开始。历史纠错/零增量重排仍走独立路径。
 
 普通流程只为本批实际有交易的 profile 生成和发布成品；无交易 profile 不创建空文件，也不修改根表。`住所` 可作为驻所输入别名，但正式文件和 Sheet 始终使用 canonical `驻所` 身份。
 
@@ -20,25 +20,28 @@
 
 发放归档没有人工 Gate，也不复用普通报销的 Gate 1/Gate 2 状态。唯一 CLI 是 `scripts/run_compact_disbursement_workflow.mjs --archive <request.json>`，唯一 API 是 `archiveCompactDisbursementWorkflow`。请求严格只允许四个字段：`kind`、`stagingToken`、`manifestPath`、`manifestSha256`；其中 `kind` 固定为 `compact-disbursement-archive-v1`。
 
-一次调用依次完成来源 fresh 复核、候选生成、内部校验和原子归档。最终批次目录严格只有：
+用户不需要准备原报销 manifest、publish receipt、工资 certificate、`sourceReview` 或其他内部 JSON。当前任务根据明确文件 fresh 复核业务语义，在内部生成并内嵌 `sourceReview`、默认 v2 manifest 和四字段 request，再用一次调用完成来源审计、候选生成、内部校验和原子归档。最终批次目录严格只有：
 
 - `发放情况说明.txt`；
 - `发放核对表.xlsx`；
 - `发放凭证/`。
 
-最终目录由 manifest 中的 `batch.archiveParentPath` 与批次名派生。报销来源只通过 `reimbursementSources[].originalManifestPath` 和 `publishReceiptPath` 绑定；发放流程不移动、不覆盖原报销材料，也不扫描工资目录或改动三份报销根表，普通报销入口则不得导入发放模块。
+最终目录由 manifest 中的 `batch.archiveParentPath` 与批次名派生。v2 的 `published_archive` 可以没有原报销 manifest 和 publish receipt，`fresh_evidence` 可以没有 attestation，工资可以没有 certificate；任何可选佐证一旦提供，就必须 fresh 验证，错误、损坏或与来源事实冲突都会阻塞。发放流程只读取当前任务显式注册的文件，不移动、不覆盖原报销材料，不扫描工资目录或 sidecar，也不改动三份报销根表；普通报销入口不得导入发放模块。
 
-## 版本状态与下载
+图片和没有冻结工资业务 schema 的工作簿属于 review-bound。插件会严格验证文件身份、SHA、媒体完整性或 OOXML 结构，但不宣称通过 OCR 或固定单元格布局机械识别金额；当前任务必须基于明确文件完成语义复核，遇到业务歧义先询问，不能猜测。
+
+## 已有版本记录与下载
 
 | 版本 | 状态 | 说明 |
 |---|---|---|
-| `0.5.0+codex.20260819174146` | 用户已确认本机原版可用 | 作为当前性能对比基线。原版含私有回归样例，因此不公开原字节；GitHub 提供删除私有测试并泛化示例的 [`portable1` 脱敏便携包](https://github.com/a1055010315-sudo/xiaohongshu-reimbursement-workflow/releases/tag/v0.5.0-codex.20260819174146-portable1)，运行脚本保持一致，并附 SHA256。 |
-| `0.5.0+codex.20260820094210` | **尚未经过用户业务验收** | 首次加入四个脱敏报销工作簿模板，并区分空白模板结构与成品动态合并/行高。仅作为[模板版预发布包](https://github.com/a1055010315-sudo/xiaohongshu-reimbursement-workflow/releases/tag/v0.5.0-codex.20260820094210)保留，不应取代已验证基线。 |
-| `0.5.0+codex.20260821194339` | 当前已验证版本 | 普通报销保留可恢复 Gate 1/Gate 2、严格图片验证和 Gate 2 全量对应复核；新增隔离的单次无人工 Gate 发放归档。全量回归、独立前向测试、打包及安装态复核均已通过；20% 仅是信息性改善目标，不再是验收硬门。 |
+| `0.5.0+codex.20260819174146` | 历史已验证基线 | 原版含私有回归样例，因此不公开原字节；GitHub 提供删除私有测试并泛化示例的 [`portable1` 脱敏便携包](https://github.com/a1055010315-sudo/xiaohongshu-reimbursement-workflow/releases/tag/v0.5.0-codex.20260819174146-portable1)，运行脚本保持一致，并附 SHA256。 |
+| `0.5.0+codex.20260820094210` | 历史模板预发布包 | 首次加入四个脱敏报销工作簿模板，并区分空白模板结构与成品动态合并/行高；该[预发布包](https://github.com/a1055010315-sudo/xiaohongshu-reimbursement-workflow/releases/tag/v0.5.0-codex.20260820094210)未经过用户业务验收。 |
+| `0.5.0+codex.20260821194339` | 历史已验证版本 | 保留普通报销 Gate 1/Gate 2，并加入隔离的单次无人工 Gate 发放归档；这是既有版本记录，不再标为本仓库“当前候选”。 |
+| `0.5.0+codex.20260822170308` | 当前开发基线 manifest | 本次 vNext 文档迁移沿用的既有 manifest 版本；本期不更新 version、不打包、不安装，也不把尚未生成的后续候选写入 README。 |
 
 `19174146.portable1` 是隐私脱敏的可迁移运行包，不宣称与含私有测试的本机原版逐字节相同。原版来源证明摘要为 `d070ae296d0606db8a03a5d50f08559eb3a42fccadec7aecbeca20b400ca16b5`，算法为按相对路径排序后，对每项 `relativePath + NUL + SHA256 + NUL + size` 形成清单再计算 SHA256。
 
-从对应 Release 或仓库 `dist/` 下载明确命名的 marketplace ZIP 和 `.sha256`，不要使用 GitHub 自动生成的 “Source code” 压缩包。先核对校验和，再解压到新的本地目录，并把该解压目录注册为 `xiaohongshu-finance` marketplace 根。不得使用 `personal` marketplace 或其旧安装缓存代替当前候选：
+从对应 Release 或仓库 `dist/` 下载实际存在、明确命名的 marketplace ZIP 和 `.sha256`，不要使用 GitHub 自动生成的 “Source code” 压缩包，也不要从 README 推断一个尚未生成的新候选版本。先核对校验和，再解压到新的本地目录，并把该解压目录注册为 `xiaohongshu-finance` marketplace 根。不得使用 `personal` marketplace 或旧安装缓存代替所选成品包：
 
 ### 安装
 
@@ -48,7 +51,7 @@ codex plugin add xiaohongshu-reimbursement-workflow@xiaohongshu-finance --json
 codex plugin list --json
 ```
 
-安装后必须核对插件列表显示为所下载包的明确版本，再新建 Codex 任务加载 Skill。`20094210` 是未测试模板版，除非专门回归模板行为，否则优先使用已确认基线的脱敏便携包。
+安装后必须核对插件列表显示为所下载包的明确版本，再新建 Codex 任务加载 Skill。版本选择以实际 Release/ZIP、SHA256 sidecar 和包内 plugin manifest 一致为准；历史表中的“开发基线”不等于已经生成可安装的新候选。
 
 该版本正式合并到 GitHub `main` 后，同事也可把仓库链接和明确安装要求交给 Codex：
 
@@ -85,13 +88,23 @@ codex plugin list --json
 
 任何候选、基线、来源覆盖、预览或摘要变化都会使旧门禁失效。公司根表的未受管 Sheet 必须保持；驻所输入别名不会改变正式输出身份。
 
-用户明确要求整理发放记录时才进入发放归档。准备好经过来源绑定的 manifest 后，只执行一次：
+用户明确要求整理发放记录时才进入发放归档。使用者直接给出明确业务材料和处置决定即可，例如：
+
+```text
+使用 $xiaohongshu-reimbursement-workflow:xiaohongshu-reimbursement-workflow 生成本批发放归档。
+已发布报销成品或 fresh 报销证据：<明确文件/附件>
+工资最终件：<明确工作簿或图片；没有则写无>
+发放凭证：<明确文件/附件>
+逐行处置决定与归档父目录：<明确说明>
+```
+
+当前任务会 fresh 复核这些明确文件；业务事实或对应关系不清楚时先询问，不猜测。随后由任务内部生成 `sourceReview`、默认 `disbursement-archive-manifest-v2`、manifest SHA256 和 request，再只执行一次：
 
 ```bash
 node scripts/run_compact_disbursement_workflow.mjs --archive <request.json>
 ```
 
-`request.json` 必须严格为以下四字段结构，不接受批准口令、Gate、`statePath`、binding 或其他旧字段：
+`request.json` 是任务内部运行输入，不是用户手动准备步骤。它必须严格为以下四字段结构，不接受批准口令、Gate、`statePath`、binding 或其他旧字段：
 
 ```json
 {
@@ -101,6 +114,8 @@ node scripts/run_compact_disbursement_workflow.mjs --archive <request.json>
   "manifestSha256": "<manifest SHA256>"
 }
 ```
+
+外层 archive request 的 kind 继续是 `compact-disbursement-archive-v1`，这与内部默认 v2 manifest 不冲突。旧的 `disbursement-archive-manifest-v1` 仅严格兼容一个发布周期，并返回 `DISBURSEMENT_MANIFEST_V1_DEPRECATED` warning；warning 不新增 Gate 或确认口令。
 
 ## 仓库内容
 
@@ -118,12 +133,10 @@ node scripts/run_compact_disbursement_workflow.mjs --archive <request.json>
 
 仓库不包含真实报销截图、财务数据、账号凭证或本机财务路径。
 
-## 当前候选验证与性能口径
+## 当前实现边界
 
 - 普通报销继续使用 Gate 1/Gate 2；发放归档是一次调用完成的独立无人工 Gate 流程。两者不共享状态、来源扫描或发布入口。
-- 20% 只作为默认信息性改善目标，不是通过硬门。保留已证明有效且安全的优化；不为跨过 20% 叠加未证明收益的复杂度。验收守卫仍是输出完全等价、p95 不退化、RSS 无明显恶化，并保持普通流程预览 PNG 唯一性。
-- H 线正式对比（只读旧安装缓存与未修改目标版）记录的冷、热改善分别为 `34.159%`、`34.148%`。
-- O 线 r12 信息性诊断（未修改目标版与当前普通报销优化版）记录的冷、热 p50 改善分别为 `18.311%`、`23.142%`；冷启动未达到 20%，如实保留为信息性结果，不写成“20% 门槛通过”。该次诊断输出等价、PNG 唯一性及 RSS 条件通过。
-- 新版普通报销计时包含 Gate 2 对 7 类工件、全部唯一源图和归档媒体的独立读取、完整解码、逐项对应审计及报告生成；不包含外部人工/模型形成第二遍视觉观察的等待时间。
+- 发放仍保留两次来源审计、候选/stage/final 完整审计、TOCTOU 核对、fsync、原子发布、恢复保护、最终三项复核和 allowlist 清理；入口迁移不减少安全链。
+- 本期只更新发放业务材料入口、review-bound 信任边界和 v1 一周期迁移说明，没有实施整体性能优化、运行新性能评估或生成新的性能结论。20% 仍只是默认信息性改善目标，不是通过硬门。
 - 普通总表预览只含本批投影；预览失败只重跑渲染，不重建候选、交付表或证据。
 - JPEG 允许仅缺少 EOI 但仍可严格完整解码的输入；扫描数据截断、无有效 SOF、超出 25 MiB 或像素上限的媒体会被拒绝，归档始终保留原始字节和 SHA256。发放 PDF 还会逐页解析内容流，并拒绝加密、损坏、超限或无法完整解析的文件。
