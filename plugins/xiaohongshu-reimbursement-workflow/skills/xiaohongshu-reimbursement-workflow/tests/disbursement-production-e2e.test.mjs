@@ -96,6 +96,10 @@ test("one explicit archive call performs fresh review, atomic publication, final
     assert.match(receipt.candidateAuditDigest, /^[0-9a-f]{64}$/u);
     assert.equal(receipt.prePublishAuditDigest, receipt.candidateAuditDigest);
     assert.match(receipt.publicationInputIdentityDigest, /^[0-9a-f]{64}$/u);
+    assert.deepEqual(receipt.warnings, [{
+      code: "DISBURSEMENT_MANIFEST_V1_DEPRECATED",
+      message: "Manifest v1 remains supported but is deprecated; use strict manifest v2 for new archive tasks.",
+    }]);
     await assert.rejects(fs.access(workflowRoot), /ENOENT/u);
     assert.deepEqual((await fs.readdir(fixture.root)).filter((name) => name.includes(".publishing")), []);
   });
@@ -118,6 +122,7 @@ test("strict manifest v2 completes reimbursement-only, salary-only, and mixed ar
         const receipt = await archiveCompactDisbursementWorkflow(requestFor(fixture));
         await assertStrictFinalArchive(fixture, receipt);
         assert.equal(receipt.cleanup.removed, true);
+        assert.equal(receipt.warnings, undefined);
         assert.equal(fixture.manifest.sourceFiles.some((file) => file.usage.includes("salary_certificate_attestation")), false);
         assert.equal(fixture.manifest.sourceFiles.some((file) => file.usage.includes("original_manifest_attestation")), false);
         assert.equal(fixture.manifest.sourceFiles.some((file) => file.usage.includes("publish_receipt_attestation")), false);
@@ -139,6 +144,73 @@ test("published_archive manifest v2 completes a full archive without original ma
     await assertStrictFinalArchive(fixture, receipt);
     assert.equal(fixture.manifest.reimbursementSources[0].attestations, undefined);
     assert.equal(receipt.cleanup.removed, true);
+  });
+});
+
+test("equivalent strict v1 and v2 business inputs generate byte-identical final artifacts", async () => {
+  const baseRoot = await fs.mkdtemp(path.join(os.tmpdir(), "codex-disbursement-v1-v2-equivalence-"));
+  const priorTemp = process.env.TEMP;
+  const priorTmp = process.env.TMP;
+  process.env.TEMP = baseRoot;
+  process.env.TMP = baseRoot;
+  try {
+    const common = {
+      profileIds: ["xiaohongshu", "company"],
+      reimbursementTransactionCount: 12,
+      includeSalary: true,
+      requestedUniqueVoucherCount: 6,
+    };
+    const v1 = await createCompactDisbursementProductionFixture({
+      root: path.join(baseRoot, "v1"),
+      manifestVersion: 1,
+      ...common,
+    });
+    const v2 = await createCompactDisbursementProductionFixture({
+      root: path.join(baseRoot, "v2"),
+      manifestVersion: 2,
+      reimbursementMode: "fresh_evidence",
+      ...common,
+    });
+    const v1Audit = await auditDisbursementManifest({ manifestPath: v1.manifestPath, manifestSha256: v1.manifestSha256 });
+    const v2Audit = await auditDisbursementManifest({ manifestPath: v2.manifestPath, manifestSha256: v2.manifestSha256 });
+    const v1Built = await buildDisbursementArchiveBytes(v1Audit);
+    const v2Built = await buildDisbursementArchiveBytes(v2Audit);
+
+    assert.deepEqual(v2Built.summaryBytes, v1Built.summaryBytes);
+    assert.deepEqual(v2Built.workbookBytes, v1Built.workbookBytes);
+    assert.deepEqual(
+      v2Built.vouchers.map((entry) => ({ archiveName: entry.archiveName, bytes: entry.bytes })),
+      v1Built.vouchers.map((entry) => ({ archiveName: entry.archiveName, bytes: entry.bytes })),
+    );
+    assert.equal(v2Built.artifactDigest, v1Built.artifactDigest);
+    assert.deepEqual(v1Audit.warnings, [{
+      code: "DISBURSEMENT_MANIFEST_V1_DEPRECATED",
+      message: "Manifest v1 remains supported but is deprecated; use strict manifest v2 for new archive tasks.",
+    }]);
+    assert.equal(v2Audit.warnings, undefined);
+  } finally {
+    process.env.TEMP = priorTemp;
+    process.env.TMP = priorTmp;
+    await fs.rm(baseRoot, { recursive: true, force: true });
+  }
+});
+
+test("provided optional v2 attestations are validated and do not restore a startup gate", async () => {
+  await withProductionSandbox({
+    manifestVersion: 2,
+    reimbursementMode: "fresh_evidence",
+    profileIds: ["xiaohongshu"],
+    reimbursementTransactionCount: 8,
+    includeSalary: true,
+    requestedUniqueVoucherCount: 3,
+    includeReimbursementAttestations: true,
+    includeSalaryAttestation: true,
+  }, async ({ fixture }) => {
+    const receipt = await archiveCompactDisbursementWorkflow(requestFor(fixture));
+    await assertStrictFinalArchive(fixture, receipt);
+    assert.equal(fixture.manifest.sourceFiles.some((file) => file.usage.includes("original_manifest_attestation")), true);
+    assert.equal(fixture.manifest.sourceFiles.some((file) => file.usage.includes("publish_receipt_attestation")), true);
+    assert.equal(fixture.manifest.sourceFiles.some((file) => file.usage.includes("salary_certificate_attestation")), true);
   });
 });
 
@@ -285,6 +357,87 @@ test("candidate and source TOCTOU changes stop publication", async (t) => {
       await fs.access(stageRoot);
       await fs.access(`${stageRoot}.owner.json`);
     });
+  });
+
+  await t.test("v2 source mutation after candidate audit is caught by the fresh audit", async () => {
+    await withProductionSandbox({
+      manifestVersion: 2,
+      reimbursementMode: "fresh_evidence",
+      profileIds: ["xiaohongshu"],
+      reimbursementTransactionCount: 8,
+      includeSalary: true,
+      requestedUniqueVoucherCount: 3,
+    }, async ({ fixture }) => {
+      const source = fixture.manifest.sourceFiles.find((file) => file.usage.includes("fresh_reimbursement_evidence"));
+      assert.ok(source);
+      await assert.rejects(
+        archiveCompactDisbursementWorkflow(requestFor(fixture), {
+          testHooks: {
+            async afterCandidateAudited() {
+              await fs.appendFile(source.path, Buffer.from([0]));
+            },
+          },
+        }),
+        /SHA-256 differs from its sourceFiles binding/u,
+      );
+      await assert.rejects(fs.access(path.join(fixture.root, fixture.expectedBatchName)), /ENOENT/u);
+    });
+  });
+
+  await t.test("v2 source mutation after stage verification is caught before atomic rename", async () => {
+    await withProductionSandbox({
+      manifestVersion: 2,
+      reimbursementMode: "fresh_evidence",
+      profileIds: ["xiaohongshu"],
+      reimbursementTransactionCount: 8,
+      includeSalary: true,
+      requestedUniqueVoucherCount: 3,
+    }, async ({ fixture }) => {
+      const source = fixture.manifest.sourceFiles.find((file) => file.usage.includes("salary_artifact"));
+      assert.ok(source);
+      await assert.rejects(
+        archiveCompactDisbursementWorkflow(requestFor(fixture), {
+          testHooks: {
+            async afterPublishStageVerified() {
+              await fs.appendFile(source.path, Buffer.from([0]));
+            },
+          },
+        }),
+        /publication inputs changed after publish stage verification and before atomic rename/u,
+      );
+      await assert.rejects(fs.access(path.join(fixture.root, fixture.expectedBatchName)), /ENOENT/u);
+    });
+  });
+});
+
+test("manifest v2 resumes from an audited stage and still cleans its owned temporary state", async () => {
+  await withProductionSandbox({
+    manifestVersion: 2,
+    reimbursementMode: "fresh_evidence",
+    profileIds: ["xiaohongshu"],
+    reimbursementTransactionCount: 8,
+    includeSalary: true,
+    requestedUniqueVoucherCount: 3,
+  }, async ({ baseRoot, fixture }) => {
+    const request = requestFor(fixture);
+    const workflowRoot = path.join(baseRoot, `codex-xhs-disbursement-${request.stagingToken}`);
+    await assert.rejects(
+      archiveCompactDisbursementWorkflow(request, {
+        testHooks: {
+          afterPublishStageVerified() {
+            throw new Error("simulated v2 crash after stage audit");
+          },
+        },
+      }),
+      /simulated v2 crash after stage audit/u,
+    );
+    await fs.access(workflowRoot);
+    const receipt = await archiveCompactDisbursementWorkflow(request);
+    await assertStrictFinalArchive(fixture, receipt);
+    assert.equal(receipt.recovered, true);
+    assert.equal(receipt.cleanup.removed, true);
+    await assert.rejects(fs.access(workflowRoot), /ENOENT/u);
+    assert.deepEqual((await fs.readdir(fixture.root)).filter((name) => name.includes(".publishing")), []);
   });
 });
 

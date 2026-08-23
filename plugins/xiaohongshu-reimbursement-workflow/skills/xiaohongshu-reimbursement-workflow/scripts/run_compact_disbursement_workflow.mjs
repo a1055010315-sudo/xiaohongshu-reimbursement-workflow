@@ -1305,6 +1305,9 @@ function publishReceipt(context, finalAudit, { recovered, cleanup }) {
       size: entry.size,
       rowReferences: entry.rowReferences,
     })),
+    ...(Array.isArray(context.freshAudit.warnings) && context.freshAudit.warnings.length
+      ? { warnings: context.freshAudit.warnings.map((entry) => ({ ...entry })) }
+      : {}),
     finalAuditDigest: finalAudit.reportDigest,
     recovered,
     cleanup,
