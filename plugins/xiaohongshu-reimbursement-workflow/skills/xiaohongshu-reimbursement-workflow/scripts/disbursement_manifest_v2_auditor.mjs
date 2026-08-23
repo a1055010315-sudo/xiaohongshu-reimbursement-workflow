@@ -141,7 +141,9 @@ export async function prepareDisbursementManifestV2Audit(normalized, { validateB
   const voucherJobs = await mapSettledLimit(voucherFileIds, 4, async (fileId) => {
     const file = sourceFileById.get(fileId);
     if (!file) fail(`voucher file ${fileId} is missing from sourceFiles.`);
-    const validated = await validateBoundBinary(file.path, file.sha256, `sourceFiles voucher ${fileId}`);
+    const validated = await validateBoundBinary(file.path, file.sha256, `sourceFiles voucher ${fileId}`, {
+      expectedKind: file.kind,
+    });
     return { fileId, validated };
   });
   const validatedVoucherByFileId = new Map(voucherJobs.settled.map((item) => [item.value.fileId, item.value.validated]));

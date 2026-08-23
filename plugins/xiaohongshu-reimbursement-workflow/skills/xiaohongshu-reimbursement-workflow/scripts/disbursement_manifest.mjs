@@ -404,7 +404,7 @@ async function validateWorkbookBytes(bytes, field) {
   if (!/<sheet\b/iu.test(workbookXml)) fail(`${field} XLSX must contain at least one worksheet.`);
 }
 
-export async function validateBoundDisbursementBinary(filePath, expectedSha256, field, { salaryKind } = {}) {
+export async function validateBoundDisbursementBinary(filePath, expectedSha256, field, { salaryKind, expectedKind } = {}) {
   const stable = await readStableBinaryFile(filePath, {
     maxBytes: salaryKind ? MAX_SALARY_ARTIFACT_BYTES : MAX_VOUCHER_BYTES,
   });
@@ -417,6 +417,9 @@ export async function validateBoundDisbursementBinary(filePath, expectedSha256, 
   else if (signature.kind === "workbook") await validateWorkbookBytes(bytes, field);
   if (salaryKind && signature.kind !== salaryKind) fail(`${field} content does not match finalArtifactKind.`);
   if (!salaryKind && !new Set(["image", "pdf"]).has(signature.kind)) fail(`${field} must be an image or PDF voucher.`);
+  if (expectedKind && signature.kind !== expectedKind) {
+    fail(`${field} declared kind ${expectedKind} does not match actual content kind ${signature.kind}.`);
+  }
   return Object.freeze({ stable, bytes, signature, image });
 }
 

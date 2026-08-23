@@ -252,20 +252,50 @@ test("CLI exposes only one --archive operation and returns the verified receipt"
   });
 });
 
-test("owner binding rejects staging-token reuse for a different request", async () => {
-  await withProductionSandbox({ reimbursementTransactionCount: 8, requestedUniqueVoucherCount: 4 }, async ({ fixture }) => {
+test("owner binding is checked before a different request can read an invalid manifest", async () => {
+  await withProductionSandbox({ reimbursementTransactionCount: 8, requestedUniqueVoucherCount: 4 }, async ({ baseRoot, fixture }) => {
     const request = requestFor(fixture);
+    const workflowRoot = path.join(baseRoot, `codex-xhs-disbursement-${request.stagingToken}`);
     await assert.rejects(
       archiveCompactDisbursementWorkflow(request, {
         testHooks: { afterOwnerCreated() { throw new Error("simulated owner crash"); } },
       }),
       /simulated owner crash/u,
     );
-    const differentManifestPath = path.join(fixture.root, "different-manifest.json");
-    await fs.copyFile(fixture.manifestPath, differentManifestPath);
+    const maliciousManifestPath = path.join(fixture.root, "malformed-different-manifest.json");
+    const maliciousManifestBytes = Buffer.from('{"kind":"malformed"\n', "utf8");
+    await fs.writeFile(maliciousManifestPath, maliciousManifestBytes, { flag: "wx" });
+    for (const conflictingRequest of [
+      { ...request, manifestPath: path.join(fixture.root, "missing-different-manifest.json"), manifestSha256: "0".repeat(64) },
+      { ...request, manifestPath: maliciousManifestPath, manifestSha256: sha256Bytes(maliciousManifestBytes) },
+    ]) {
+      await assert.rejects(
+        archiveCompactDisbursementWorkflow(conflictingRequest),
+        /owner marker is invalid or belongs to another archive request/u,
+      );
+    }
+    await fs.access(workflowRoot);
+  });
+});
+
+test("a new token with an invalid manifest does not create a workflow root", async () => {
+  await withProductionSandbox({ reimbursementTransactionCount: 8, requestedUniqueVoucherCount: 4 }, async ({ baseRoot, fixture }) => {
+    const stagingToken = crypto.randomBytes(32).toString("hex");
+    const invalidManifestPath = path.join(fixture.root, "invalid-new-token-manifest.json");
+    const invalidManifestBytes = Buffer.from('{"kind":"malformed"\n', "utf8");
+    await fs.writeFile(invalidManifestPath, invalidManifestBytes, { flag: "wx" });
     await assert.rejects(
-      archiveCompactDisbursementWorkflow({ ...request, manifestPath: differentManifestPath }),
-      /owner marker is invalid or belongs to another archive request/u,
+      archiveCompactDisbursementWorkflow({
+        kind: DISBURSEMENT_ARCHIVE_KIND,
+        stagingToken,
+        manifestPath: invalidManifestPath,
+        manifestSha256: sha256Bytes(invalidManifestBytes),
+      }),
+      /JSON|parse|malformed|Unexpected/iu,
+    );
+    await assert.rejects(
+      fs.access(path.join(baseRoot, `codex-xhs-disbursement-${stagingToken}`)),
+      /ENOENT/u,
     );
   });
 });

@@ -772,14 +772,23 @@ function candidateRecordFromExisting(candidateRoot, expectedRecord) {
   });
 }
 
-async function openOwnedWorkflow({ workflowRoot, stagingToken, archiveRequestDigest, manifest, testHooks }) {
+async function openExistingOwnedWorkflow({ workflowRoot, stagingToken, archiveRequestDigest, manifest }) {
   const existing = await fs.lstat(workflowRoot).catch((error) => errorCode(error, "ENOENT") ? null : Promise.reject(error));
-  if (existing) {
-    if (!existing.isDirectory() || existing.isSymbolicLink()) fail("existing workflow root is not a plain owned directory.");
-    const owner = await assertOwnerMarker(workflowRoot, { stagingToken, archiveRequestDigest, manifest });
-    return Object.freeze({ owner, workflowRootIdentity: owner.workflowRootIdentity, recovered: true });
+  if (!existing) return null;
+  if (!existing.isDirectory() || existing.isSymbolicLink()) fail("existing workflow root is not a plain owned directory.");
+  const owner = await assertOwnerMarker(workflowRoot, { stagingToken, archiveRequestDigest, manifest });
+  return Object.freeze({ owner, workflowRootIdentity: owner.workflowRootIdentity, recovered: true });
+}
+
+async function createOrRecoverOwnedWorkflow({ workflowRoot, stagingToken, archiveRequestDigest, manifest, testHooks }) {
+  try {
+    await fs.mkdir(workflowRoot, { recursive: false });
+  } catch (error) {
+    if (!errorCode(error, "EEXIST")) throw error;
+    const recovered = await openExistingOwnedWorkflow({ workflowRoot, stagingToken, archiveRequestDigest, manifest });
+    if (!recovered) fail("workflow root disappeared during owner recovery.");
+    return recovered;
   }
-  await fs.mkdir(workflowRoot, { recursive: false });
   const workflowRootIdentity = await capturePlainDirectoryIdentity(workflowRoot, "new workflow root");
   const owner = await createOwnerMarker(workflowRoot, workflowRootIdentity, stagingToken, archiveRequestDigest, manifest);
   await testHooks?.afterOwnerCreated?.({ workflowRoot, owner });
@@ -1399,10 +1408,22 @@ export async function archiveCompactDisbursementWorkflow(rawRequest, { testHooks
   const manifest = Object.freeze({ path: manifestPath, sha256: manifestSha256 });
   const archiveRequestDigest = canonicalDigest({ kind: rawRequest.kind, stagingToken, manifestPath, manifestSha256 });
   const workflowRoot = path.join(path.resolve(os.tmpdir()), `${WORKFLOW_PREFIX}${stagingToken}`);
+  let opened = await openExistingOwnedWorkflow({ workflowRoot, stagingToken, archiveRequestDigest, manifest });
   const initialAudit = await auditDisbursementManifest({ manifestPath, manifestSha256 });
   const boundSourcePaths = boundSourcePathsFromAudit(initialAudit);
   const archiveParentIdentity = await capturePlainDirectoryIdentity(initialAudit.batch.archiveParentPath, "archive parent");
-  const opened = await openOwnedWorkflow({ workflowRoot, stagingToken, archiveRequestDigest, manifest, testHooks });
+  if (opened) {
+    const owner = await assertOwnerMarker(workflowRoot, {
+      stagingToken,
+      archiveRequestDigest,
+      manifest,
+      binding: opened.owner,
+      workflowRootIdentity: opened.workflowRootIdentity,
+    });
+    opened = Object.freeze({ owner, workflowRootIdentity: owner.workflowRootIdentity, recovered: true });
+  } else {
+    opened = await createOrRecoverOwnedWorkflow({ workflowRoot, stagingToken, archiveRequestDigest, manifest, testHooks });
+  }
   const baseContext = Object.freeze({
     stagingToken,
     workflowRoot,

@@ -139,6 +139,48 @@ test("strict PDF validator accepts a complete one-page voucher", async () => {
   assert.deepEqual(result, { pageCount: 1, totalOperators: 2 });
 });
 
+test("manifest v2 voucher kind must match fully validated image and PDF content", async (t) => {
+  const scenarios = [
+    { name: "image declared as PDF", actualKind: "image", declaredKind: "pdf" },
+    { name: "PDF declared as image", actualKind: "pdf", declaredKind: "image" },
+  ];
+  for (const scenario of scenarios) {
+    await t.test(scenario.name, async () => {
+      const root = await fs.mkdtemp(path.join(os.tmpdir(), "codex-disbursement-v2-voucher-kind-"));
+      try {
+        const fixture = await createCompactDisbursementProductionFixture({
+          root,
+          manifestVersion: 2,
+          reimbursementMode: "fresh_evidence",
+          profileIds: [],
+          reimbursementTransactionCount: 0,
+          includeSalary: true,
+          requestedUniqueVoucherCount: 1,
+        });
+        const manifest = structuredClone(fixture.manifest);
+        const voucherFile = manifest.sourceFiles.find((file) => file.usage.includes("payout_voucher"));
+        assert.ok(voucherFile);
+        if (scenario.actualKind === "pdf") {
+          const bytes = onePagePdf();
+          voucherFile.path = path.join(root, "actual-voucher.pdf");
+          voucherFile.sha256 = sha256Bytes(bytes);
+          await fs.writeFile(voucherFile.path, bytes, { flag: "wx" });
+        }
+        voucherFile.kind = scenario.declaredKind;
+        const manifestBytes = Buffer.from(`${JSON.stringify(manifest)}\n`, "utf8");
+        const manifestPath = path.join(root, `mismatched-${scenario.actualKind}-voucher.json`);
+        await fs.writeFile(manifestPath, manifestBytes, { flag: "wx" });
+        await assert.rejects(
+          auditDisbursementManifest({ manifestPath, manifestSha256: sha256Bytes(manifestBytes) }),
+          new RegExp(`declared kind ${scenario.declaredKind} does not match actual content kind ${scenario.actualKind}`, "u"),
+        );
+      } finally {
+        await fs.rm(root, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
 test("valid PDF validation works when imported from --input-type=module eval", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "codex-disbursement-pdf-eval-import-"));
   try {
