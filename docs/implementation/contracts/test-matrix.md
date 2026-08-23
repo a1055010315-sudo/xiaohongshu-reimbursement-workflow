@@ -1,6 +1,6 @@
 # 测试矩阵
 
-状态：S00 基线已执行；后续契约测试未冻结。
+状态：S00 基线已执行；S01 v2 结构契约测试已冻结并通过。
 
 ## S00 发放测试
 
@@ -43,13 +43,26 @@ $env:XHS_BUNDLED_PYTHON = 'C:\Users\a1055\.cache\codex-runtimes\codex-primary-ru
 
 临时 Node 与 bundled Node 的 SHA-256 均为 `b8983a7a4af031048d92632291bb53989aed5411d62e02f25b78daaddc2a10ea`。测试完成后，两个 junction、Node 硬链接及临时目录均已删除。
 
-## 后续矩阵占位
+## S01 manifest v2 结构契约
+
+- 测试文件：`tests/disbursement-manifest-v2-contract.test.mjs`
+- 同跑现有无外部包 domain 测试：`tests/disbursement-domain.test.mjs`
+- 命令：`node --test --test-reporter=tap <contract-test> <domain-test>`
+- 结果：37 pass，0 fail，0 skipped；其中 v2 contract 33 项、现有 domain 4 项。
+- 耗时：104.9305 ms。
+- 测试为纯合成 JSON/纯 domain；未读取真实财务目录，未创建生产 fixture。
+
+覆盖：reimbursement-only（`published_archive` 和 `fresh_evidence`）、salary-only、mixed、unknown fields、kind/version 错配、v1/v2 混用、重复 ID、未知 fileId、同一路径文件身份冲突、非法 mode、三类可选 attestation 缺失通过、提供合法绑定通过、提供未知/错误 usage 绑定拒绝、task-internal sourceReview 完整绑定、非法日期和金额精度。
+
+## 后续矩阵
 
 | 契约/能力 | 单元 | 测试 | 状态 |
 | --- | --- | --- | --- |
-| manifest v2 | TBD | TBD | 未冻结 |
-| 启动门槛替换 | TBD | TBD | 未冻结 |
+| manifest v2 结构 | S01 | `disbursement-manifest-v2-contract.test.mjs` | frozen/pass |
+| 报销来源/可选佐证 fresh 验证 | S02 | TBD | 待实现 |
+| 工资来源/可选 certificate fresh 验证 | S03 | TBD | 待实现 |
+| v2 业务闭合与入口分派 | S04 | TBD | 待实现 |
 | 兼容/迁移 | TBD | TBD | 未冻结 |
 | 失败恢复 | TBD | TBD | 未冻结 |
 
-不得把 TBD 行视为已承诺的设计或测试范围。
+不得把 TBD 行视为已实现能力。S01 的 pass 只证明纯结构契约，不证明文件内容、来源事实或业务闭合正确。
