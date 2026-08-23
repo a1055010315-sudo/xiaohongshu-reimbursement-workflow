@@ -17,7 +17,7 @@
 
 当前任务先把实际要读取的文件收敛为明确清单，fresh 读取并进行语义复核，再在任务内部生成并内嵌 `disbursement-source-review-v2`，随后生成默认的 `disbursement-archive-manifest-v2`、计算 SHA256，并构造严格四字段 archive request。不要让用户手写这些内部 JSON，也不要要求用户扫描目录寻找原 manifest、receipt、certificate 或其他 sidecar；审计器不得枚举父目录、追随未注册路径或用隐式文件扩大发放输入。
 
-v2 manifest 的详细 exact schema 见 [Manifest v2 冻结契约](../../../../../docs/implementation/contracts/manifest-v2.md)。所有来源都在 `sourceFiles` 中以显式路径、SHA256、类型和 usage 注册；报销、工资与凭证结构只引用 file ID。`sourceReview.reviewedFileIds` 必须完整且仅覆盖对应来源输入和已提供的可选佐证。每笔报销交易必须在 `rows[].reimbursementRefs` 中恰好出现一次；每个工资最终件、每份凭证都必须被行引用。`expected` 必须精确闭合行数、在批应发/实发/已核销、唯一凭证数、凭证引用数、尾差合计和工资槽位数。金额使用最多三位小数的定点十进制字符串。
+v2 manifest 的详细 exact schema 见包内 [发放 manifest v2 内部契约](disbursement-manifest-v2.md)。所有来源都在 `sourceFiles` 中以显式路径、SHA256、类型和 usage 注册；报销、工资与凭证结构只引用 file ID。`sourceReview.reviewedFileIds` 必须完整且仅覆盖对应来源输入和已提供的可选佐证。每笔报销交易必须在 `rows[].reimbursementRefs` 中恰好出现一次；每个工资最终件、每份凭证都必须被行引用。`expected` 必须精确闭合行数、在批应发/实发/已核销、唯一凭证数、凭证引用数、尾差合计和工资槽位数。金额使用最多三位小数的定点十进制字符串。
 
 ## Review-bound 信任边界
 
