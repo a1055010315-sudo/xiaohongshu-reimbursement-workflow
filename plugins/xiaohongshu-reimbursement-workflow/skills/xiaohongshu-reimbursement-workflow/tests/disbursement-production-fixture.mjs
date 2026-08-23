@@ -10,10 +10,14 @@ import {
   parseDisbursementAmount,
   resolveVisibleDisbursementStatus,
 } from "../scripts/disbursement_domain.mjs";
+import { buildReimbursementArtifacts, REIMBURSEMENT_ARTIFACT_BUILD_KIND } from "../scripts/build_reimbursement_artifacts.mjs";
+import { loadProfileRegistry } from "../scripts/finance_domain.mjs";
 import { canonicalDigest, loadBundledDependency, sha256Bytes } from "../scripts/workflow_primitives.mjs";
 
 const SharpModule = loadBundledDependency("sharp");
 const sharp = SharpModule.default ?? SharpModule;
+const JSZipModule = loadBundledDependency("jszip");
+const JSZip = JSZipModule.default ?? JSZipModule;
 const SKILL_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const SALARY_TEMPLATE = path.join(SKILL_ROOT, "assets", "templates", "disbursement", "compact-disbursement.xlsx");
 
@@ -48,6 +52,120 @@ async function makePng(index, width = 72, height = 48) {
       background: { r: (index * 53) % 255, g: (index * 97) % 255, b: (index * 193) % 255 },
     },
   }).png({ compressionLevel: 6 }).toBuffer();
+}
+
+async function safeSalaryWorkbookBytes() {
+  const zip = new JSZip();
+  zip.file("[Content_Types].xml", '<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>');
+  zip.file("_rels/.rels", '<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>');
+  zip.file("xl/workbook.xml", '<?xml version="1.0" encoding="UTF-8"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="工资最终件" sheetId="1" r:id="rId1"/></sheets></workbook>');
+  zip.file("xl/_rels/workbook.xml.rels", '<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>');
+  zip.file("xl/worksheets/sheet1.xml", '<?xml version="1.0" encoding="UTF-8"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>合成工资材料</t></is></c><c r="B1"><v>5800</v></c></row></sheetData></worksheet>');
+  return zip.generateAsync({ type: "nodebuffer", compression: "DEFLATE" });
+}
+
+function xml(value) {
+  return String(value)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&apos;");
+}
+
+function excelSerial(isoDate) {
+  return String(Math.floor(Date.parse(`${isoDate}T00:00:00Z`) / 86_400_000) + 25_569);
+}
+
+function compactDate(value) {
+  return `${value.slice(0, 4)}.${Number(value.slice(5, 7))}.${Number(value.slice(8, 10))}`;
+}
+
+async function copyBound(source, target) {
+  await fs.mkdir(path.dirname(target), { recursive: true });
+  return writeBound(target, await fs.readFile(source.path));
+}
+
+async function createPublishedSnapshot(detail, outputPath, profile, transactions) {
+  const zip = await JSZip.loadAsync(await fs.readFile(detail.path), { createFolders: false });
+  const workbookXml = await zip.file("xl/workbook.xml").async("string");
+  zip.file("xl/workbook.xml", workbookXml.replaceAll(profile.detailSheetName, profile.managedRootSheetName));
+  const rows = transactions.map((item, index) => {
+    const row = index + 1;
+    return `<row r="${row}"><c r="A${row}"><v>${excelSerial(item.date)}</v></c><c r="B${row}" t="inlineStr"><is><t>${xml(item.project)}</t></is></c><c r="C${row}"><v>${item.sourceAmount}</v></c><c r="D${row}"><f>SUM(C${row}:C${row})</f><v>${item.sourceAmount}</v></c><c r="E${row}" t="inlineStr"><is><t>${xml(item.person)}</t></is></c><c r="F${row}" t="inlineStr"><is><t>${xml(item.classification)}</t></is></c></row>`;
+  }).join("");
+  zip.file("xl/worksheets/sheet1.xml", `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>${rows}</sheetData></worksheet>`);
+  const bytes = await zip.generateAsync({ type: "nodebuffer", compression: "DEFLATE", compressionOptions: { level: 6 }, platform: "DOS" });
+  await fs.mkdir(path.dirname(outputPath), { recursive: true });
+  return writeBound(outputPath, bytes);
+}
+
+async function createPublishedV2Sources({ root, originalManifestFile, profileIds, transactions, material, reimbursementPeriod }) {
+  const registry = await loadProfileRegistry();
+  const profileIdByName = Object.fromEntries(profileIds.map((profileId) => [DISBURSEMENT_PROFILE_NAMES[profileId], profileId]));
+  const builderTransactions = transactions.map((transaction) => ({
+    ...transaction,
+    profileId: profileIdByName[transaction.category],
+    amount: transaction.sourceAmount,
+  }));
+  const orderedProfileIds = [...profileIds].sort((left, right) => ["xiaohongshu", "company", "residence"].indexOf(left) - ["xiaohongshu", "company", "residence"].indexOf(right));
+  const factsPreimage = {
+    affectedProfileIds: orderedProfileIds,
+    transactions: builderTransactions.map(({ evidence: _evidence, ...transaction }) => transaction),
+    summaryAnnotations: [],
+  };
+  const sourceCoveragePreimage = {
+    transactionSourceRefs: builderTransactions.map((transaction) => ({ transactionId: transaction.id, sourceRefs: transaction.sourceRefs })),
+  };
+  const certificateCore = {
+    kind: "reimbursement-manifest-facts-v1",
+    operationMode: "reimbursement-batch",
+    manifestFileSha256: originalManifestFile.sha256,
+    manifestDigest: crypto.createHash("sha256").update("production fixture builder manifest").digest("hex"),
+    configDigest: crypto.createHash("sha256").update("production fixture builder config").digest("hex"),
+    profileConfigDigest: registry.profileConfigDigest,
+    factsDigest: canonicalDigest(factsPreimage),
+    factsPreimage,
+    sourceCoverageDigest: canonicalDigest(sourceCoveragePreimage),
+    sourceCoveragePreimage,
+  };
+  const presentationBuild = await buildReimbursementArtifacts({
+    kind: REIMBURSEMENT_ARTIFACT_BUILD_KIND,
+    stagingToken: crypto.randomBytes(32).toString("hex"),
+    manifestPath: originalManifestFile.path,
+    manifestSha256: originalManifestFile.sha256,
+    reimbursementFactsCertificate: { ...certificateCore, certificateDigest: canonicalDigest(certificateCore) },
+  });
+  try {
+    const results = [];
+    for (const profileId of profileIds) {
+      const profile = registry.profiles[profileId];
+      const presentation = presentationBuild.artifacts.find((artifact) => artifact.profileId === profileId);
+      if (!presentation) throw new Error(`published v2 fixture lacks presentation for ${profileId}`);
+      const archiveName = `${compactDate(reimbursementPeriod.start)}-${compactDate(reimbursementPeriod.end)}_${profile.targetCategory}`;
+      const archiveRoot = path.join(root, `published-v2-${profileId}`, archiveName);
+      await fs.mkdir(archiveRoot, { recursive: true });
+      const summary = await copyBound(presentation.summary, path.join(archiveRoot, path.basename(presentation.summary.path)));
+      const detail = await copyBound(presentation.detail, path.join(archiveRoot, path.basename(presentation.detail.path)));
+      const screenshot = await copyBound(presentation.screenshot, path.join(archiveRoot, path.basename(presentation.screenshot.path)));
+      const supplements = [];
+      for (const supplement of presentation.supplements) supplements.push(await copyBound(supplement, path.join(archiveRoot, path.basename(supplement.path))));
+      const evidence = [];
+      const evidenceDirectory = path.join(archiveRoot, "报销截图", profile.screenshotMapSheetName);
+      for (const item of presentation.evidenceArchive) evidence.push(await copyBound(item, path.join(evidenceDirectory, item.finalName)));
+      const profileTransactions = transactions.filter((transaction) => transaction.category === profile.targetCategory);
+      const snapshot = await createPublishedSnapshot(
+        detail,
+        path.join(archiveRoot, `${profile.archiveStem}_截至${compactDate(reimbursementPeriod.end)}.xlsx`),
+        profile,
+        profileTransactions,
+      );
+      results.push({ profileId, summary, detail, screenshot, snapshot, supplements, evidence, material });
+    }
+    return results;
+  } finally {
+    await fs.rm(presentationBuild.stagingRoot, { recursive: true, force: true });
+  }
 }
 
 function transactionAmount(index) {
@@ -98,8 +216,15 @@ export async function createCompactDisbursementProductionFixture({
   includeSalary = true,
   requestedUniqueVoucherCount = 24,
   nameRevision = 1,
+  manifestVersion = 1,
+  reimbursementMode = "fresh_evidence",
+  includeReimbursementAttestations = false,
+  includeSalaryAttestation = false,
 } = {}) {
   if (!path.isAbsolute(root)) throw new Error("fixture root must be absolute");
+  if (![1, 2].includes(manifestVersion)) throw new Error("fixture manifestVersion must be 1 or 2");
+  if (!["fresh_evidence", "published_archive"].includes(reimbursementMode)) throw new Error("fixture reimbursementMode is invalid");
+  if (profileIds.length === 0 && !includeSalary) throw new Error("fixture requires reimbursement and/or salary");
   await fs.mkdir(root, { recursive: true });
   const reimbursementPeriod = Object.freeze({ start: "2031-04-10", end: "2031-04-15" });
   const baseline = await writeBound(path.join(root, "ordinary-baseline.xlsx"), Buffer.from("synthetic baseline\n", "utf8"));
@@ -182,13 +307,19 @@ export async function createCompactDisbursementProductionFixture({
     receipt = { ...receiptCore, receiptDigest: canonicalDigest(receiptCore) };
     receiptFile = await writeJson(path.join(root, "ordinary-publish-receipt.json"), receipt);
   }
+  const publishedV2Sources = manifestVersion === 2 && reimbursementMode === "published_archive" && profileIds.length
+    ? await createPublishedV2Sources({ root, originalManifestFile, profileIds, transactions, material, reimbursementPeriod })
+    : [];
 
   const salaryArtifacts = [];
   let salaryAmount = "0";
+  let salaryFile = null;
+  let salaryCertificate = null;
+  let salaryCertificateFile = null;
   if (includeSalary) {
     const salaryPath = path.join(root, "salary-final.xlsx");
-    const salaryBytes = await fs.readFile(SALARY_TEMPLATE);
-    const salaryFile = await writeBound(salaryPath, salaryBytes);
+    const salaryBytes = manifestVersion === 2 ? await safeSalaryWorkbookBytes() : await fs.readFile(SALARY_TEMPLATE);
+    salaryFile = await writeBound(salaryPath, salaryBytes);
     salaryAmount = "5800";
     const certificateCore = {
       kind: "salary-final-artifact-v1",
@@ -201,8 +332,8 @@ export async function createCompactDisbursementProductionFixture({
       storeReference: "工资最终件/2031-04/小红书工资/最终表.xlsx",
       grossPayTotal: salaryAmount,
     };
-    const certificate = { ...certificateCore, certificateDigest: canonicalDigest(certificateCore) };
-    const certificateFile = await writeJson(path.join(root, "salary-final-certificate.json"), certificate);
+    salaryCertificate = { ...certificateCore, certificateDigest: canonicalDigest(certificateCore) };
+    salaryCertificateFile = await writeJson(path.join(root, "salary-final-certificate.json"), salaryCertificate);
     salaryArtifacts.push({
       id: "salary-2031-04-xhs",
       month: "2031-04",
@@ -211,14 +342,16 @@ export async function createCompactDisbursementProductionFixture({
       finalArtifactKind: "workbook",
       path: salaryFile.path,
       sha256: salaryFile.sha256,
-      storeReference: certificate.storeReference,
-      certificatePath: certificateFile.path,
-      certificateSha256: certificateFile.sha256,
+      storeReference: salaryCertificate.storeReference,
+      certificatePath: salaryCertificateFile.path,
+      certificateSha256: salaryCertificateFile.sha256,
     });
   }
 
   const eligibleForVoucher = transactions.map((_, index) => index).filter((index) => ["reconciled", "refund", "retained"].includes(payoutKind(index)));
-  const uniqueVoucherCount = Math.max(1, Math.min(requestedUniqueVoucherCount, eligibleForVoucher.length));
+  const uniqueVoucherCount = eligibleForVoucher.length
+    ? Math.max(1, Math.min(requestedUniqueVoucherCount, eligibleForVoucher.length))
+    : includeSalary ? 1 : 0;
   const vouchers = [];
   for (let index = 0; index < uniqueVoucherCount; index += 1) {
     const file = await writeBound(path.join(root, `payout-${String(index + 1).padStart(3, "0")}.png`), await makePng(index + 1));
@@ -269,6 +402,22 @@ export async function createCompactDisbursementProductionFixture({
     });
     return base;
   });
+  if (includeSalary && rows.length === 0) {
+    rows.push({
+      id: "row-salary-only",
+      order: 1,
+      subject: "合成人员工资",
+      scopeStatus: "in_batch",
+      payoutStatus: "reconciled",
+      paymentMethod: "transfer",
+      adjustmentKind: "none",
+      amounts: { ...zeroAmounts(), salary: salaryAmount },
+      paidAmount: salaryAmount,
+      reimbursementRefs: [],
+      salaryArtifactId: "salary-2031-04-xhs",
+      voucherRefs: [vouchers[0].id, "voucher-duplicate-alias"],
+    });
+  }
   rows.push({
     id: "row-rounding-tail",
     order: rows.length + 1,
@@ -286,7 +435,8 @@ export async function createCompactDisbursementProductionFixture({
 
   const normalInBatch = rows.filter((row) => row.scopeStatus === "in_batch" && row.adjustmentKind === "none");
   const visible = rows.map((row) => ({ row, status: resolveVisibleDisbursementStatus(row) }));
-  const disbursementManifest = {
+  let disbursementManifest;
+  if (manifestVersion === 1) disbursementManifest = {
     kind: "disbursement-archive-manifest-v1",
     version: 1,
     batch: {
@@ -317,6 +467,142 @@ export async function createCompactDisbursementProductionFixture({
       salarySlotCount: salaryArtifacts.length,
     },
   };
+  else {
+    if (reimbursementMode === "published_archive" && includeReimbursementAttestations) {
+      throw new Error("published_archive fixture attestations are intentionally separate from its default no-attestation path");
+    }
+    const sourceFiles = [];
+    const publishedInputFileIdsByProfile = new Map();
+    if (profileIds.length) {
+      if (reimbursementMode === "fresh_evidence") {
+        sourceFiles.push({
+          id: "fresh-reimbursement-evidence",
+          path: material.path,
+          sha256: material.sha256,
+          kind: "image",
+          usage: ["fresh_reimbursement_evidence"],
+        });
+        if (includeReimbursementAttestations) {
+          sourceFiles.push(
+            { id: "ordinary-manifest-attestation", path: originalManifestFile.path, sha256: originalManifestFile.sha256, kind: "json", usage: ["original_manifest_attestation"] },
+            { id: "ordinary-receipt-attestation", path: receiptFile.path, sha256: receiptFile.sha256, kind: "json", usage: ["publish_receipt_attestation"] },
+          );
+        }
+      } else {
+        for (const published of publishedV2Sources) {
+          const entries = [
+            ["summary", published.summary, "text"],
+            ["detail", published.detail, "workbook"],
+            ["screenshot", published.screenshot, "workbook"],
+            ["snapshot", published.snapshot, "workbook"],
+            ...published.supplements.map((binding, index) => [`supplement-${index + 1}`, binding, "workbook"]),
+            ...published.evidence.map((binding, index) => [`evidence-${index + 1}`, binding, "image"]),
+          ];
+          const ids = entries.map(([role, binding, kind]) => {
+            const fileId = `published-${published.profileId}-${role}`;
+            sourceFiles.push({ id: fileId, path: binding.path, sha256: binding.sha256, kind, usage: ["published_reimbursement_artifact"] });
+            return fileId;
+          });
+          publishedInputFileIdsByProfile.set(published.profileId, ids);
+        }
+      }
+    }
+    if (includeSalary) {
+      sourceFiles.push({ id: "salary-final-artifact", path: salaryFile.path, sha256: salaryFile.sha256, kind: "workbook", usage: ["salary_artifact"] });
+      if (includeSalaryAttestation) {
+        sourceFiles.push({ id: "salary-certificate-attestation", path: salaryCertificateFile.path, sha256: salaryCertificateFile.sha256, kind: "json", usage: ["salary_certificate_attestation"] });
+      }
+    }
+    const voucherFileIdByPath = new Map();
+    for (const voucher of vouchers) {
+      if (voucherFileIdByPath.has(voucher.path)) continue;
+      const fileId = `payout-voucher-file-${String(voucherFileIdByPath.size + 1).padStart(3, "0")}`;
+      voucherFileIdByPath.set(voucher.path, fileId);
+      sourceFiles.push({ id: fileId, path: voucher.path, sha256: voucher.sha256, kind: "image", usage: ["payout_voucher"] });
+    }
+    const reimbursementSourcesV2 = profileIds.map((profileId) => ({
+      id: sourceIdByProfile[profileId],
+      profileId,
+      mode: reimbursementMode,
+      inputFileIds: reimbursementMode === "fresh_evidence" ? ["fresh-reimbursement-evidence"] : publishedInputFileIdsByProfile.get(profileId),
+      ...(includeReimbursementAttestations ? { attestations: { originalManifestFileId: "ordinary-manifest-attestation", receiptFileId: "ordinary-receipt-attestation" } } : {}),
+    }));
+    const reimbursementReviews = reimbursementSourcesV2.map((source) => ({
+      id: `review-${source.id}`,
+      sourceId: source.id,
+      mode: reimbursementMode,
+      reviewedFileIds: reimbursementMode === "fresh_evidence"
+        ? ["fresh-reimbursement-evidence", ...(includeReimbursementAttestations ? ["ordinary-manifest-attestation", "ordinary-receipt-attestation"] : [])]
+        : [...source.inputFileIds],
+      facts: {
+        batchId: originalManifest.batch.batchId,
+        reimbursementPeriod,
+        transactions: transactions
+          .filter((transaction) => transaction.category === DISBURSEMENT_PROFILE_NAMES[source.profileId])
+          .map((transaction) => ({ id: transaction.id, date: transaction.date, person: transaction.person, reimbursementAmount: transaction.reimbursementAmount })),
+      },
+    }));
+    const salaryArtifactsV2 = includeSalary ? [{
+      id: "salary-2031-04-xhs",
+      month: "2031-04",
+      salaryCategoryId: "xiaohongshu-salary",
+      salaryCategoryName: "小红书工资",
+      finalArtifactKind: "workbook",
+      fileId: "salary-final-artifact",
+      storeReference: salaryCertificate.storeReference,
+      ...(includeSalaryAttestation ? { attestation: { salaryCertificateFileId: "salary-certificate-attestation" } } : {}),
+    }] : [];
+    const salaryRow = rows.find((row) => row.salaryArtifactId === "salary-2031-04-xhs");
+    const salaryReviews = includeSalary ? [{
+      id: "review-salary-2031-04-xhs",
+      salaryArtifactId: "salary-2031-04-xhs",
+      mode: "final_artifact",
+      reviewedFileIds: ["salary-final-artifact", ...(includeSalaryAttestation ? ["salary-certificate-attestation"] : [])],
+      facts: {
+        month: "2031-04",
+        salaryCategoryId: "xiaohongshu-salary",
+        salaryCategoryName: "小红书工资",
+        finalArtifactKind: "workbook",
+        storeReference: salaryCertificate.storeReference,
+        grossPayTotal: salaryAmount,
+        payments: [{ id: "salary-payment-001", subject: salaryRow.subject, amount: salaryAmount }],
+      },
+    }] : [];
+    disbursementManifest = {
+      kind: "disbursement-archive-manifest-v2",
+      version: 2,
+      batch: {
+        batchId: "synthetic-compact-disbursement",
+        archiveParentPath: root,
+        nameRevision,
+        ...(profileIds.length ? { reimbursementPeriod } : {}),
+      },
+      sourceFiles,
+      reimbursementSources: reimbursementSourcesV2,
+      salaryArtifacts: salaryArtifactsV2,
+      vouchers: vouchers.map((voucher) => ({ id: voucher.id, fileId: voucherFileIdByPath.get(voucher.path) })),
+      rows,
+      sourceReview: {
+        kind: "disbursement-source-review-v2",
+        version: 2,
+        id: "production-fixture-review",
+        producer: "task_internal",
+        generatedAt: "2031-04-16T00:00:00Z",
+        reimbursement: reimbursementReviews,
+        salary: salaryReviews,
+      },
+      expected: {
+        rowCount: rows.length,
+        inBatchDueTotal: formatDisbursementAmount(add(normalInBatch.map((row) => formatDisbursementAmount(add(Object.values(row.amounts)))))),
+        inBatchPaidTotal: formatDisbursementAmount(add(normalInBatch.map((row) => row.paidAmount))),
+        reconciledTotal: formatDisbursementAmount(add(visible.filter((entry) => entry.row.scopeStatus === "in_batch" && entry.row.adjustmentKind === "none" && entry.status === "已核销").map((entry) => entry.row.paidAmount))),
+        uniqueVoucherCount: new Set(vouchers.map((entry) => entry.sha256)).size,
+        voucherReferenceCount: rows.reduce((sum, row) => sum + row.voucherRefs.length, 0),
+        roundingTailTotal: "0.367",
+        salarySlotCount: salaryArtifactsV2.length,
+      },
+    };
+  }
   const manifestFile = await writeJson(path.join(root, "disbursement-manifest.json"), disbursementManifest);
   return Object.freeze({
     root,

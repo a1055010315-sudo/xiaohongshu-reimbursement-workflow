@@ -27,6 +27,10 @@ import {
   paymentMethodDisplay,
   resolveVisibleDisbursementStatus,
 } from "./disbursement_domain.mjs";
+import {
+  dispatchDisbursementManifestVersion,
+  validateDisbursementManifestV2,
+} from "./disbursement_manifest_v2_contract.mjs";
 
 export const DISBURSEMENT_MANIFEST_KIND = "disbursement-archive-manifest-v1";
 export const DISBURSEMENT_AUDIT_KIND = "compact-disbursement-audit-v1";
@@ -400,7 +404,7 @@ async function validateWorkbookBytes(bytes, field) {
   if (!/<sheet\b/iu.test(workbookXml)) fail(`${field} XLSX must contain at least one worksheet.`);
 }
 
-async function validateBoundBinary(filePath, expectedSha256, field, { salaryKind } = {}) {
+export async function validateBoundDisbursementBinary(filePath, expectedSha256, field, { salaryKind } = {}) {
   const stable = await readStableBinaryFile(filePath, {
     maxBytes: salaryKind ? MAX_SALARY_ARTIFACT_BYTES : MAX_VOUCHER_BYTES,
   });
@@ -424,12 +428,13 @@ function sortedUnique(values) {
   return [...new Set(values)].sort();
 }
 
-export async function auditDisbursementManifest({ manifestPath, manifestSha256 }) {
+async function auditDisbursementManifestV1({ manifestPath, manifestSha256 }, options = {}) {
   const resolvedManifestPath = absolutePath(manifestPath, "manifestPath");
   const expectedManifestSha256 = sha(manifestSha256, "manifestSha256");
-  const manifestSnapshot = await readStableUtf8JsonFile(resolvedManifestPath, { maxBytes: MAX_JSON_BYTES });
+  const manifestSnapshot = options.manifestSnapshot
+    ?? await readStableUtf8JsonFile(resolvedManifestPath, { maxBytes: MAX_JSON_BYTES });
   if (manifestSnapshot.sha256 !== expectedManifestSha256) fail("manifest SHA-256 differs from the request binding.");
-  const raw = manifestSnapshot.value;
+  const raw = options.rawOverride ?? manifestSnapshot.value;
   exact(raw,
     new Set(["kind", "version", "batch", "reimbursementSources", "salaryArtifacts", "vouchers", "rows", "expected"]),
     new Set(), "manifest");
@@ -450,8 +455,20 @@ export async function auditDisbursementManifest({ manifestPath, manifestSha256 }
     });
   }
 
+  let reimbursementSources;
+  let salaryArtifacts;
+  let salaryById;
+  let voucherEntries;
+  let voucherById;
+  if (options.prepared) {
+    ({ reimbursementSources, salaryArtifacts, salaryById, voucherEntries, voucherById } = options.prepared);
+    if (!Array.isArray(reimbursementSources) || !Array.isArray(salaryArtifacts) || !(salaryById instanceof Map)
+      || !Array.isArray(voucherEntries) || !(voucherById instanceof Map)) {
+      fail("prepared v2 source audit did not expose the complete compatibility shape.");
+    }
+  } else {
   const registry = await loadProfileRegistry();
-  const reimbursementSources = [];
+  reimbursementSources = [];
   const sourceById = new Map();
   const reimbursementCertificateDigests = new Set();
   const reimbursementBatchProfileKeys = new Set();
@@ -498,8 +515,8 @@ export async function auditDisbursementManifest({ manifestPath, manifestSha256 }
     fail("batch.reimbursementPeriod must be omitted when no reimbursement source is present.");
   }
 
-  const salaryArtifacts = [];
-  const salaryById = new Map();
+  salaryArtifacts = [];
+  salaryById = new Map();
   const salarySlotKeys = new Set();
   const salaryArtifactDigests = new Set();
   const salaryCertificateDigests = new Set();
@@ -531,7 +548,7 @@ export async function auditDisbursementManifest({ manifestPath, manifestSha256 }
     if (salaryCertificateDigests.has(certificate.certificateDigest)) fail(`${field} reuses one salary certificate in multiple slots.`);
     salaryArtifactDigests.add(artifactSha256);
     salaryCertificateDigests.add(certificate.certificateDigest);
-    const validated = await validateBoundBinary(artifactPath, artifactSha256, `${field}.artifact`, { salaryKind: finalArtifactKind });
+    const validated = await validateBoundDisbursementBinary(artifactPath, artifactSha256, `${field}.artifact`, { salaryKind: finalArtifactKind });
     const normalized = Object.freeze({
       artifactId,
       month,
@@ -550,8 +567,8 @@ export async function auditDisbursementManifest({ manifestPath, manifestSha256 }
     salaryById.set(artifactId, normalized);
   }
 
-  const voucherEntries = [];
-  const voucherById = new Map();
+  voucherEntries = [];
+  voucherById = new Map();
   const voucherReadJobs = new Map();
   for (const [index, entry] of array(raw.vouchers, "vouchers").entries()) {
     const field = `vouchers[${index}]`;
@@ -569,12 +586,13 @@ export async function auditDisbursementManifest({ manifestPath, manifestSha256 }
   const readJobs = [...voucherReadJobs.entries()];
   const settled = await mapSettledLimit(readJobs, 4, async ([readKey, entry]) => ({
     readKey,
-    validated: await validateBoundBinary(entry.voucherPath, entry.voucherSha256, `${entry.field}.voucher`),
+    validated: await validateBoundDisbursementBinary(entry.voucherPath, entry.voucherSha256, `${entry.field}.voucher`),
   }));
   const voucherRuntimeByReadKey = new Map(settled.settled.map((item) => [item.value.readKey, item.value.validated]));
   for (const entry of voucherEntries) {
     const readKey = `${process.platform === "win32" ? entry.voucherPath.toLowerCase() : entry.voucherPath}\u0000${entry.voucherSha256}`;
     entry.validated = voucherRuntimeByReadKey.get(readKey);
+  }
   }
 
   const referencedTransactionKeys = new Set();
@@ -875,6 +893,9 @@ export async function auditDisbursementManifest({ manifestPath, manifestSha256 }
     closureStatus,
     factsDigest: canonicalDigest(factsCore),
     sourceBindingDigest: canonicalDigest(sourceBindingCore),
+    ...(Array.isArray(options.auditWarnings) && options.auditWarnings.length
+      ? { warnings: Object.freeze(options.auditWarnings.map((entry) => Object.freeze({ ...entry }))) }
+      : {}),
   };
   const bytesByDigest = new Map();
   for (const entry of voucherEntries) {
@@ -887,17 +908,21 @@ export async function auditDisbursementManifest({ manifestPath, manifestSha256 }
     if (!boundSourcePathMap.has(key)) boundSourcePathMap.set(key, resolved);
   };
   addBoundSourcePath(resolvedManifestPath);
-  for (const entry of reimbursementSources) {
-    addBoundSourcePath(entry.originalManifestPath);
-    addBoundSourcePath(entry.publishReceiptPath);
-    for (const filePath of entry.verifiedPublishedSource.originalManifestFilePaths) addBoundSourcePath(filePath);
-    for (const binding of entry.verifiedPublishedSource.artifactBindings) addBoundSourcePath(binding.path);
+  if (options.prepared) {
+    for (const filePath of options.prepared.boundSourcePaths) addBoundSourcePath(filePath);
+  } else {
+    for (const entry of reimbursementSources) {
+      addBoundSourcePath(entry.originalManifestPath);
+      addBoundSourcePath(entry.publishReceiptPath);
+      for (const filePath of entry.verifiedPublishedSource.originalManifestFilePaths) addBoundSourcePath(filePath);
+      for (const binding of entry.verifiedPublishedSource.artifactBindings) addBoundSourcePath(binding.path);
+    }
+    for (const entry of salaryArtifacts) {
+      addBoundSourcePath(entry.artifactPath);
+      addBoundSourcePath(entry.certificatePath);
+    }
+    for (const entry of voucherEntries) addBoundSourcePath(entry.voucherPath);
   }
-  for (const entry of salaryArtifacts) {
-    addBoundSourcePath(entry.artifactPath);
-    addBoundSourcePath(entry.certificatePath);
-  }
-  for (const entry of voucherEntries) addBoundSourcePath(entry.voucherPath);
   const boundSourcePaths = Object.freeze([...boundSourcePathMap.values()].sort((left, right) => left.localeCompare(right)));
   Object.defineProperty(result, "runtime", {
     configurable: false,
@@ -906,4 +931,41 @@ export async function auditDisbursementManifest({ manifestPath, manifestSha256 }
     writable: false,
   });
   return Object.freeze(result);
+}
+
+export async function auditDisbursementManifest({ manifestPath, manifestSha256 }) {
+  const resolvedManifestPath = absolutePath(manifestPath, "manifestPath");
+  const expectedManifestSha256 = sha(manifestSha256, "manifestSha256");
+  const manifestSnapshot = await readStableUtf8JsonFile(resolvedManifestPath, { maxBytes: MAX_JSON_BYTES });
+  if (manifestSnapshot.sha256 !== expectedManifestSha256) fail("manifest SHA-256 differs from the request binding.");
+  const version = dispatchDisbursementManifestVersion(manifestSnapshot.value);
+  if (version === 1) {
+    return auditDisbursementManifestV1({ manifestPath: resolvedManifestPath, manifestSha256: expectedManifestSha256 }, {
+      manifestSnapshot,
+      auditWarnings: [{
+        code: "DISBURSEMENT_MANIFEST_V1_DEPRECATED",
+        message: "Manifest v1 remains supported but is deprecated; use strict manifest v2 for new archive tasks.",
+      }],
+    });
+  }
+  const normalized = validateDisbursementManifestV2(manifestSnapshot.value);
+  const { prepareDisbursementManifestV2Audit } = await import("./disbursement_manifest_v2_auditor.mjs");
+  const prepared = await prepareDisbursementManifestV2Audit(normalized, {
+    validateBoundBinary: validateBoundDisbursementBinary,
+  });
+  const compatibilityRaw = {
+    kind: DISBURSEMENT_MANIFEST_KIND,
+    version: 1,
+    batch: structuredClone(normalized.batch),
+    reimbursementSources: [],
+    salaryArtifacts: [],
+    vouchers: [],
+    rows: structuredClone(normalized.rows),
+    expected: structuredClone(normalized.expected),
+  };
+  return auditDisbursementManifestV1({ manifestPath: resolvedManifestPath, manifestSha256: expectedManifestSha256 }, {
+    manifestSnapshot,
+    rawOverride: compatibilityRaw,
+    prepared,
+  });
 }

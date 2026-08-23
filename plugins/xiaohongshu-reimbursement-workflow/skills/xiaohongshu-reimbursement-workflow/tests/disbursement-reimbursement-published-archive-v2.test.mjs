@@ -214,7 +214,7 @@ async function createReceipt(root, bindings, overrides = {}) {
     affectedProfileIds: ["xiaohongshu"],
     outputs: [{
       profileId: "xiaohongshu",
-      root: bindings.snapshot,
+      root: overrides.reuseSnapshotAsRoot ? bindings.snapshot : bindings.root,
       detail: bindings.detail,
       screenshot: bindings.screenshot,
       summary: bindings.summary,
@@ -225,7 +225,11 @@ async function createReceipt(root, bindings, overrides = {}) {
     }],
     postPublishAuditDigest: crypto.createHash("sha256").update("post publish audit").digest("hex"),
   };
-  const receipt = { ...receiptCore, receiptDigest: overrides.invalidDigest ? "0".repeat(64) : canonicalDigest(receiptCore) };
+  const receipt = {
+    ...receiptCore,
+    receiptDigest: overrides.invalidDigest ? "0".repeat(64) : canonicalDigest(receiptCore),
+    cleanup: { removed: true, preserved: [], failures: [] },
+  };
   return writeJson(path.join(root, overrides.filename ?? "ordinary-receipt.json"), receipt);
 }
 
@@ -243,17 +247,21 @@ async function createFixture() {
   const evidenceDirectory = path.join(archiveRoot, "报销截图", "小红书报销");
   const evidence = await copyBound(presentation.evidenceArchive[0], path.join(evidenceDirectory, presentation.evidenceArchive[0].finalName));
   const snapshot = await createSnapshot(detail, path.join(archiveRoot, "小红书支出总表_截至2031.4.15.xlsx"));
+  const registry = await loadProfileRegistry();
+  const rootWorkbook = await copyBound(snapshot, path.join(root, registry.profiles.xiaohongshu.canonicalRootWorkbookName));
   await fs.rm(presentationBuild.stagingRoot, { recursive: true, force: true });
 
   const duplicateSummary = await copyBound(summary, path.join(archiveRoot, "2031.4.10-2031.4.15_小红书报销_报销文字说明（含伪补报）.txt"));
   const unknown = await writeBytes(path.join(archiveRoot, "未知归档说明.txt"), Buffer.from("unknown\n", "utf8"));
   const extraEvidence = await writeBytes(path.join(evidenceDirectory, "999_额外_凭证_1_2031-04-10.png"), await makePng(220, 40, 80));
-  const originalManifest = await createOriginalManifest(root, snapshot, evidence);
-  const conflictingManifest = await createOriginalManifest(root, snapshot, evidence, { filename: "ordinary-manifest-conflict.json", transactionPerson: "冲突人员" });
-  const receiptBindings = { detail, screenshot, summary, supplement, evidence, snapshot };
+  const attestationOnlyBaseline = await writeBytes(path.join(root, "attestation-only-baseline.xlsx"), Buffer.from("no-follow baseline bytes\n", "utf8"));
+  const originalManifest = await createOriginalManifest(root, attestationOnlyBaseline, originalEvidence);
+  const conflictingManifest = await createOriginalManifest(root, attestationOnlyBaseline, originalEvidence, { filename: "ordinary-manifest-conflict.json", transactionPerson: "冲突人员" });
+  const receiptBindings = { root: rootWorkbook, detail, screenshot, summary, supplement, evidence, snapshot };
   const receipt = await createReceipt(root, receiptBindings);
   const invalidReceipt = await createReceipt(root, receiptBindings, { filename: "ordinary-receipt-invalid.json", invalidDigest: true });
   const conflictingReceipt = await createReceipt(root, receiptBindings, { filename: "ordinary-receipt-conflict.json", batchId: "conflicting-batch" });
+  const reusedRoleReceipt = await createReceipt(root, receiptBindings, { filename: "ordinary-receipt-reused-role.json", reuseSnapshotAsRoot: true });
 
   const files = [
     sourceFile("SUMMARY", summary, "text"),
@@ -262,6 +270,7 @@ async function createFixture() {
     sourceFile("SNAPSHOT", snapshot, "workbook"),
     sourceFile("SUPPLEMENT", supplement, "workbook"),
     sourceFile("EVIDENCE", evidence, "image"),
+    sourceFile("ROOT", rootWorkbook, "workbook"),
     sourceFile("DUPLICATE-SUMMARY", duplicateSummary, "text"),
     sourceFile("UNKNOWN", unknown, "text"),
     sourceFile("EXTRA-EVIDENCE", extraEvidence, "image"),
@@ -270,6 +279,7 @@ async function createFixture() {
     sourceFile("RECEIPT", receipt, "json", "publish_receipt_attestation"),
     sourceFile("INVALID-RECEIPT", invalidReceipt, "json", "publish_receipt_attestation"),
     sourceFile("CONFLICTING-RECEIPT", conflictingReceipt, "json", "publish_receipt_attestation"),
+    sourceFile("REUSED-ROLE-RECEIPT", reusedRoleReceipt, "json", "publish_receipt_attestation"),
   ];
   return {
     root,
@@ -287,7 +297,10 @@ function request({
   fileOverrides = {},
 } = {}) {
   const attestationIds = attestations ? Object.values(attestations) : [];
-  const declaredIds = [...inputFileIds, ...attestationIds];
+  const effectiveInputFileIds = attestations?.receiptFileId && !inputFileIds.includes("ROOT")
+    ? [...inputFileIds, "ROOT"]
+    : [...inputFileIds];
+  const declaredIds = [...effectiveInputFileIds, ...attestationIds];
   const sourceFiles = declaredIds.map((id) => ({ ...fixture.filesById.get(id), ...(fileOverrides[id] ?? {}) }));
   return {
     sourceFiles,
@@ -295,7 +308,7 @@ function request({
       id: "SOURCE-XHS",
       profileId: "xiaohongshu",
       mode: "published_archive",
-      inputFileIds: [...inputFileIds],
+      inputFileIds: effectiveInputFileIds,
       ...(attestations ? { attestations: { ...attestations } } : {}),
     }],
     reimbursementReviews: [{
@@ -404,18 +417,26 @@ test("archived evidence not referenced by screenshot media is rejected", async (
   );
 });
 
-test("original manifest attestation is independently optional and fresh validated", async () => {
+test("original manifest attestation is independently optional and validated no-follow against archive facts", async () => {
   const result = await auditDisbursementReimbursementSourcesV2(request({ attestations: { originalManifestFileId: "ORIGINAL-MANIFEST" } }));
   assert.equal(result.sources[0].attestations.originalManifest.fileId, "ORIGINAL-MANIFEST");
+  assert.equal(result.sources[0].attestations.originalManifest.referencedPathsFollowed, false);
   assert.equal(result.sources[0].attestations.receipt, undefined);
   assert.equal(result.sources[0].reviewBoundFacts[0].corroboration, "original_manifest_attestation");
 });
 
-test("receipt attestation is independently optional and binds only explicit paths", async () => {
+test("real publisher receipt shape with post-digest cleanup is accepted and binds only explicit paths", async () => {
   const result = await auditDisbursementReimbursementSourcesV2(request({ attestations: { receiptFileId: "RECEIPT" } }));
   assert.equal(result.sources[0].attestations.receipt.fileId, "RECEIPT");
   assert.equal(result.sources[0].attestations.originalManifest, undefined);
   assert.equal(result.sources[0].attestations.receipt.artifactBindings.length, 7);
+});
+
+test("receipt root and snapshot roles cannot reuse one path or file identity", async () => {
+  await assert.rejects(
+    () => auditDisbursementReimbursementSourcesV2(request({ attestations: { receiptFileId: "REUSED-ROLE-RECEIPT" } })),
+    /root path has archive role snapshot|reuses an artifact file already assigned/u,
+  );
 });
 
 test("both optional attestations can corroborate one reconstructed archive", async () => {

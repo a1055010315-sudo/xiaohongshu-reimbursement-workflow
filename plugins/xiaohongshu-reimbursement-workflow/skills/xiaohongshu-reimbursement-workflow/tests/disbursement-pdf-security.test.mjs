@@ -277,7 +277,7 @@ test("real pypdf AES-256 PDF with empty user password is rejected by the real ar
       },
     );
     await assert.rejects(fs.access(path.join(root, fixture.expectedBatchName)), /ENOENT/u);
-    await fs.access(path.join(root, `codex-xhs-disbursement-${stagingToken}`));
+    await assert.rejects(fs.access(path.join(root, `codex-xhs-disbursement-${stagingToken}`)), /ENOENT/u);
   } finally {
     await fs.rm(root, { recursive: true, force: true });
   }

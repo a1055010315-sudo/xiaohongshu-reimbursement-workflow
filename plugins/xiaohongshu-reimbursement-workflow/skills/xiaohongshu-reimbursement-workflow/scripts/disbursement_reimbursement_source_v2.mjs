@@ -788,18 +788,16 @@ async function loadBoundSourceFile(file, field) {
   return loaded;
 }
 
-async function auditOriginalManifestAttestation(binding, source, review, profile, explicitPathKeys) {
-  const raw = object(binding.json, "original manifest attestation");
-  for (const [index, file] of array(raw.files, "original manifest attestation.files").entries()) {
-    const declaredPath = path.resolve(text(file?.path, `original manifest attestation.files[${index}].path`));
-    if (!explicitPathKeys.has(pathKey(declaredPath))) {
-      fail(`original manifest attestation references undeclared source path ${declaredPath}.`);
-    }
-  }
+async function auditOriginalManifestAttestation(binding, source, review, profile) {
+  object(binding.json, "original manifest attestation");
   let stdout;
   let stderr;
   try {
-    ({ stdout, stderr } = await execFileAsync(process.execPath, [ORDINARY_MANIFEST_AUDITOR, binding.path], {
+    ({ stdout, stderr } = await execFileAsync(process.execPath, [
+      ORDINARY_MANIFEST_AUDITOR,
+      binding.path,
+      "--defer-ordinary-file-verification",
+    ], {
       encoding: "utf8",
       shell: false,
       windowsHide: true,
@@ -813,7 +811,7 @@ async function auditOriginalManifestAttestation(binding, source, review, profile
   const lines = stdout.split(/\r?\n/u).filter(Boolean);
   if (lines.length !== 1) fail("original manifest attestation auditor must return one JSON line.");
   const audit = parseStrictJson(lines[0]);
-  if (audit.ok !== true || audit.fileVerificationMode !== "manifest-auditor" || audit.manifestFileSha256 !== binding.sha256) {
+  if (audit.ok !== true || audit.fileVerificationMode !== "bound-builders" || audit.manifestFileSha256 !== binding.sha256) {
     fail("original manifest attestation audit binding is incomplete or changed.");
   }
   if (!audit.affectedProfileIds.includes(source.profileId)) fail("original manifest attestation does not include the reimbursement profile.");
@@ -827,7 +825,14 @@ async function auditOriginalManifestAttestation(binding, source, review, profile
     .map((item) => ({ id: item.id, date: item.date, person: item.person, reimbursementAmount: canonicalAmount(item.reimbursementAmount, `${item.id}.reimbursementAmount`) }))
     .sort((left, right) => left.id.localeCompare(right.id));
   if (canonicalDigest(transactions) !== canonicalDigest(expected)) fail("original manifest attestation transactions conflict with reconstructed/sourceReview facts.");
-  return { fileId: binding.fileId, sha256: binding.sha256, manifestDigest: audit.manifestDigest, affectedProfileIds: [...audit.affectedProfileIds] };
+  return {
+    fileId: binding.fileId,
+    sha256: binding.sha256,
+    manifestDigest: audit.manifestDigest,
+    affectedProfileIds: [...audit.affectedProfileIds],
+    mode: "v3-structure-and-archive-facts-no-follow",
+    referencedPathsFollowed: false,
+  };
 }
 
 function receiptBinding(value, field) {
@@ -852,9 +857,13 @@ function expectedArtifactRole(receiptRole) {
 
 function auditReceiptAttestation(binding, source, review, roles, loadedByPath, manifestAttestation) {
   const receipt = object(binding.json, "publish receipt attestation");
+  exact(receipt,
+    new Set(["kind", "batchId", "affectedProfileIds", "outputs", "postPublishAuditDigest", "receiptDigest"]),
+    new Set(["cleanup"]), "publish receipt attestation");
   if (receipt.kind !== "ordinary-reimbursement-published-v1") fail("publish receipt attestation kind is invalid.");
   const digest = sha(receipt.receiptDigest, "publish receipt attestation.receiptDigest");
-  if (canonicalDigest(without(receipt, "receiptDigest")) !== digest) fail("publish receipt attestation digest is invalid.");
+  if (canonicalDigest(without(receipt, "receiptDigest", "cleanup")) !== digest) fail("publish receipt attestation digest is invalid.");
+  if (receipt.cleanup !== undefined) object(receipt.cleanup, "publish receipt attestation.cleanup");
   if (receipt.batchId !== review.facts.batchId || !Array.isArray(receipt.affectedProfileIds) || !receipt.affectedProfileIds.includes(source.profileId)) {
     fail("publish receipt attestation does not bind sourceReview batch/profile.");
   }
@@ -865,13 +874,21 @@ function auditReceiptAttestation(binding, source, review, roles, loadedByPath, m
   if (outputs.length !== 1) fail("publish receipt attestation must contain exactly one output for the profile.");
   const flattened = flattenReceiptOutput(outputs[0]);
   const resolved = [];
+  const seenFileIds = new Set();
+  const seenPaths = new Set();
   for (const item of flattened) {
     const loaded = loadedByPath.get(pathKey(item.path));
     if (!loaded) fail(`publish receipt attestation references undeclared artifact path ${item.path}.`);
     if (loaded.sha256 !== item.sha256) fail(`publish receipt attestation ${item.receiptRole} SHA conflicts with explicit source file.`);
+    const identity = pathKey(loaded.path);
+    if (seenFileIds.has(loaded.fileId) || seenPaths.has(identity)) {
+      fail(`publish receipt attestation ${item.receiptRole} reuses an artifact file already assigned to another receipt role.`);
+    }
+    seenFileIds.add(loaded.fileId);
+    seenPaths.add(identity);
     const actualRole = Object.entries(roles).find(([, values]) => Array.isArray(values) && values.includes(loaded))?.[0] ?? null;
     const wantedRole = expectedArtifactRole(item.receiptRole);
-    if (!(wantedRole === "root" && (actualRole === "root" || actualRole === "snapshot")) && actualRole !== wantedRole) {
+    if (actualRole !== wantedRole) {
       fail(`publish receipt attestation ${item.receiptRole} path has archive role ${actualRole ?? "unknown"}.`);
     }
     resolved.push({ receiptRole: item.receiptRole, fileId: loaded.fileId, path: loaded.path, sha256: loaded.sha256 });
@@ -887,6 +904,10 @@ function auditReceiptAttestation(binding, source, review, roles, loadedByPath, m
   ]);
   const receiptFileIds = new Set(resolved.map((item) => item.fileId));
   for (const fileId of archiveFileIds) if (!receiptFileIds.has(fileId)) fail(`publish receipt attestation omits explicit archive artifact ${fileId}.`);
+  for (const fileId of receiptFileIds) if (!archiveFileIds.has(fileId)) fail(`publish receipt attestation includes non-archive artifact ${fileId}.`);
+  if (receiptFileIds.size !== archiveFileIds.size || resolved.length !== archiveFileIds.size) {
+    fail("publish receipt attestation artifact roles do not close one-to-one over the explicit published output set.");
+  }
   return { fileId: binding.fileId, sha256: binding.sha256, receiptDigest: digest, artifactBindings: resolved };
 }
 
@@ -961,10 +982,9 @@ async function auditPublishedArchiveSource(source, review, fileById, registry) {
   await validateScreenshotWorkbook(roles.screenshot[0], detail, profile, roles.evidence);
   validateSummary(roles.summary[0], detail, supplements, profile, period);
   validateSnapshot(roles.snapshot[0], detail, profile, period);
-  const explicitPathKeys = new Set(loaded.map((item) => pathKey(item.path)));
   let originalManifest = null;
   if (source.attestations?.originalManifestFileId) {
-    originalManifest = await auditOriginalManifestAttestation(loadedById.get(source.attestations.originalManifestFileId), source, review, profile, explicitPathKeys);
+    originalManifest = await auditOriginalManifestAttestation(loadedById.get(source.attestations.originalManifestFileId), source, review, profile);
   }
   let receipt = null;
   if (source.attestations?.receiptFileId) {
