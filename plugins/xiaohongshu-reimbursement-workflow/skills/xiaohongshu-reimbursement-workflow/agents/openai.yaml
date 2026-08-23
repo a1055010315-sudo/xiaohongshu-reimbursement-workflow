@@ -1,0 +1,6 @@
+interface:
+  display_name: "三类报销局部增量工作流"
+  short_description: "三类报销局部发布与独立发放归档"
+  default_prompt: "使用 $xiaohongshu-reimbursement-workflow 处理本批小红书、公司或驻所的普通报销或补报；普通流程只生成本批局部候选并经两道门禁发布。仅当我明确要求发放归档时，才使用独立单次归档模式核对报销、工资和发放凭证，无需额外确认口令，直接生成并复核简洁三项归档。"
+policy:
+  allow_implicit_invocation: false

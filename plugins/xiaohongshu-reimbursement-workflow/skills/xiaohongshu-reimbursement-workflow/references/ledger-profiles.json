@@ -1,0 +1,71 @@
+{
+  "schemaVersion": 1,
+  "profileOrder": [
+    "xiaohongshu",
+    "company",
+    "residence"
+  ],
+  "profiles": {
+    "xiaohongshu": {
+      "targetCategory": "小红书报销",
+      "categoryAliases": [
+        "小红书",
+        "小红书报销"
+      ],
+      "canonicalRootWorkbookName": "小红书支出总表.xlsx",
+      "rootWorkbookInputNames": [
+        "小红书支出总表.xlsx"
+      ],
+      "managedRootSheetName": "Sheet1",
+      "managedRootSheetInputNames": [
+        "Sheet1"
+      ],
+      "detailSheetName": "本次报销明细",
+      "screenshotMapSheetName": "小红书报销",
+      "archiveStem": "小红书支出总表",
+      "preserveUnmanagedSheets": true
+    },
+    "company": {
+      "targetCategory": "公司报销",
+      "categoryAliases": [
+        "公司",
+        "公司报销"
+      ],
+      "canonicalRootWorkbookName": "公司支出总表.xlsx",
+      "rootWorkbookInputNames": [
+        "公司支出总表.xlsx"
+      ],
+      "managedRootSheetName": "公司支出",
+      "managedRootSheetInputNames": [
+        "公司支出"
+      ],
+      "detailSheetName": "本次报销明细",
+      "screenshotMapSheetName": "公司报销",
+      "archiveStem": "公司支出总表",
+      "preserveUnmanagedSheets": true
+    },
+    "residence": {
+      "targetCategory": "驻所报销",
+      "categoryAliases": [
+        "驻所",
+        "驻所报销",
+        "住所",
+        "住所报销"
+      ],
+      "canonicalRootWorkbookName": "驻所支出.xlsx",
+      "rootWorkbookInputNames": [
+        "驻所支出.xlsx",
+        "住所支出.xlsx"
+      ],
+      "managedRootSheetName": "驻所支出",
+      "managedRootSheetInputNames": [
+        "驻所支出",
+        "住所支出"
+      ],
+      "detailSheetName": "本次报销明细",
+      "screenshotMapSheetName": "住所报销",
+      "archiveStem": "驻所支出",
+      "preserveUnmanagedSheets": true
+    }
+  }
+}

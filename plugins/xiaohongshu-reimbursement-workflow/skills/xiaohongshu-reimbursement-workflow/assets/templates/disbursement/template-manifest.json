@@ -1,0 +1,136 @@
+{
+  "schemaVersion": 1,
+  "contractId": "compact-disbursement-template-v1",
+  "templates": {
+    "compact-disbursement": {
+      "file": "compact-disbursement.xlsx",
+      "sha256": "d2ef7985037f7f9a0d0e1d49f8ba6c090ac105885608cfecc5c69727bae7bc7d",
+      "sheetName": "发放核对表",
+      "worksheetCount": 1,
+      "visibleWorksheetCount": 1,
+      "hiddenWorksheetCount": 0,
+      "headerRow": 16,
+      "dataStartRow": 17,
+      "dataEndRow": 46,
+      "summaryRow": 47,
+      "requiredHeaders": [
+        "姓名/事项",
+        "小红书报销",
+        "公司报销",
+        "驻所报销",
+        "工资类别",
+        "工资",
+        "应发合计",
+        "实际发放",
+        "方式",
+        "状态",
+        "凭证/备注"
+      ],
+      "visibleStatuses": [
+        "已核销",
+        "待凭证",
+        "待现金确认",
+        "异常待说明",
+        "非本批",
+        "已忽略尾差"
+      ],
+      "columns": [
+        {
+          "min": 1,
+          "max": 1,
+          "width": 18
+        },
+        {
+          "min": 2,
+          "max": 2,
+          "width": 13
+        },
+        {
+          "min": 3,
+          "max": 3,
+          "width": 13
+        },
+        {
+          "min": 4,
+          "max": 4,
+          "width": 13
+        },
+        {
+          "min": 5,
+          "max": 5,
+          "width": 13
+        },
+        {
+          "min": 6,
+          "max": 6,
+          "width": 13
+        },
+        {
+          "min": 7,
+          "max": 7,
+          "width": 14
+        },
+        {
+          "min": 8,
+          "max": 8,
+          "width": 14
+        },
+        {
+          "min": 9,
+          "max": 9,
+          "width": 12
+        },
+        {
+          "min": 10,
+          "max": 10,
+          "width": 16
+        },
+        {
+          "min": 11,
+          "max": 11,
+          "width": 32
+        }
+      ],
+      "styleRoles": {
+        "title": 21,
+        "subtitle": 23,
+        "header": 25,
+        "text": 27,
+        "amount": 28,
+        "status": 29,
+        "summaryLabel": 31,
+        "summaryAmount": 32
+      },
+      "moneyNumberFormat": "0.000",
+      "layoutPolicy": {
+        "showGridLines": false,
+        "freezePane": {
+          "ySplit": 16,
+          "topLeftCell": "A17"
+        },
+        "requiredMerges": [
+          "A1:K1",
+          "A3:K3",
+          "A15:K15"
+        ],
+        "autoFilter": "A16:K46",
+        "printArea": "A1:K47",
+        "repeatHeaderRow": 16,
+        "orientation": "landscape",
+        "paperSize": "A4",
+        "fitToWidthPages": 1,
+        "fitToHeightPages": 2
+      },
+      "partSha256": {
+        "xl/styles.xml": "7e38478e2493fdd13abd52793ec7a471688e11a8927750e9e3f18842c013316d",
+        "xl/theme/theme1.xml": "d15e8ebf78ef7b9720839d7ae8fdc81a7df5bc24706d8e137df61a5683c358d9",
+        "xl/worksheets/sheet1.xml": "86c1580255b0b7b6c6655b139e0bd5cd435dba7d73805b446c3b736955f38e9d",
+        "xl/workbook.xml": "f81e98e3ed3538a23278381080a3cf8bb9c74359bb16ea553a223236dac204f0"
+      },
+      "contractRoleSignaturesDigest": "5a9b7ca4ff18a21e8b0b9c8e5e4742c26c1d2dc4bfaf2a5fc6dee16c927c8c57",
+      "styleRolesDigest": "db04d0f0def0c917b6c2945d367a2b3e614ffc6da28ef285581af51b6c8285a5",
+      "layoutDigest": "6b69eb3c4556b14a3970efc586f9a1c3503108a3a9903c6ccc748827fb5ccf01",
+      "styleBindingDigest": "25ab57fef4b534c446a78051f9fdf90dea2ef21b8d1e49ce09bd1466fabacb07"
+    }
+  }
+}
