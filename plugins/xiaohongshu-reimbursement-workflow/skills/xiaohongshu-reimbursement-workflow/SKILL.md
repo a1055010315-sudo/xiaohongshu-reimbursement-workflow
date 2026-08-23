@@ -1,6 +1,6 @@
 ---
 name: xiaohongshu-reimbursement-workflow
-description: "Process Xiaohongshu, company, or residence reimbursement batches and supplements from one manifest, or explicitly build a compact downstream disbursement archive from already audited reimbursement facts, final salary artifacts, payment evidence, and human disposition decisions. Use for 小红书报销、公司报销、驻所/住所报销、补报、续跑、终审、发布或发放归档. Historical ledger correction and compact disbursement are separate explicit modes and are never invoked by ordinary reimbursement."
+description: "Process Xiaohongshu, company, or residence reimbursement batches and supplements, or explicitly build a compact downstream disbursement archive from user-identified published reimbursement artifacts or fresh evidence, final salary materials, payout vouchers, and disposition decisions. Use for 小红书报销、公司报销、驻所/住所报销、补报、续跑、终审、发布或发放归档. Historical ledger correction and compact disbursement are separate explicit modes and are never invoked by ordinary reimbursement."
 ---
 
 # 报销工作流
@@ -9,7 +9,7 @@ description: "Process Xiaohongshu, company, or residence reimbursement batches a
 
 - 普通新增或补报：只用 `scripts/run_reimbursement_workflow.mjs`。
 - 普通交付物使用 `assets/templates/xiaohongshu/` 中经 SHA256 校验的脱敏模板；模板数据区不预置业务合并，成品投影阶段可按真实业务数据恢复必要合并和明确行高规则。
-- 发放归档：只有用户明确提出“生成/更新发放归档”时才读 [简洁发放归档](references/compact-disbursement.md)，并只用独立入口 `scripts/run_compact_disbursement_workflow.mjs --archive <request.json>`。请求 kind 为 `compact-disbursement-archive-v1`，严格只含 `kind/stagingToken/manifestPath/manifestSha256`；一次完成 fresh 复核、候选、原子发布、最终三项复核和清理，不设置人工 Gate、不索取确认口令。普通报销不得导入发放模块、扫描工资目录或读取发放凭证。
+- 发放归档：只有用户明确提出时才读 [简洁发放归档](references/compact-disbursement.md)，并使用独立 `--archive` 入口。用户从明确业务材料开始；当前任务内部生成 `sourceReview`、默认 v2 manifest 和严格四字段 request，不索取原 manifest、publish receipt、工资 certificate 或内部 JSON，也不寻找 sidecar。图片和未冻结工资 schema 的工作簿保持 review-bound；歧义先询问，不声称机械 OCR 或金额解析。一次调用完成完整安全链，不设人工 Gate；manifest v1 仅严格兼容一个发布周期并返回弃用 warning。普通报销不得导入发放模块、扫描工资目录或读取发放凭证。
 - 历史总表修复或重排：只有用户明确提出时才读 [历史修正规则](references/ledger-business-correction.md)，并使用隔离的 ledger-reorder 脚本。
 - 用户只要求检查或修改本 skill/plugin 时，不得读取、生成或修改任何报销文件。
 - 普通模式绝不调用全表历史维护链，也不因历史空行、G/H 内容、共享公式、WPS 元数据或 `mc:AlternateContent` 拒绝本批。

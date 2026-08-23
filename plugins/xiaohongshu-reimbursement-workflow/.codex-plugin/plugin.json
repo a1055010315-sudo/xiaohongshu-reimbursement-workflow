@@ -1,7 +1,7 @@
 {
   "name": "xiaohongshu-reimbursement-workflow",
   "version": "0.5.0+codex.20260822170308",
-  "description": "Template-bound Xiaohongshu, company, and residence reimbursement workflow with one-pass evidence binding, batch-local ledger patches, two approval gates, recoverable publishing, and an explicit downstream compact disbursement archive mode.",
+  "description": "Template-bound Xiaohongshu, company, and residence reimbursement workflow with two approval gates for ordinary reimbursements and an explicit one-pass compact disbursement archive built from user-identified business materials and task-internal review manifests.",
   "author": {
     "name": "a1055010315-sudo",
     "url": "https://github.com/a1055010315-sudo"
@@ -19,7 +19,7 @@
   "interface": {
     "displayName": "\u4e09\u7c7b\u62a5\u9500\u5c40\u90e8\u589e\u91cf\u5de5\u4f5c\u6d41",
     "shortDescription": "\u4e09\u7c7b\u62a5\u9500\u5c40\u90e8\u53d1\u5e03\u4e0e\u72ec\u7acb\u53d1\u653e\u5f52\u6863",
-    "longDescription": "\u5c0f\u7ea2\u4e66\u3001\u516c\u53f8\u548c\u9a7b\u6240\u62a5\u9500\u5171\u7528\u4e00\u5957\u8131\u654f\u6a21\u677f\u4e0e\u6210\u54c1\u6295\u5f71\u5206\u5c42\u6d41\u7a0b\uff1a\u6750\u6599\u53ea\u6536\u96c6\u4e00\u6b21\uff0c\u53ea\u628a\u672c\u6279\u65b0\u589e\u6216\u8865\u62a5\u5c40\u90e8\u5199\u5165\u5019\u9009\u603b\u8868\uff0c\u901a\u8fc7\u4e24\u9053\u95e8\u7981\u548c\u53ef\u6062\u590d\u539f\u5b50\u53d1\u5e03\u5b8c\u6210\u4ea4\u4ed8\u3002\u7528\u6237\u660e\u786e\u8981\u6c42\u53d1\u653e\u5f52\u6863\u65f6\uff0c\u72ec\u7acb\u6a21\u5f0f\u518d\u6838\u5bf9\u5df2\u5ba1\u8ba1\u62a5\u9500\u4e8b\u5b9e\u3001\u5de5\u8d44\u6700\u7ec8\u4ef6\u548c\u4ed8\u6b3e\u51ed\u8bc1\uff0c\u4ec5\u751f\u6210\u8bf4\u660e\u3001\u5355\u5de5\u4f5c\u8868\u6838\u5bf9\u8868\u548c\u51ed\u8bc1\u76ee\u5f55\u3002\u666e\u901a\u62a5\u9500\u4e0d\u52a0\u8f7d\u8be5\u6a21\u5f0f\u3001\u4e0d\u626b\u63cf\u5de5\u8d44\u6216\u53d1\u653e\u6587\u4ef6\u3002",
+    "longDescription": "小红书、公司和驻所报销共用一套脱敏模板与成品投影分层流程：材料只收集一次，只把本批新增或补报局部写入候选总表，通过两道门禁和可恢复原子发布完成交付。用户明确要求发放归档时，独立模式直接从用户指明的已发布报销成品或 fresh 证据、工资最终件、发放凭证和处置决定开始，由当前任务内部生成复核与 manifest，通过单次无人工 Gate 安全链生成说明、单工作表核对表和凭证目录。普通报销不加载该模式、不扫描工资或发放文件。",
     "developerName": "a1055010315-sudo",
     "category": "Productivity",
     "capabilities": [
@@ -30,7 +30,7 @@
     "defaultPrompt": [
       "\u5904\u7406\u672c\u6279\u5c0f\u7ea2\u4e66\u3001\u516c\u53f8\u6216\u9a7b\u6240\u62a5\u9500\uff0c\u53ea\u751f\u6210\u672c\u6279\u6210\u54c1\u548c\u5c40\u90e8\u5019\u9009\u603b\u8868\u3002",
       "\u6309\u5df2\u6709 manifest \u548c\u54c8\u5e0c\u7ee7\u7eed\u672c\u6279\u62a5\u9500\uff0c\u4e0d\u91cd\u590d\u8bc6\u522b\u672a\u53d8\u5316\u56fe\u7247\u3002",
-      "\u663e\u5f0f\u751f\u6210\u53d1\u653e\u5f52\u6863\uff0c\u5c06\u5df2\u5ba1\u8ba1\u62a5\u9500\u3001\u5de5\u8d44\u6700\u7ec8\u4ef6\u548c\u53d1\u653e\u51ed\u8bc1\u6838\u5bf9\u4e3a\u7b80\u6d01\u4e09\u9879\u76ee\u5f55\u3002"
+      "\u663e\u5f0f\u751f\u6210\u53d1\u653e\u5f52\u6863\uff0c\u76f4\u63a5\u4ece\u6211\u6307\u660e\u7684\u5df2\u53d1\u5e03\u62a5\u9500\u6210\u54c1\u6216 fresh \u8bc1\u636e\u3001\u5de5\u8d44\u6700\u7ec8\u4ef6\u3001\u53d1\u653e\u51ed\u8bc1\u548c\u5904\u7f6e\u51b3\u5b9a\u5f00\u59cb\uff0c\u7531\u5f53\u524d\u4efb\u52a1\u5185\u90e8\u751f\u6210\u590d\u6838\u4e0e manifest\uff0c\u4e0d\u8981\u6c42\u6211\u51c6\u5907\u539f manifest\u3001publish receipt \u6216\u5de5\u8d44 certificate\u3002"
     ],
     "brandColor": "#E94B64",
     "websiteURL": "https://github.com/a1055010315-sudo/xiaohongshu-reimbursement-workflow"
