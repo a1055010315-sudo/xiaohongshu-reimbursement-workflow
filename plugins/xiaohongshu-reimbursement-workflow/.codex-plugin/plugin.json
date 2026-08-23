@@ -1,7 +1,7 @@
 {
   "name": "xiaohongshu-reimbursement-workflow",
-  "version": "0.5.0+codex.20260819121632",
-  "description": "Shared profile-driven Xiaohongshu, company, and residence reimbursement workflow with source binding, independent OOXML audit, two approval gates, and recoverable publishing.",
+  "version": "0.5.0+codex.20260823144931",
+  "description": "Template-bound Xiaohongshu, company, and residence reimbursement workflow with two approval gates for ordinary reimbursements and an explicit one-pass compact disbursement archive built from user-identified business materials and task-internal review manifests.",
   "author": {
     "name": "a1055010315-sudo",
     "url": "https://github.com/a1055010315-sudo"
@@ -17,9 +17,9 @@
   ],
   "skills": "./skills/",
   "interface": {
-    "displayName": "\u4e09\u7c7b\u62a5\u9500\u5171\u4eab\u5f52\u6863\u5de5\u4f5c\u6d41",
-    "shortDescription": "\u5c0f\u7ea2\u4e66\u3001\u516c\u53f8\u3001\u9a7b\u6240\u62a5\u9500\u7684\u5171\u4eab\u6784\u5efa\u3001\u5ba1\u8ba1\u548c\u53d7\u63a7\u53d1\u5e03",
-    "longDescription": "\u5c0f\u7ea2\u4e66\u3001\u516c\u53f8\u548c\u9a7b\u6240\u5171\u7528\u4e00\u5957 profile \u9a71\u52a8\u6d41\u7a0b\uff1b\u53ea\u4e3a\u6709\u62a5\u9500\u7684 profile \u751f\u6210\u6839\u8868\u3001\u660e\u7ec6\u548c\u622a\u56fe\u8868\uff0c\u5e76\u901a\u8fc7\u6765\u6e90\u8986\u76d6\u3001\u72ec\u7acb OOXML \u5ba1\u8ba1\u3001\u4e24\u6b21\u4eba\u5de5\u6279\u51c6\u53ca\u53ef\u6062\u590d\u53d1\u5e03\u5b8c\u6210\u4ea4\u4ed8\u3002",
+    "displayName": "\u4e09\u7c7b\u62a5\u9500\u5c40\u90e8\u589e\u91cf\u5de5\u4f5c\u6d41",
+    "shortDescription": "\u4e09\u7c7b\u62a5\u9500\u5c40\u90e8\u53d1\u5e03\u4e0e\u72ec\u7acb\u53d1\u653e\u5f52\u6863",
+    "longDescription": "小红书、公司和驻所报销共用一套脱敏模板与成品投影分层流程：材料只收集一次，只把本批新增或补报局部写入候选总表，通过两道门禁和可恢复原子发布完成交付。用户明确要求发放归档时，独立模式直接从用户指明的已发布报销成品或 fresh 证据、工资最终件、发放凭证和处置决定开始，由当前任务内部生成复核与 manifest，通过单次无人工 Gate 安全链生成说明、单工作表核对表和凭证目录。普通报销不加载该模式、不扫描工资或发放文件。",
     "developerName": "a1055010315-sudo",
     "category": "Productivity",
     "capabilities": [
@@ -28,8 +28,9 @@
       "Write"
     ],
     "defaultPrompt": [
-      "\u5904\u7406\u672c\u6279\u5c0f\u7ea2\u4e66\u3001\u516c\u53f8\u548c\u9a7b\u6240\u62a5\u9500\uff0c\u53ea\u4e3a\u5b9e\u9645\u53d1\u751f\u7684 profile \u751f\u6210\u4e09\u7c7b\u8d22\u52a1\u6210\u54c1\u3002",
-      "\u4ece\u5df2\u6709\u65f6\u95f4\u6bb5\u5f52\u6863\u6587\u4ef6\u5939\u6309\u54c8\u5e0c\u68c0\u67e5\u70b9\u7ee7\u7eed\u4e09\u7c7b\u62a5\u9500\u6d41\u7a0b\u3002"
+      "\u5904\u7406\u672c\u6279\u5c0f\u7ea2\u4e66\u3001\u516c\u53f8\u6216\u9a7b\u6240\u62a5\u9500\uff0c\u53ea\u751f\u6210\u672c\u6279\u6210\u54c1\u548c\u5c40\u90e8\u5019\u9009\u603b\u8868\u3002",
+      "\u6309\u5df2\u6709 manifest \u548c\u54c8\u5e0c\u7ee7\u7eed\u672c\u6279\u62a5\u9500\uff0c\u4e0d\u91cd\u590d\u8bc6\u522b\u672a\u53d8\u5316\u56fe\u7247\u3002",
+      "\u663e\u5f0f\u751f\u6210\u53d1\u653e\u5f52\u6863\uff0c\u76f4\u63a5\u4ece\u6211\u6307\u660e\u7684\u5df2\u53d1\u5e03\u62a5\u9500\u6210\u54c1\u6216 fresh \u8bc1\u636e\u3001\u5de5\u8d44\u6700\u7ec8\u4ef6\u3001\u53d1\u653e\u51ed\u8bc1\u548c\u5904\u7f6e\u51b3\u5b9a\u5f00\u59cb\uff0c\u7531\u5f53\u524d\u4efb\u52a1\u5185\u90e8\u751f\u6210\u590d\u6838\u4e0e manifest\uff0c\u4e0d\u8981\u6c42\u6211\u51c6\u5907\u539f manifest\u3001publish receipt \u6216\u5de5\u8d44 certificate\u3002"
     ],
     "brandColor": "#E94B64",
     "websiteURL": "https://github.com/a1055010315-sudo/xiaohongshu-reimbursement-workflow"

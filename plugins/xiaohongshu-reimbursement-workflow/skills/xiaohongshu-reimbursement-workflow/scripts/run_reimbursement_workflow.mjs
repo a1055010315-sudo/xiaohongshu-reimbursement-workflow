@@ -5,23 +5,16 @@ import { constants as fsConstants } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { Worker } from "node:worker_threads";
 
 import { buildGateBinding } from "./build_gate_binding.mjs";
-import { buildReimbursementArtifacts, REIMBURSEMENT_ARTIFACT_BUILD_KIND } from "./build_reimbursement_artifacts.mjs";
-import { auditBatchManifest } from "./audit_batch_manifest.mjs";
-import { EvidenceCache } from "./evidence_cache.mjs";
-import {
-  buildRootWorkbookCandidates,
-  computeRootWorkbookAuditRequestDigest,
-  ROOT_WORKBOOK_AUDIT_REQUEST_KIND,
-  runRootWorkbookAuditWorker,
-  validateRootWorkbookAuditBatch,
-} from "./build_root_workbook_candidate.mjs";
 import { loadProfileRegistry } from "./finance_domain.mjs";
 import { runSafePublish, runSafePublishAsync } from "./run_safe_publish.mjs";
 import {
   canonicalDigest,
   copyStableBinaryBytes,
+  loadBundledDependency,
+  mapSettledLimit,
   parseStrictJson,
   readStableBinaryFile,
   readStableUtf8JsonFile,
@@ -33,23 +26,31 @@ export const WORKFLOW_GATE1_KIND = "ordinary-reimbursement-ready-gate-1-v1";
 export const WORKFLOW_GATE2_KIND = "ordinary-reimbursement-ready-gate-2-v1";
 export const WORKFLOW_RECEIPT_KIND = "ordinary-reimbursement-published-v1";
 export const WORKFLOW_PUBLISH_AUDIT_KIND = "ordinary-reimbursement-publish-audit-v1";
+export const WORKFLOW_READY_PREVIEW_KIND = "ordinary-reimbursement-ready-preview-v1";
 
 const TOKEN_RE = /^[0-9a-f]{64}$/u;
 const SHA_RE = /^[0-9a-f]{64}$/u;
 const MAX_JSON_BYTES = 16 * 1024 * 1024;
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
+const MANIFEST_AUDITOR = path.join(SCRIPT_DIR, "audit_batch_manifest.mjs");
 const PREVIEW_RENDERER = path.join(SCRIPT_DIR, "render_reimbursement_previews.ps1");
 const WORKFLOW_PREFIX = "codex-xhs-workflow-";
-const ROOT_STAGING_PREFIX = "codex-xhs-reimburse-";
-const PRESENTATION_STAGING_PREFIX = "codex-xhs-artifacts-";
 const GATE1_TEXT = "本次报销通过无误";
 const GATE2_TEXT = "确认更新根目录支出总表";
-const PREVIEW_REQUEST_KIND = "ordinary-reimbursement-preview-request-v1";
-const PREVIEW_RESPONSE_KIND = "ordinary-reimbursement-preview-response-v1";
-const PREVIEW_RESULT_KIND = "ordinary-reimbursement-preview-set-v1";
+const PREVIEW_REQUEST_KIND = "ordinary-reimbursement-preview-request-v2";
+const PREVIEW_RESPONSE_KIND = "ordinary-reimbursement-preview-response-v2";
+const PREVIEW_RESULT_KIND = "ordinary-reimbursement-preview-set-v2";
+const FULL_CORRESPONDENCE_AUDIT_KIND = "gate2-full-correspondence-v1";
 const MAX_PREVIEW_BYTES = 32 * 1024 * 1024;
 const MAX_RENDERER_OUTPUT_BYTES = 2 * 1024 * 1024;
 const RENDERER_TIMEOUT_MS = 120_000;
+const PREVIEW_VALIDATION_CONCURRENCY = 3;
+const REIMBURSEMENT_ARTIFACT_BUILD_KIND = "reimbursement-artifact-build-request-v1";
+
+function loadPreviewSharp() {
+  const module = loadBundledDependency("sharp");
+  return module.default ?? module;
+}
 
 function fail(message) {
   throw new Error(`Ordinary Reimbursement Workflow ${message}`);
@@ -88,6 +89,12 @@ function clone(value) {
   return structuredClone(value);
 }
 
+function withoutDigest(value, field) {
+  const result = clone(value);
+  delete result[field];
+  return result;
+}
+
 function samePath(left, right) {
   const normalize = (value) => process.platform === "win32" ? path.resolve(value).toLowerCase() : path.resolve(value);
   return normalize(left) === normalize(right);
@@ -99,16 +106,51 @@ function deriveToken(token, role) {
 
 async function writeExclusiveJson(filePath, value) {
   const bytes = Buffer.from(`${JSON.stringify(value)}\n`, "utf8");
-  const handle = await fs.open(filePath, "wx", 0o600);
+  const expectedSha256 = sha256Bytes(bytes);
+  let created = false;
   try {
-    await handle.writeFile(bytes);
-    await handle.sync();
-  } finally {
-    await handle.close();
+    const handle = await fs.open(filePath, "wx", 0o600);
+    created = true;
+    try {
+      await handle.writeFile(bytes);
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+  } catch (error) {
+    if (created) {
+      try {
+        await fs.unlink(filePath);
+      } catch (cleanupError) {
+        if (cleanupError?.code !== "ENOENT") throw new Error(`${error instanceof Error ? error.message : String(error)}; incomplete exclusive JSON cleanup: ${filePath}`, { cause: error });
+      }
+    }
+    throw error;
   }
-  const stable = await readStableUtf8JsonFile(filePath, { maxBytes: MAX_JSON_BYTES });
-  if (stable.sha256 !== sha256Bytes(bytes)) fail(`${path.basename(filePath)} changed after exclusive write.`);
-  return { path: filePath, sha256: stable.sha256, size: stable.size };
+  // This is a task-owned, exclusive, fsynced write. Consumers independently
+  // re-read against this binding, so an immediate double read adds no durable
+  // protection and only repeats I/O.
+  return { path: filePath, sha256: expectedSha256, size: bytes.length };
+}
+
+function errorHasCode(error, code) {
+  let current = error;
+  const seen = new Set();
+  while (current && typeof current === "object" && !seen.has(current)) {
+    if (current.code === code) return true;
+    seen.add(current);
+    current = current.cause;
+  }
+  return false;
+}
+
+async function readOptionalStableJson(filePath) {
+  try {
+    return await readStableUtf8JsonFile(filePath, { maxBytes: MAX_JSON_BYTES });
+  } catch (error) {
+    if (errorHasCode(error, "ENOENT")) return null;
+    throw error;
+  }
 }
 
 async function assertBoundFile(binding, field) {
@@ -117,11 +159,56 @@ async function assertBoundFile(binding, field) {
   return stable;
 }
 
-async function auditManifest(manifestPath, expectedSha256, evidenceCache) {
-  const result = await auditBatchManifest(manifestPath, { evidenceCache });
-  if (result.ok !== true || result.manifestFileSha256 !== expectedSha256 || !result.reimbursementFactsCertificate) {
-    fail("manifest audit result is incomplete or changed.");
-  }
+function createManifestAuditSession() {
+  const worker = new Worker(pathToFileURL(MANIFEST_AUDITOR), {
+    execArgv: [],
+    workerData: { kind: "ordinary-manifest-audit-session-v1" },
+    resourceLimits: { maxOldGenerationSizeMb: 256, maxYoungGenerationSizeMb: 64 },
+  });
+  let state = "starting"; let fatalError = null; let pending = null; let nextRequestId = 1; let queue = Promise.resolve();
+  let readyResolve; let readyReject;
+  const ready = new Promise((resolve, reject) => { readyResolve = resolve; readyReject = reject; });
+  void ready.catch(() => {});
+  const failSession = (error) => {
+    if (fatalError) return;
+    fatalError = error instanceof Error ? error : new Error(String(error)); state = "closed";
+    if (pending) { clearTimeout(pending.timer); pending.reject(fatalError); pending = null; }
+    else readyReject(fatalError);
+  };
+  worker.on("message", (message) => {
+    if (state === "starting" && message?.kind === "ordinary-manifest-audit-session-ready-v1") { state = "ready"; readyResolve(); return; }
+    if (state !== "running" || message?.kind !== "ordinary-manifest-audit-session-result-v1" || message.requestId !== pending?.requestId) return failSession(new Error("manifest audit session response protocol is invalid"));
+    const current = pending; pending = null; clearTimeout(current.timer); state = "ready";
+    if (message.ok !== true) current.reject(new Error(`manifest audit failed: ${message.error ?? "unknown worker error"}`));
+    else current.resolve(message.result);
+  });
+  worker.once("error", failSession);
+  worker.once("exit", (code) => { if (state !== "closed") failSession(new Error(`manifest audit session exited with code ${code}`)); });
+  worker.unref();
+  const runOne = async (manifestPath) => {
+    await ready;
+    if (fatalError || state !== "ready") throw fatalError ?? new Error("manifest audit session is unavailable");
+    const requestId = nextRequestId; nextRequestId += 1; state = "running";
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => { failSession(new Error("manifest audit timed out")); void worker.terminate(); }, 60_000);
+      pending = { requestId, resolve, reject, timer };
+      worker.postMessage({ kind: "ordinary-manifest-audit-session-request-v1", requestId, manifestPath, deferOrdinaryFileVerification: true });
+    });
+  };
+  return Object.freeze({
+    run(manifestPath) {
+      const result = queue.then(() => runOne(manifestPath));
+      queue = result.catch(() => {});
+      return result;
+    },
+  });
+}
+
+const manifestAuditSession = createManifestAuditSession();
+
+export async function auditManifest(manifestPath, expectedSha256) {
+  const result = object(await manifestAuditSession.run(manifestPath), "manifest audit result");
+  if (result.ok !== true || result.manifestFileSha256 !== expectedSha256 || result.fileVerificationMode !== "bound-builders" || !result.reimbursementFactsCertificate) fail("manifest audit result is incomplete or changed.");
   return result;
 }
 
@@ -135,32 +222,19 @@ function aggregateGate(gate, bindings, extra = {}) {
   return deepFreeze({ ...body, bindingDigest: canonicalDigest(body) });
 }
 
-function previewBindingScopes(previews) {
-  return previews.map((item) => ({ ...previewIdentityFields(item), previewSha256: item.sha256 }));
-}
-
-function reimbursementGateCommon(audit, artifact, previewScopes) {
-  return {
-    version: 2,
-    mode: "reimbursement-batch",
-    batchId: audit.batch.batchId,
-    operationDigest: audit.operationDigest,
-    candidateRevision: artifact.candidateRevision,
-    candidatePath: artifact.candidatePath,
-    candidateSha256: artifact.candidateSha256,
-    candidatePlanSha256: artifact.planSha256,
-    sourceCoverageDigest: audit.sourceCoverageDigest,
-    affectedProfileIds: [artifact.profileId],
-    previewScopes: previewScopes.filter((item) => item.profileId === artifact.profileId),
-  };
-}
-
-function gate1For(audit, rootBuild, reviewPackageDigest, previewBuild) {
-  const previewScopes = previewBindingScopes(previewBuild.previews);
+function gate1For(audit, rootBuild, reviewPackageDigest) {
   return aggregateGate("gate-1", rootBuild.artifacts.map((artifact) => {
     const binding = buildGateBinding({
-      ...reimbursementGateCommon(audit, artifact, previewScopes),
+      version: 2,
       gate: "gate-1",
+      mode: "reimbursement-batch",
+      batchId: audit.batch.batchId,
+      operationDigest: audit.operationDigest,
+      candidateRevision: artifact.candidateRevision,
+      candidatePath: artifact.candidatePath,
+      candidateSha256: artifact.candidateSha256,
+      candidatePlanSha256: artifact.planSha256,
+      sourceCoverageDigest: audit.sourceCoverageDigest,
       factsDigest: audit.factsDigest,
       reviewPackageDigest,
     });
@@ -168,24 +242,35 @@ function gate1For(audit, rootBuild, reviewPackageDigest, previewBuild) {
   }));
 }
 
-function gate2For(audit, rootBuild, finalAudits, baselines, gate2PreviewDigest, previewBuild) {
+function gate2For(audit, rootBuild, finalAudits, baselines, gate2PreviewDigest, correspondenceAudit) {
   const previewDigest = sha(gate2PreviewDigest, "gate2PreviewDigest");
-  const previewScopes = previewBindingScopes(previewBuild.previews);
-  const auditByProfile = new Map(finalAudits.map((item) => [item.profile.profileId, item]));
+  const auditByProfile = new Map(finalAudits.map((item) => [item.profileId ?? item.profile?.profileId, item]));
   const baselineByProfile = new Map(baselines.map((item) => [item.profileId, item]));
   return aggregateGate("gate-2", rootBuild.artifacts.map((artifact) => {
     const finalAudit = auditByProfile.get(artifact.profileId);
     const baseline = baselineByProfile.get(artifact.profileId);
     if (!finalAudit || !baseline) fail(`${artifact.profileId} final audit or baseline binding is missing.`);
     const binding = buildGateBinding({
-      ...reimbursementGateCommon(audit, artifact, previewScopes),
+      version: 2,
       gate: "gate-2",
+      mode: "reimbursement-batch",
+      batchId: audit.batch.batchId,
+      operationDigest: audit.operationDigest,
+      candidateRevision: artifact.candidateRevision,
+      candidatePath: artifact.candidatePath,
+      candidateSha256: artifact.candidateSha256,
       baselinePath: baseline.path,
       baselineSha256: baseline.sha256,
       finalAuditDigest: finalAudit.auditDigest,
+      candidatePlanSha256: artifact.planSha256,
+      sourceCoverageDigest: audit.sourceCoverageDigest,
     });
     return { profileId: artifact.profileId, ...binding };
-  }), { gate2PreviewDigest: previewDigest });
+  }), {
+    gate2PreviewDigest: previewDigest,
+    fullCorrespondenceAuditDigest: sha(correspondenceAudit.reportDigest, "fullCorrespondenceAuditDigest"),
+    independentEvidenceReviewDigest: sha(correspondenceAudit.independentEvidenceReviewDigest, "independentEvidenceReviewDigest"),
+  });
 }
 
 async function cleanupBound(files, roots) {
@@ -209,25 +294,26 @@ async function cleanupBound(files, roots) {
   return { preserved, failures };
 }
 
-async function writeAuditRequest(workflowRoot, certificate, profiles, role) {
+async function writeAuditRequest(workflowRoot, certificate, profiles, role, rootAuditModule) {
   const requestNonce = crypto.randomBytes(32).toString("hex");
-  const request = { kind: ROOT_WORKBOOK_AUDIT_REQUEST_KIND, requestNonce, reimbursementFactsCertificate: certificate, profiles };
-  request.requestDigest = computeRootWorkbookAuditRequestDigest(request);
+  const request = { kind: rootAuditModule.ROOT_WORKBOOK_AUDIT_REQUEST_KIND, requestNonce, reimbursementFactsCertificate: certificate, profiles };
+  request.requestDigest = rootAuditModule.computeRootWorkbookAuditRequestDigest(request);
   const binding = await writeExclusiveJson(path.join(workflowRoot, `.${role}-audit-${requestNonce}.json`), request);
   return { request, binding };
 }
 
 async function runBatchAudit(workflowRoot, certificate, profiles, role) {
-  const { request, binding } = await writeAuditRequest(workflowRoot, certificate, profiles, role);
+  const rootAuditModule = await import("./build_root_workbook_candidate.mjs");
+  const { request, binding } = await writeAuditRequest(workflowRoot, certificate, profiles, role, rootAuditModule);
   try {
-    const raw = await runRootWorkbookAuditWorker({ requestPath: binding.path, requestFileSha256: binding.sha256, requestNonce: request.requestNonce });
+    const raw = await rootAuditModule.runRootWorkbookAuditWorker({ requestPath: binding.path, requestFileSha256: binding.sha256, requestNonce: request.requestNonce });
     const { rawStdout: _stdout, ...response } = raw;
-    return validateRootWorkbookAuditBatch(response, {
+    return rootAuditModule.validateRootWorkbookAuditBatch(response, {
       requestDigest: request.requestDigest,
       requestFileSha256: binding.sha256,
       requestNonce: request.requestNonce,
       profileIds: profiles.map((item) => item.profileId),
-      profileBindings: profiles.map(({ profileId, baselineSha256, candidateSha256 }) => ({ profileId, baselineSha256, candidateSha256 })),
+      profileBindings: profiles.map(({ profileId, baselineSha256, candidateSha256, localPatchCertificate }) => ({ profileId, baselineSha256, candidateSha256, localPatchCertificate })),
       certificate,
     });
   } finally {
@@ -258,6 +344,7 @@ async function runPreviewRenderer({ requestPath, requestFileSha256, requestNonce
   const child = spawn("powershell.exe", [
     "-NoProfile",
     "-NonInteractive",
+    "-Sta",
     "-ExecutionPolicy", "Bypass",
     "-File", PREVIEW_RENDERER,
     "-RequestPath", requestPath,
@@ -310,152 +397,195 @@ async function runPreviewRenderer({ requestPath, requestFileSha256, requestNonce
   });
 }
 
-function pngDimensions(bytes, field) {
-  if (bytes.length < 24 || !bytes.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) fail(`${field} is not a PNG.`);
-  const width = bytes.readUInt32BE(16);
-  const height = bytes.readUInt32BE(20);
-  if (width < 1 || height < 1 || width > 50_000 || height > 50_000) fail(`${field} dimensions are invalid.`);
-  return { width, height };
+function bindingText(value, field) {
+  const result = text(value, field);
+  if (result.includes("\0")) fail(`${field} contains a forbidden NUL character.`);
+  return result;
 }
 
-export function rootPreviewRowRanges(projection, profileId) {
-  object(projection, `${profileId} root projection`);
-  const checkedInteger = (value, field, minimum = 0) => {
-    if (!Number.isSafeInteger(value) || value < minimum) fail(`${profileId} projection ${field} is invalid.`);
-    return value;
-  };
-  const endRow = checkedInteger(projection.endRow, "endRow", 2);
-  const manifestRecordCount = checkedInteger(projection.manifestRecordCount, "manifestRecordCount", 1);
-  if (projection.manifestRowRanges !== undefined) {
-    if (!Array.isArray(projection.manifestRowRanges) || projection.manifestRowRanges.length < 1) {
-      fail(`${profileId} projection manifestRowRanges must contain at least one audited range.`);
-    }
-    let priorEnd = 1;
-    let rowCount = 0;
-    const ranges = projection.manifestRowRanges.map((raw, index) => {
-      exact(raw, new Set(["startRow", "endRow"]), `${profileId} projection manifestRowRanges[${index}]`);
-      const startRow = checkedInteger(raw.startRow, `manifestRowRanges[${index}].startRow`, 2);
-      const rangeEndRow = checkedInteger(raw.endRow, `manifestRowRanges[${index}].endRow`, startRow);
-      if (rangeEndRow > endRow || (index > 0 && startRow <= priorEnd + 1)) {
-        fail(`${profileId} projection manifestRowRanges must be ordered, disjoint canonical bands within endRow.`);
-      }
-      priorEnd = rangeEndRow;
-      rowCount += rangeEndRow - startRow + 1;
-      return { startRow, endRow: rangeEndRow };
-    });
-    if (rowCount !== manifestRecordCount) fail(`${profileId} projection manifestRowRanges do not cover every manifest record exactly once.`);
-    return ranges;
-  }
-
-  const baselineRecordCount = checkedInteger(projection.baselineRecordCount, "baselineRecordCount");
-  const transactionCount = checkedInteger(projection.transactionCount, "transactionCount", 1);
-  const startRow = baselineRecordCount + 2;
-  if (
-    transactionCount !== baselineRecordCount + manifestRecordCount
-    || endRow !== transactionCount + 1
-    || endRow - startRow + 1 !== manifestRecordCount
-  ) {
-    fail(`${profileId} legacy projection cannot prove a contiguous manifest-only tail preview.`);
-  }
-  return [{ startRow, endRow }];
-}
-
-function previewIdentityFields(value, sourceField = "sourceSha256") {
-  return {
-    profileId: value.profileId,
-    role: value.role,
-    sheetName: value.sheetName,
-    rangeAddress: value.rangeAddress,
-    sourceSha256: value[sourceField],
-  };
-}
-
-function previewIdentity(value, sourceField = "sourceSha256") {
-  return canonicalDigest(previewIdentityFields(value, sourceField));
-}
-
-export function pairVerifiedPreviewsByIdentity(jobs, previews) {
-  if (!Array.isArray(jobs) || !Array.isArray(previews) || jobs.length !== previews.length) {
-    fail("Gate 1 preview set cannot satisfy the Gate 2 preview contract.");
-  }
-  const priorByIdentity = new Map();
-  for (const prior of previews) {
-    const identity = previewIdentity(prior);
-    if (priorByIdentity.has(identity)) fail("Gate 1 preview set contains a duplicate preview identity.");
-    priorByIdentity.set(identity, prior);
-  }
-  const jobIdentities = new Set();
-  return jobs.map((job) => {
-    const identity = previewIdentity(job, "workbookSha256");
-    if (jobIdentities.has(identity)) fail("Gate 2 preview jobs contain a duplicate preview identity.");
-    jobIdentities.add(identity);
-    const prior = priorByIdentity.get(identity);
-    if (!prior) fail("Gate 1 preview identity differs from the current Gate 2 source or range.");
-    return prior;
+function normalizedBatchRows(value, field = "batchRows") {
+  if (!Array.isArray(value) || value.length < 1) fail(`${field} must be a non-empty array.`);
+  return value.map((entry, index) => {
+    const rowRange = bindingText(entry, `${field}[${index}]`);
+    if (!/^[1-9][0-9]*:[1-9][0-9]*$/u.test(rowRange)) fail(`${field}[${index}] is invalid.`);
+    const [start, end] = rowRange.split(":").map(Number);
+    if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start > end) fail(`${field}[${index}] is not an ordered row range.`);
+    return rowRange;
   });
 }
 
-async function buildReviewPreviews(workflowRoot, rootBuild, presentationBuild, testHooks, stage = "gate-1", verifiedPreviewBuild = undefined) {
+export function previewJobBindingDigest(rawJob) {
+  const job = object(rawJob, "preview job binding");
+  const fields = [
+    "preview-job-binding-v2",
+    bindingText(job.profileId, "preview job profileId"),
+    bindingText(job.role, "preview job role"),
+    sha(job.workbookSha256, "preview job workbookSha256"),
+    bindingText(job.sheetName, "preview job sheetName"),
+    bindingText(job.rangeAddress, "preview job rangeAddress"),
+    sha(job.candidateSha256, "preview job candidateSha256"),
+    sha(job.planSha256, "preview job planSha256"),
+    sha(job.sourceCoverageDigest, "preview job sourceCoverageDigest"),
+    normalizedBatchRows(job.batchRows).join(","),
+  ];
+  return sha256Bytes(fields.join("\0"));
+}
+
+export async function inspectPreviewPng(bytes, field = "preview") {
+  if (!(bytes instanceof Uint8Array) || bytes.length < 1_000) fail(`${field} is not a non-empty PNG.`);
+  try {
+    const sharp = loadPreviewSharp();
+    const image = sharp(bytes, { failOn: "error", limitInputPixels: 100_000_000 });
+    const metadata = await image.metadata();
+    const width = metadata.width;
+    const height = metadata.height;
+    if (metadata.format !== "png" || !Number.isSafeInteger(width) || !Number.isSafeInteger(height) || width < 1 || height < 1 || width > 50_000 || height > 50_000) {
+      fail(`${field} dimensions or format are invalid.`);
+    }
+    const aspectRatio = width / height;
+    if (aspectRatio < 0.01 || aspectRatio > 100) fail(`${field} has an unreasonable aspect ratio.`);
+    const stats = await sharp(bytes, { failOn: "error", limitInputPixels: 100_000_000 }).stats();
+    const visibleChannels = stats.channels.slice(0, Math.min(3, stats.channels.length));
+    if (visibleChannels.length < 1 || !visibleChannels.some((channel) => channel.max > channel.min && channel.stdev > 0.05) || !Number.isFinite(stats.entropy) || stats.entropy <= 0.0001) {
+      fail(`${field} is blank or has no meaningful pixel variance.`);
+    }
+    return { width, height };
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith("Ordinary Reimbursement Workflow ")) throw error;
+    fail(`${field} cannot be fully decoded as PNG: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+export async function buildReviewPreviews(workflowRoot, rootBuild, presentationBuild, sourceCoverageDigest, testHooks, stage = "gate-1", verifiedPreviewBuild = undefined) {
   if (!new Set(["gate-1", "gate-2"]).has(stage)) fail("preview stage is invalid.");
   if (verifiedPreviewBuild !== undefined && stage !== "gate-2") fail("only Gate 2 may build verified preview copies.");
-  const outputRoot = path.join(workflowRoot, `${stage}-previews`);
-  await fs.mkdir(outputRoot, { recursive: false });
-  const presentationByProfile = new Map(presentationBuild.artifacts.map((item) => [item.profileId, item]));
+  const outputRoot = verifiedPreviewBuild?.outputRoot ?? path.join(workflowRoot, `${stage}-previews`);
   const jobs = [];
-  for (const root of rootBuild.artifacts) {
+  let requestNonce;
+  let requestPath;
+  let requestFile;
+  let response;
+  try {
+    if (verifiedPreviewBuild === undefined) await fs.mkdir(outputRoot, { recursive: false });
+    const verifiedByRole = new Map((verifiedPreviewBuild?.previews ?? []).map((item) => [`${item.profileId}\0${item.role}`, item]));
+    const outputPathFor = (profileId, role) => verifiedByRole.get(`${profileId}\0${role}`)?.path ?? path.join(outputRoot, `${profileId}-${role}.png`);
+    const presentationByProfile = new Map(presentationBuild.artifacts.map((item) => [item.profileId, item]));
+    const bindings = [];
+    for (const root of rootBuild.artifacts) {
     const presentation = presentationByProfile.get(root.profileId);
     if (!presentation) fail(`${root.profileId} presentation artifact is missing for preview rendering.`);
-    const rootRanges = rootPreviewRowRanges(root.audit.projection, root.profileId);
-    jobs.push(...rootRanges.map(({ startRow, endRow }) => ({
+    if (!root.previewPath || !root.candidatePath || samePath(root.previewPath, root.candidatePath)) fail(`${root.profileId} root preview must be a dedicated batch-only projection and cannot fall back to the candidate workbook.`);
+    const profileBinding = {
+      profileId: root.profileId,
+      candidateSha256: root.candidateSha256,
+      planSha256: root.planSha256,
+      sourceCoverageDigest: sha(sourceCoverageDigest, "sourceCoverageDigest"),
+      batchRows: root.audit.projection.batchRanges.map((range) => `${range.startRow}:${range.endRow}`),
+      rootPreviewRange: root.previewRangeAddress,
+    };
+    profileBinding.batchRows = normalizedBatchRows(profileBinding.batchRows, `${root.profileId} batchRows`);
+    bindings.push(profileBinding);
+    const bindJob = (job) => {
+      const bound = {
+        ...job,
+        candidateSha256: profileBinding.candidateSha256,
+        planSha256: profileBinding.planSha256,
+        sourceCoverageDigest: profileBinding.sourceCoverageDigest,
+        batchRows: [...profileBinding.batchRows],
+      };
+      return { ...bound, bindingDigest: previewJobBindingDigest(bound) };
+    };
+    jobs.push(
+      bindJob({
         profileId: root.profileId,
         role: "root",
-        workbookPath: root.candidatePath,
-        workbookSha256: root.candidateSha256,
-        sheetName: root.audit.profile.managedRootSheetName,
-        rangeAddress: `A${startRow}:F${endRow}`,
-        outputPath: path.join(outputRoot, `${root.profileId}-root-${startRow}-${endRow}.png`),
-      })),
-      {
+        workbookPath: root.previewPath,
+        workbookSha256: root.previewSha256,
+        sheetName: root.previewSheetName,
+        rangeAddress: root.previewRangeAddress,
+        outputPath: outputPathFor(root.profileId, "root"),
+      }),
+      bindJob({
         profileId: root.profileId,
         role: "detail",
         workbookPath: presentation.detail.path,
         workbookSha256: presentation.detail.sha256,
         sheetName: presentation.detail.sheetName,
         rangeAddress: `A1:F${presentation.detail.endRow}`,
-        outputPath: path.join(outputRoot, `${root.profileId}-detail.png`),
-      },
-      {
+        outputPath: outputPathFor(root.profileId, "detail"),
+      }),
+      bindJob({
         profileId: root.profileId,
         role: "screenshot",
         workbookPath: presentation.screenshot.path,
         workbookSha256: presentation.screenshot.sha256,
         sheetName: presentation.screenshot.sheetName,
-        rangeAddress: `A1:H${presentation.screenshot.endRow}`,
-        outputPath: path.join(outputRoot, `${root.profileId}-screenshot.png`),
-      },
+        rangeAddress: `A1:${presentation.screenshot.endColumn}${presentation.screenshot.endRow}`,
+        outputPath: outputPathFor(root.profileId, "screenshot"),
+      }),
     );
-  }
-  const requestNonce = crypto.randomBytes(32).toString("hex");
-  const previewScopes = jobs.map((job) => previewIdentityFields(job, "workbookSha256"));
-  const affectedProfileIds = rootBuild.artifacts.map((item) => item.profileId);
-  const request = { kind: PREVIEW_REQUEST_KIND, requestNonce, outputRoot, affectedProfileIds, previewScopes, jobs };
-  const requestFile = verifiedPreviewBuild === undefined
-    ? await writeExclusiveJson(path.join(workflowRoot, `.${stage}-preview-request-${requestNonce}.json`), request)
-    : undefined;
-  let response;
-  try {
+    }
+    requestNonce = crypto.randomBytes(32).toString("hex");
+    const requestBindingDigest = canonicalDigest({
+    bindings,
+    jobs: jobs.map(({ profileId, role, workbookSha256, sheetName, rangeAddress, candidateSha256, planSha256, sourceCoverageDigest: coverage, batchRows, bindingDigest }) => ({
+      profileId,
+      role,
+      workbookSha256,
+      sheetName,
+      rangeAddress,
+      candidateSha256,
+      planSha256,
+      sourceCoverageDigest: coverage,
+      batchRows,
+      bindingDigest,
+    })),
+  });
+    const request = { kind: PREVIEW_REQUEST_KIND, requestNonce, outputRoot, bindingDigest: requestBindingDigest, bindings, jobs };
+    requestPath = path.join(workflowRoot, `.${stage}-preview-request-${requestNonce}.json`);
+    requestFile = verifiedPreviewBuild === undefined
+      ? await writeExclusiveJson(requestPath, request)
+      : undefined;
     if (verifiedPreviewBuild !== undefined) {
-      const verifiedPreviews = pairVerifiedPreviewsByIdentity(jobs, verifiedPreviewBuild.previews);
+      if (!Array.isArray(verifiedPreviewBuild.previews) || verifiedPreviewBuild.previews.length !== jobs.length) fail("Gate 1 preview set cannot satisfy the Gate 2 preview contract.");
       response = {
         kind: PREVIEW_RESPONSE_KIND,
         requestNonce,
         requestFileSha256: null,
+        bindingDigest: requestBindingDigest,
         enginePeakWorkingSetBytes: 1,
         previews: await Promise.all(jobs.map(async (job, index) => {
-          const prior = verifiedPreviews[index];
-          const priorStable = await assertBoundFile(prior, `Gate 1 ${prior.profileId} ${prior.role} preview`);
-          await fs.copyFile(prior.path, job.outputPath, fsConstants.COPYFILE_EXCL);
-          return { profileId: job.profileId, role: job.role, workbookSha256: job.workbookSha256, outputPath: job.outputPath, sha256: priorStable.sha256, size: priorStable.size };
+          const prior = verifiedPreviewBuild.previews[index];
+          if (
+            prior.profileId !== job.profileId
+            || prior.role !== job.role
+            || prior.sourceSha256 !== job.workbookSha256
+            || prior.sheetName !== job.sheetName
+            || prior.rangeAddress !== job.rangeAddress
+            || prior.candidateSha256 !== job.candidateSha256
+            || prior.planSha256 !== job.planSha256
+            || prior.sourceCoverageDigest !== job.sourceCoverageDigest
+            || canonicalDigest(prior.batchRows) !== canonicalDigest(job.batchRows)
+            || prior.bindingDigest !== job.bindingDigest
+          ) {
+            fail("Gate 1 preview source binding differs from the current Gate 2 source.");
+          }
+          return {
+            profileId: job.profileId,
+            role: job.role,
+            workbookSha256: job.workbookSha256,
+            sheetName: job.sheetName,
+            rangeAddress: job.rangeAddress,
+            candidateSha256: job.candidateSha256,
+            planSha256: job.planSha256,
+            sourceCoverageDigest: job.sourceCoverageDigest,
+            batchRows: [...job.batchRows],
+            bindingDigest: job.bindingDigest,
+            outputPath: job.outputPath,
+            sha256: prior.sha256,
+            size: prior.size,
+            renderAttempts: 0,
+          };
         })),
       };
     } else {
@@ -463,38 +593,90 @@ async function buildReviewPreviews(workflowRoot, rootBuild, presentationBuild, t
         ? await testHooks.runPreviewRenderer({ request: clone(request), requestPath: requestFile.path, requestFileSha256: requestFile.sha256 })
         : await runPreviewRenderer({ requestPath: requestFile.path, requestFileSha256: requestFile.sha256, requestNonce });
     }
-    exact(response, new Set(["kind", "requestNonce", "requestFileSha256", "enginePeakWorkingSetBytes", "previews"]), "preview renderer response");
-    if (response.kind !== PREVIEW_RESPONSE_KIND || response.requestNonce !== requestNonce || (requestFile ? response.requestFileSha256 !== requestFile.sha256 : response.requestFileSha256 !== null)) fail("preview renderer response differs from the bound request.");
+    exact(response, new Set(["kind", "requestNonce", "requestFileSha256", "bindingDigest", "enginePeakWorkingSetBytes", "previews"]), "preview renderer response");
+    if (response.kind !== PREVIEW_RESPONSE_KIND || response.requestNonce !== requestNonce || response.bindingDigest !== requestBindingDigest || (requestFile ? response.requestFileSha256 !== requestFile.sha256 : response.requestFileSha256 !== null)) fail("preview renderer response differs from the bound request.");
     if (!Number.isSafeInteger(response.enginePeakWorkingSetBytes) || response.enginePeakWorkingSetBytes < 1) fail("preview renderer did not report a valid engine peak working set.");
     if (!Array.isArray(response.previews) || response.previews.length !== jobs.length) fail("preview renderer returned the wrong preview count.");
-    const previews = [];
-    for (const [index, raw] of response.previews.entries()) {
-      exact(raw, new Set(["profileId", "role", "workbookSha256", "outputPath", "sha256", "size"]), `preview renderer response previews[${index}]`);
+    const validatedPreviewBindings = response.previews.map((raw, index) => {
+      exact(raw, new Set(["profileId", "role", "workbookSha256", "sheetName", "rangeAddress", "candidateSha256", "planSha256", "sourceCoverageDigest", "batchRows", "bindingDigest", "outputPath", "sha256", "size", "renderAttempts"]), `preview renderer response previews[${index}]`);
       const job = jobs[index];
-      if (raw.profileId !== job.profileId || raw.role !== job.role || raw.workbookSha256 !== job.workbookSha256 || !samePath(raw.outputPath, job.outputPath)) fail("preview renderer output order or source binding is invalid.");
+      for (const field of ["profileId", "role", "workbookSha256", "sheetName", "rangeAddress", "candidateSha256", "planSha256", "sourceCoverageDigest", "bindingDigest"]) {
+        if (raw[field] !== job[field]) fail(`preview renderer output ${index} ${field} differs from its full source binding.`);
+      }
+      if (canonicalDigest(raw.batchRows) !== canonicalDigest(job.batchRows)) fail(`preview renderer output ${index} batchRows differs from its full source binding.`);
+      if (previewJobBindingDigest(raw) !== job.bindingDigest) fail(`preview renderer output ${index} bindingDigest preimage is invalid.`);
+      if (!samePath(raw.outputPath, job.outputPath)) fail(`preview renderer output ${index} path differs from its bound job.`);
+      if (!Number.isSafeInteger(raw.renderAttempts) || raw.renderAttempts < 0 || raw.renderAttempts > 3 || (verifiedPreviewBuild === undefined ? raw.renderAttempts < 1 : raw.renderAttempts !== 0)) fail("preview renderer attempt count is invalid.");
+      if (!Number.isSafeInteger(raw.size) || raw.size < 1_000) fail(`preview renderer output ${index} size is invalid.`);
+      return { index, raw, job, renderSha256: sha(raw.sha256, `preview ${index} sha256`) };
+    });
+    const decodedPreviewBySha256 = new Map();
+    const validated = await mapSettledLimit(validatedPreviewBindings, PREVIEW_VALIDATION_CONCURRENCY, async ({ index, raw, job, renderSha256 }) => {
+      if (stage === "gate-2" && testHooks?.beforeGate2PreviewRead) await testHooks.beforeGate2PreviewRead({ index, profileId: job.profileId, role: job.role, path: job.outputPath });
       const stable = await readStableBinaryFile(job.outputPath, { maxBytes: MAX_PREVIEW_BYTES });
-      if (stable.sha256 !== sha(raw.sha256, `preview ${index} sha256`) || stable.size !== raw.size || stable.size < 1_000) fail("preview renderer output changed after render.");
-      const dimensions = pngDimensions(copyStableBinaryBytes(stable), `preview ${index}`);
-      previews.push({ profileId: job.profileId, role: job.role, sourceSha256: job.workbookSha256, sheetName: job.sheetName, rangeAddress: job.rangeAddress, path: job.outputPath, sha256: stable.sha256, size: stable.size, ...dimensions });
-    }
+      if (stable.sha256 !== renderSha256 || stable.size !== raw.size) fail("preview renderer output changed after render.");
+      let dimensions;
+      if (verifiedPreviewBuild === undefined) {
+        let inspection = decodedPreviewBySha256.get(renderSha256);
+        if (!inspection) {
+          inspection = inspectPreviewPng(copyStableBinaryBytes(stable), `preview ${index}`);
+          decodedPreviewBySha256.set(renderSha256, inspection);
+        }
+        dimensions = await inspection;
+      } else {
+        dimensions = { width: verifiedPreviewBuild.previews[index].width, height: verifiedPreviewBuild.previews[index].height };
+      }
+      return {
+        profileId: job.profileId,
+        role: job.role,
+        sourceSha256: job.workbookSha256,
+        sheetName: job.sheetName,
+        rangeAddress: job.rangeAddress,
+        candidateSha256: job.candidateSha256,
+        planSha256: job.planSha256,
+        sourceCoverageDigest: job.sourceCoverageDigest,
+        batchRows: [...job.batchRows],
+        bindingDigest: job.bindingDigest,
+        renderAttempts: raw.renderAttempts,
+        path: job.outputPath,
+        sha256: stable.sha256,
+        size: stable.size,
+        ...dimensions,
+      };
+    });
+    const previews = validated.settled.map((entry) => entry.value);
     const body = {
       kind: PREVIEW_RESULT_KIND,
       stage,
       outputRoot,
+      bindingDigest: requestBindingDigest,
       requestFileSha256: requestFile?.sha256 ?? null,
       ...(verifiedPreviewBuild === undefined ? {} : { rebuiltFromPreviewDigest: sha(verifiedPreviewBuild.previewDigest, "Gate 1 previewDigest") }),
       enginePeakWorkingSetBytes: response.enginePeakWorkingSetBytes,
       previews,
     };
-    return deepFreeze({ ...body, previewDigest: canonicalDigest(body), ownedFiles: previews.map(({ path: filePath, sha256, size }) => ({ path: filePath, sha256, size })) });
+    return deepFreeze({ ...body, previewDigest: canonicalDigest(body), ownedFiles: verifiedPreviewBuild === undefined ? previews.map(({ path: filePath, sha256, size }) => ({ path: filePath, sha256, size })) : [] });
   } catch (error) {
+    if (verifiedPreviewBuild !== undefined) throw error;
+    let unboundRequestCleanupFailure;
+    if (!requestFile && requestPath && !errorHasCode(error, "EEXIST")) {
+      try { await fs.unlink(requestPath); } catch (cleanupError) { if (cleanupError?.code !== "ENOENT") unboundRequestCleanupFailure = cleanupError; }
+    }
     const cleanupEntries = [];
     for (const job of jobs) {
       const current = await readStableBinaryFile(job.outputPath, { maxBytes: MAX_PREVIEW_BYTES }).catch(() => null);
       if (current) cleanupEntries.push({ path: job.outputPath, sha256: current.sha256, size: current.size });
     }
+    const partialPrefix = requestNonce ? `.codex-preview-${requestNonce.slice(0, 16)}-` : null;
+    const directoryEntries = await fs.readdir(outputRoot, { withFileTypes: true }).catch((readError) => readError?.code === "ENOENT" ? [] : Promise.reject(readError));
+    for (const entry of directoryEntries) {
+      if (!partialPrefix || !entry.isFile() || !entry.name.startsWith(partialPrefix) || !entry.name.endsWith(".partial.png")) continue;
+      const partialPath = path.join(outputRoot, entry.name);
+      const current = await readStableBinaryFile(partialPath, { maxBytes: MAX_PREVIEW_BYTES }).catch(() => null);
+      if (current) cleanupEntries.push({ path: partialPath, sha256: current.sha256, size: current.size });
+    }
     const cleanup = await cleanupBound(cleanupEntries, [outputRoot]);
-    if (cleanup.preserved.length || cleanup.failures.length) fail(`${error instanceof Error ? error.message : String(error)}; preview cleanup was incomplete.`);
+    if (unboundRequestCleanupFailure || cleanup.preserved.length || cleanup.failures.length) fail(`${error instanceof Error ? error.message : String(error)}; preview cleanup was incomplete.`);
     throw error;
   } finally {
     if (requestFile) {
@@ -510,206 +692,34 @@ function stateCore(value) {
   return result;
 }
 
-function array(value, field) {
-  if (!Array.isArray(value)) fail(`${field} must be an array.`);
-  return value;
-}
-
-function verifyEmbeddedDigest(value, digestField, field, omittedFields = []) {
-  const body = clone(object(value, field));
-  const expected = sha(body[digestField], `${field}.${digestField}`);
-  delete body[digestField];
-  for (const omitted of omittedFields) delete body[omitted];
-  if (canonicalDigest(body) !== expected) fail(`${field}.${digestField} does not match its complete body.`);
-}
-
-function verifyCertificate(certificate) {
-  const checked = object(certificate, "workflow state certificate");
-  if (canonicalDigest(checked.factsPreimage) !== checked.factsDigest) fail("certificate factsDigest does not match factsPreimage.");
-  if (canonicalDigest(checked.sourceCoveragePreimage) !== checked.sourceCoverageDigest) fail("certificate sourceCoverageDigest does not match sourceCoveragePreimage.");
-  verifyEmbeddedDigest(checked, "certificateDigest", "workflow state certificate");
-}
-
-function profileIds(items, field) {
-  return array(items, field).map((item, index) => text(object(item, `${field}[${index}]`).profileId, `${field}[${index}].profileId`));
-}
-
-function requireProfileOrder(actual, expected, field) {
-  if (canonicalDigest(actual) !== canonicalDigest(expected) || new Set(actual).size !== actual.length) {
-    fail(`${field} must exactly match affectedProfileIds in registry order.`);
-  }
-}
-
-function verifyPresentationBuild(build) {
-  object(build, "presentationBuild");
-  for (const [index, artifact] of array(build.artifacts, "presentationBuild.artifacts").entries()) {
-    verifyEmbeddedDigest(artifact, "artifactDigest", `presentationBuild.artifacts[${index}]`);
-  }
-  verifyEmbeddedDigest(build, "buildDigest", "presentationBuild", ["diagnostics"]);
-}
-
-function verifyPreviewBuild(build, field) {
-  object(build, field);
-  array(build.previews, `${field}.previews`);
-  array(build.ownedFiles, `${field}.ownedFiles`);
-  verifyEmbeddedDigest(build, "previewDigest", field, ["ownedFiles"]);
-}
-
-function reviewPackageDigestFor(manifestSha256, certificate, rootBuild, presentationBuild, previewBuild) {
-  return canonicalDigest({
-    manifestSha256,
-    certificateDigest: certificate.certificateDigest,
-    roots: rootBuild.artifacts.map((item) => ({
-      profileId: item.profileId,
-      candidateSha256: item.candidateSha256,
-      planSha256: item.planSha256,
-      auditDigest: item.audit.auditDigest,
-    })),
-    presentation: presentationBuild.artifacts.map((item) => ({
-      profileId: item.profileId,
-      artifactDigest: item.artifactDigest,
-      detailSha256: item.detail.sha256,
-      screenshotSha256: item.screenshot.sha256,
-    })),
-    previews: previewBuild.previews.map((item) => ({
-      profileId: item.profileId,
-      role: item.role,
-      sourceSha256: item.sourceSha256,
-      sha256: item.sha256,
-      rangeAddress: item.rangeAddress,
-    })),
-  });
-}
-
-function buildReviewItems(presentationBuild, previewBuild) {
-  return presentationBuild.artifacts.map((item) => ({
-    profileId: item.profileId,
-    summary: item.summary.text,
-    detail: { path: item.detail.path, sha256: item.detail.sha256 },
-    supplement: item.supplement ? { path: item.supplement.path, sha256: item.supplement.sha256 } : null,
-    screenshot: { path: item.screenshot.path, sha256: item.screenshot.sha256, imageCount: item.screenshot.imageCount },
-    previews: previewBuild.previews.filter((preview) => preview.profileId === item.profileId),
-    evidenceCount: item.evidenceArchive.length,
-  }));
-}
-
-function stateGateAudit(state) {
-  return {
-    batch: { batchId: state.manifest.batchId },
-    operationDigest: state.manifest.operationDigest,
-    factsDigest: state.certificate.factsDigest,
-    sourceCoverageDigest: state.certificate.sourceCoverageDigest,
-  };
-}
-
-function verifyRootBuild(rootBuild) {
-  object(rootBuild, "rootBuild");
-  for (const [index, artifact] of array(rootBuild.artifacts, "rootBuild.artifacts").entries()) {
-    verifyEmbeddedDigest(object(artifact, `rootBuild.artifacts[${index}]`).audit, "auditDigest", `rootBuild.artifacts[${index}].audit`);
-  }
-}
-
-function verifyGateOneState(state) {
-  verifyCertificate(state.certificate);
-  const affectedProfileIds = array(state.affectedProfileIds, "affectedProfileIds").map((item, index) => text(item, `affectedProfileIds[${index}]`));
-  if (new Set(affectedProfileIds).size !== affectedProfileIds.length) fail("affectedProfileIds must be unique.");
-  requireProfileOrder(state.certificate.factsPreimage.affectedProfileIds, affectedProfileIds, "certificate affected profiles");
-  requireProfileOrder(profileIds(state.baselines, "baselines"), affectedProfileIds, "baselines");
-  requireProfileOrder(profileIds(state.rootBuild.artifacts, "rootBuild.artifacts"), affectedProfileIds, "rootBuild artifacts");
-  requireProfileOrder(profileIds(state.presentationBuild.artifacts, "presentationBuild.artifacts"), affectedProfileIds, "presentationBuild artifacts");
-  requireProfileOrder(state.presentationBuild.affectedProfileIds, affectedProfileIds, "presentationBuild affected profiles");
-  if (state.manifest.batchId !== state.certificate.factsPreimage.batchId) fail("manifest batchId differs from the certificate.");
-  if (state.manifest.sha256 !== state.certificate.manifestFileSha256 || state.presentationBuild.manifestSha256 !== state.manifest.sha256) {
-    fail("manifest SHA binding differs across workflow state components.");
-  }
-  verifyRootBuild(state.rootBuild);
-  verifyPresentationBuild(state.presentationBuild);
-  verifyPreviewBuild(state.previewBuild, "previewBuild");
-  const reviewPackageDigest = reviewPackageDigestFor(
-    state.manifest.sha256,
-    state.certificate,
-    state.rootBuild,
-    state.presentationBuild,
-    state.previewBuild,
-  );
-  if (reviewPackageDigest !== state.reviewPackageDigest) fail("reviewPackageDigest does not match the reviewed artifacts.");
-  const rebuiltGate = gate1For(stateGateAudit(state), state.rootBuild, reviewPackageDigest, state.previewBuild);
-  if (canonicalDigest(rebuiltGate) !== canonicalDigest(state.gate1)) fail("Gate 1 does not match the current per-profile artifacts and preview scopes.");
-}
-
-function verifyGateTwoState(state) {
-  verifyGateOneState(state);
-  verifyPreviewBuild(state.gate2PreviewBuild, "gate2PreviewBuild");
-  for (const [index, audit] of array(state.finalAudit?.audits, "finalAudit.audits").entries()) {
-    verifyEmbeddedDigest(audit, "auditDigest", `finalAudit.audits[${index}]`);
-  }
-  if (canonicalDigest(state.finalAudit) !== state.finalAuditDigest) fail("finalAuditDigest does not match the final audit batch.");
-  const finalAuditProfileIds = state.finalAudit.audits.map((audit, index) =>
-    text(object(audit.profile, `finalAudit.audits[${index}].profile`).profileId, `finalAudit.audits[${index}].profile.profileId`));
-  requireProfileOrder(finalAuditProfileIds, state.affectedProfileIds, "finalAudit profiles");
-  const rebuiltGate = gate2For(
-    stateGateAudit(state),
-    state.rootBuild,
-    state.finalAudit.audits,
-    state.baselines,
-    state.gate2PreviewBuild.previewDigest,
-    state.gate2PreviewBuild,
-  );
-  if (canonicalDigest(rebuiltGate) !== canonicalDigest(state.gate2)) fail("Gate 2 does not match the current per-profile final audits and preview scopes.");
-}
-
-function isStrictDescendant(root, target) {
-  const relative = path.relative(path.resolve(root), path.resolve(target));
-  return relative !== "" && relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
-}
-
-function requireExactPath(actual, expected, field) {
-  if (!samePath(text(actual, field), expected)) fail(`${field} is outside its task-owned location.`);
-}
-
-function requireOwnedPaths(entries, root, field) {
-  for (const [index, entry] of array(entries, field).entries()) {
-    const entryPath = text(object(entry, `${field}[${index}]`).path, `${field}[${index}].path`);
-    if (!isStrictDescendant(root, entryPath)) fail(`${field}[${index}].path is outside its task-owned staging root.`);
-  }
-}
-
-async function verifyStateFiles(state, statePath, expectedKind) {
-  const workflowRoot = path.join(path.resolve(os.tmpdir()), `${WORKFLOW_PREFIX}${state.stagingToken}`);
-  requireExactPath(state.workflowRoot, workflowRoot, "workflowRoot");
-  requireExactPath(statePath, path.join(workflowRoot, expectedKind === WORKFLOW_GATE1_KIND ? "ready-gate-1.json" : "ready-gate-2.json"), "statePath");
-  const rootStaging = path.join(path.resolve(os.tmpdir()), `${ROOT_STAGING_PREFIX}${deriveToken(state.stagingToken, "root")}`);
-  const presentationStaging = path.join(path.resolve(os.tmpdir()), `${PRESENTATION_STAGING_PREFIX}${deriveToken(state.stagingToken, "presentation")}`);
-  requireExactPath(state.rootBuild.stagingRoot, rootStaging, "rootBuild.stagingRoot");
-  requireExactPath(state.presentationBuild.stagingRoot, presentationStaging, "presentationBuild.stagingRoot");
-  requireExactPath(state.previewBuild.outputRoot, path.join(workflowRoot, "gate-1-previews"), "previewBuild.outputRoot");
-  requireOwnedPaths(state.rootBuild.ownedFiles, rootStaging, "rootBuild.ownedFiles");
-  requireOwnedPaths(state.presentationBuild.ownedFiles, presentationStaging, "presentationBuild.ownedFiles");
-  requireOwnedPaths(state.previewBuild.ownedFiles, state.previewBuild.outputRoot, "previewBuild.ownedFiles");
-  if (expectedKind === WORKFLOW_GATE2_KIND) {
-    requireExactPath(state.gate2PreviewBuild.outputRoot, path.join(workflowRoot, "gate-2-previews"), "gate2PreviewBuild.outputRoot");
-    requireOwnedPaths(state.gate2PreviewBuild.ownedFiles, state.gate2PreviewBuild.outputRoot, "gate2PreviewBuild.ownedFiles");
-    requireExactPath(state.previousState.path, path.join(workflowRoot, "ready-gate-1.json"), "previousState.path");
-    await assertBoundFile(state.previousState, "previous Gate 1 state");
-  }
-  const manifestSnapshot = await readStableUtf8JsonFile(path.resolve(text(state.manifest.path, "manifest.path")), { maxBytes: MAX_JSON_BYTES });
-  if (manifestSnapshot.sha256 !== state.manifest.sha256) fail("manifest file changed after workflow state creation.");
-  const batch = object(manifestSnapshot.value.batch, "manifest file batch");
-  if (batch.batchId !== state.manifest.batchId || !samePath(batch.archivePath, state.manifest.archivePath)) {
-    fail("workflow state batch identity or archivePath differs from the bound manifest file.");
-  }
-}
-
 async function readState(statePath, expectedKind) {
-  const resolvedStatePath = path.resolve(statePath);
-  const snapshot = await readStableUtf8JsonFile(resolvedStatePath, { maxBytes: MAX_JSON_BYTES });
+  const snapshot = await readStableUtf8JsonFile(path.resolve(statePath), { maxBytes: MAX_JSON_BYTES });
   const state = object(snapshot.value, "workflow state");
   if (state.kind !== expectedKind || canonicalDigest(stateCore(state)) !== state.stateDigest) fail("workflow state identity or digest is invalid.");
-  if (!TOKEN_RE.test(state.stagingToken ?? "")) fail("workflow state stagingToken is invalid.");
-  if (expectedKind === WORKFLOW_GATE1_KIND) verifyGateOneState(state);
-  else verifyGateTwoState(state);
-  await verifyStateFiles(state, resolvedStatePath, expectedKind);
-  return { state, snapshot, path: resolvedStatePath };
+  return { state, snapshot, path: path.resolve(statePath) };
+}
+
+async function assertPreviewCheckpoint(checkpoint, expected) {
+  const state = checkpoint.state;
+  if (
+    state.stagingToken !== expected.stagingToken
+    || !samePath(state.workflowRoot, expected.workflowRoot)
+    || state.prepareRequestDigest !== expected.prepareRequestDigest
+    || state.manifest?.sha256 !== expected.manifestSha256
+  ) fail("ready-preview checkpoint does not match the current prepare request.");
+  if (
+    !SHA_RE.test(state.certificate?.certificateDigest ?? "")
+    || !SHA_RE.test(state.certificate?.sourceCoverageDigest ?? "")
+    || !SHA_RE.test(state.factsDigest ?? "")
+    || !Array.isArray(state.affectedProfileIds)
+    || canonicalDigest(state.baselines.map((item) => item.profileId)) !== canonicalDigest(state.affectedProfileIds)
+  ) fail("ready-preview checkpoint audit bindings are incomplete.");
+  await Promise.all([
+    ...state.baselines.map((baseline) => assertBoundFile(baseline, `${baseline.profileId} checkpoint baseline`)),
+    ...state.rootBuild.ownedFiles.map((item) => assertBoundFile(item, "checkpoint root artifact")),
+    ...state.presentationBuild.ownedFiles.map((item) => assertBoundFile(item, "checkpoint presentation artifact")),
+  ]);
+  return state;
 }
 
 export async function prepareReimbursementWorkflow(rawRequest, { testHooks } = {}) {
@@ -718,15 +728,17 @@ export async function prepareReimbursementWorkflow(rawRequest, { testHooks } = {
   if (!Array.isArray(rawRequest.baselines) || rawRequest.baselines.length < 1 || rawRequest.baselines.length > 3) fail("baselines must contain one to three profiles.");
   const manifestPath = path.resolve(text(rawRequest.manifestPath, "manifestPath"));
   const manifestSha256 = sha(rawRequest.manifestSha256, "manifestSha256");
-  const manifestStable = await readStableUtf8JsonFile(manifestPath, { maxBytes: MAX_JSON_BYTES });
-  if (manifestStable.sha256 !== manifestSha256) fail("manifest SHA differs from prepare request.");
-  const evidenceCache = new EvidenceCache({
-    maxBytes: 25 * 1024 * 1024,
-    maxResidentBytes: 512 * 1024 * 1024,
-    requireRetention: true,
-  });
-  const manifestAudit = await auditManifest(manifestPath, manifestSha256, evidenceCache);
-  const registry = await loadProfileRegistry();
+  const workflowRoot = path.join(path.resolve(os.tmpdir()), `${WORKFLOW_PREFIX}${rawRequest.stagingToken}`);
+  const registryPromise = loadProfileRegistry();
+  const rootInfo = await fs.lstat(workflowRoot).catch((error) => error?.code === "ENOENT" ? null : Promise.reject(error));
+  const earlyManifestAudit = rootInfo ? null : (testHooks?.auditManifest
+    ? Promise.resolve().then(() => testHooks.auditManifest(manifestPath, manifestSha256))
+    : auditManifest(manifestPath, manifestSha256));
+  const earlyManifestAuditSettled = earlyManifestAudit?.then(
+    (value) => ({ status: "fulfilled", value }),
+    (reason) => ({ status: "rejected", reason }),
+  );
+  const registry = await registryPromise;
   const baselines = rawRequest.baselines.map((raw, index) => {
     exact(raw, new Set(["profileId", "path", "sha256", "size", "candidateRevision"]), `baselines[${index}]`);
     const profileId = text(raw.profileId, `baselines[${index}].profileId`);
@@ -734,52 +746,148 @@ export async function prepareReimbursementWorkflow(rawRequest, { testHooks } = {
     if (!Number.isSafeInteger(raw.size) || raw.size < 1 || !Number.isSafeInteger(raw.candidateRevision) || raw.candidateRevision < 1) fail(`${profileId} baseline size/revision is invalid.`);
     return { profileId, path: path.resolve(text(raw.path, `${profileId}.path`)), sha256: sha(raw.sha256, `${profileId}.sha256`), size: raw.size, candidateRevision: raw.candidateRevision };
   });
-  if (canonicalDigest(baselines.map((item) => item.profileId)) !== canonicalDigest(manifestAudit.affectedProfileIds)) fail("baselines must exactly match affected profiles in registry order.");
-  const workflowRoot = path.join(path.resolve(os.tmpdir()), `${WORKFLOW_PREFIX}${rawRequest.stagingToken}`);
-  await fs.mkdir(workflowRoot, { recursive: false });
+  const prepareRequestDigest = canonicalDigest({
+    kind: rawRequest.kind,
+    stagingToken: rawRequest.stagingToken,
+    manifestPath,
+    manifestSha256,
+    baselines,
+  });
+  const checkpointPath = path.join(workflowRoot, "ready-preview.json");
   let rootBuild;
   let presentationBuild;
   let previewBuild;
+  let previewCheckpoint;
+  let manifestAudit;
+  let manifestRecord;
+  let reusedCheckpoint = false;
+  let existingWorkflowRoot = false;
   try {
-    const [rootSettled, presentationSettled] = await Promise.allSettled([
-      buildRootWorkbookCandidates({
-        kind: "root-workbook-build-request-v1",
-        stagingToken: deriveToken(rawRequest.stagingToken, "root"),
-        reimbursementFactsCertificate: manifestAudit.reimbursementFactsCertificate,
-        artifacts: baselines.map((item) => ({ profileId: item.profileId, baselinePath: item.path, baselineSha256: item.sha256, baselineSize: item.size, candidateRevision: item.candidateRevision })),
-      }, { testHooks }),
-      buildReimbursementArtifacts({
-        kind: REIMBURSEMENT_ARTIFACT_BUILD_KIND,
-        stagingToken: deriveToken(rawRequest.stagingToken, "presentation"),
-        manifestPath,
+    if (rootInfo) {
+      existingWorkflowRoot = true;
+      if (!rootInfo.isDirectory() || rootInfo.isSymbolicLink() || !samePath(await fs.realpath(workflowRoot), workflowRoot)) fail("existing workflow root is not a plain owned directory.");
+      const manifestSnapshot = await readStableBinaryFile(manifestPath, { maxBytes: MAX_JSON_BYTES });
+      if (manifestSnapshot.sha256 !== manifestSha256) fail("manifest SHA differs from the ready-preview request binding.");
+      const checkpoint = await readState(checkpointPath, WORKFLOW_READY_PREVIEW_KIND);
+      const checkpointState = await assertPreviewCheckpoint(checkpoint, {
+        stagingToken: rawRequest.stagingToken,
+        workflowRoot,
+        prepareRequestDigest,
         manifestSha256,
-        reimbursementFactsCertificate: manifestAudit.reimbursementFactsCertificate,
-      }, { evidenceCache }),
-    ]);
-    if (rootSettled.status === "fulfilled") rootBuild = rootSettled.value;
-    if (presentationSettled.status === "fulfilled") presentationBuild = presentationSettled.value;
-    if (rootSettled.status === "rejected" || presentationSettled.status === "rejected") throw rootSettled.reason ?? presentationSettled.reason;
-    previewBuild = await buildReviewPreviews(workflowRoot, rootBuild, presentationBuild, testHooks, "gate-1");
-    const reviewPackageDigest = reviewPackageDigestFor(
+      });
+      manifestRecord = checkpointState.manifest;
+      manifestAudit = {
+        affectedProfileIds: checkpointState.affectedProfileIds,
+        batch: {
+          batchId: manifestRecord.batchId,
+          targetCategory: manifestRecord.targetCategory,
+          period: manifestRecord.period,
+          mainPeriod: manifestRecord.mainPeriod,
+        },
+        operationDigest: manifestRecord.operationDigest,
+        sourceCoverageDigest: checkpointState.certificate.sourceCoverageDigest,
+        factsDigest: checkpointState.factsDigest,
+        reimbursementFactsCertificate: checkpointState.certificate,
+      };
+      rootBuild = checkpointState.rootBuild;
+      presentationBuild = checkpointState.presentationBuild;
+      previewCheckpoint = { path: checkpoint.path, sha256: checkpoint.snapshot.sha256, size: checkpoint.snapshot.size };
+      reusedCheckpoint = true;
+    } else {
+      const manifestAuditPromise = earlyManifestAuditSettled.then((settled) => {
+        if (settled.status === "rejected") throw settled.reason;
+        return settled.value;
+      });
+      const rootBuilderModulePromise = testHooks?.buildRootWorkbookCandidates
+        ? Promise.resolve(null)
+        : import("./build_root_workbook_candidate.mjs");
+      const presentationBuilderModulePromise = testHooks?.buildReimbursementArtifacts
+        ? Promise.resolve(null)
+        : import("./build_reimbursement_artifacts.mjs");
+      const templateWarmPromise = import("./template_assets.mjs").then((module) => module.loadArtifactTemplates());
+      const sharpWarmPromise = Promise.resolve().then(() => loadPreviewSharp());
+      const startup = await Promise.allSettled([
+        manifestAuditPromise,
+        rootBuilderModulePromise,
+        presentationBuilderModulePromise,
+        templateWarmPromise,
+        sharpWarmPromise,
+      ]);
+      const startupFailure = startup.find((item) => item.status === "rejected");
+      if (startupFailure) throw startupFailure.reason;
+      manifestAudit = startup[0].value;
+      if (manifestAudit.manifestFileSha256 !== manifestSha256 || !path.isAbsolute(manifestAudit.batch?.archivePath ?? "")) fail("manifest auditor did not bind the requested bytes and archive path.");
+      if (canonicalDigest(baselines.map((item) => item.profileId)) !== canonicalDigest(manifestAudit.affectedProfileIds)) fail("baselines must exactly match affected profiles in registry order.");
+      manifestRecord = {
+        path: manifestPath,
+        sha256: manifestSha256,
+        archivePath: path.resolve(manifestAudit.batch.archivePath),
+        batchId: manifestAudit.batch.batchId,
+        operationDigest: manifestAudit.operationDigest,
+        targetCategory: manifestAudit.batch.targetCategory,
+        period: manifestAudit.batch.period,
+        mainPeriod: manifestAudit.batch.mainPeriod,
+      };
+      await fs.mkdir(workflowRoot, { recursive: false });
+      const rootBuilder = testHooks?.buildRootWorkbookCandidates ?? startup[1].value.buildRootWorkbookCandidates;
+      const presentationBuilder = testHooks?.buildReimbursementArtifacts ?? startup[2].value.buildReimbursementArtifacts;
+      const [rootSettled, presentationSettled] = await Promise.allSettled([
+        rootBuilder({
+          kind: "root-workbook-build-request-v1",
+          stagingToken: deriveToken(rawRequest.stagingToken, "root"),
+          reimbursementFactsCertificate: manifestAudit.reimbursementFactsCertificate,
+          artifacts: baselines.map((item) => ({ profileId: item.profileId, baselinePath: item.path, baselineSha256: item.sha256, baselineSize: item.size, candidateRevision: item.candidateRevision })),
+        }, { testHooks }),
+        presentationBuilder({
+          kind: REIMBURSEMENT_ARTIFACT_BUILD_KIND,
+          stagingToken: deriveToken(rawRequest.stagingToken, "presentation"),
+          manifestPath,
+          manifestSha256,
+          reimbursementFactsCertificate: manifestAudit.reimbursementFactsCertificate,
+        }),
+      ]);
+      if (rootSettled.status === "fulfilled") rootBuild = rootSettled.value;
+      if (presentationSettled.status === "fulfilled") presentationBuild = presentationSettled.value;
+      if (rootSettled.status === "rejected" || presentationSettled.status === "rejected") throw rootSettled.reason ?? presentationSettled.reason;
+      const checkpointCore = {
+        kind: WORKFLOW_READY_PREVIEW_KIND,
+        stagingToken: rawRequest.stagingToken,
+        workflowRoot,
+        prepareRequestDigest,
+        manifest: manifestRecord,
+        certificate: manifestAudit.reimbursementFactsCertificate,
+        factsDigest: manifestAudit.factsDigest,
+        affectedProfileIds: manifestAudit.affectedProfileIds,
+        baselines,
+        rootBuild,
+        presentationBuild,
+      };
+      const checkpointState = { ...checkpointCore, stateDigest: canonicalDigest(checkpointCore) };
+      previewCheckpoint = await writeExclusiveJson(checkpointPath, checkpointState);
+    }
+    previewBuild = await buildReviewPreviews(workflowRoot, rootBuild, presentationBuild, manifestAudit.reimbursementFactsCertificate.sourceCoverageDigest, testHooks, "gate-1");
+    const reviewPackageDigest = canonicalDigest({
       manifestSha256,
-      manifestAudit.reimbursementFactsCertificate,
-      rootBuild,
-      presentationBuild,
-      previewBuild,
-    );
-    const gate1 = gate1For(manifestAudit, rootBuild, reviewPackageDigest, previewBuild);
+      certificateDigest: manifestAudit.reimbursementFactsCertificate.certificateDigest,
+      roots: rootBuild.artifacts.map((item) => ({ profileId: item.profileId, candidateSha256: item.candidateSha256, planSha256: item.planSha256, auditDigest: item.audit.auditDigest })),
+      presentation: presentationBuild.artifacts.map((item) => ({ profileId: item.profileId, artifactDigest: item.artifactDigest, detailSha256: item.detail.sha256, screenshotSha256: item.screenshot.sha256 })),
+      previews: previewBuild.previews.map((item) => ({ profileId: item.profileId, role: item.role, sourceSha256: item.sourceSha256, sha256: item.sha256, sheetName: item.sheetName, rangeAddress: item.rangeAddress, bindingDigest: item.bindingDigest })),
+    });
+    const gate1 = gate1For(manifestAudit, rootBuild, reviewPackageDigest);
     const core = {
       kind: WORKFLOW_GATE1_KIND,
       requiresGate1Approval: true,
       stagingToken: rawRequest.stagingToken,
       workflowRoot,
-      manifest: { path: manifestPath, sha256: manifestSha256, archivePath: path.resolve(manifestStable.value.batch.archivePath), batchId: manifestAudit.batch.batchId, operationDigest: manifestAudit.operationDigest },
+      manifest: manifestRecord,
       certificate: manifestAudit.reimbursementFactsCertificate,
       affectedProfileIds: manifestAudit.affectedProfileIds,
       baselines,
       rootBuild,
       presentationBuild,
       previewBuild,
+      previewCheckpoint,
+      reusedPreviewCheckpoint: reusedCheckpoint,
       reviewPackageDigest,
       gate1,
     };
@@ -794,9 +902,29 @@ export async function prepareReimbursementWorkflow(rawRequest, { testHooks } = {
       stateDigest: state.stateDigest,
       affectedProfileIds: state.affectedProfileIds,
       previewEnginePeakWorkingSetBytes: previewBuild.enginePeakWorkingSetBytes,
-      review: buildReviewItems(presentationBuild, previewBuild),
+      review: presentationBuild.artifacts.map((item) => {
+        const root = rootBuild.artifacts.find((artifact) => artifact.profileId === item.profileId);
+        return {
+          profileId: item.profileId,
+          summary: item.summary.text,
+          detail: { path: item.detail.path, sha256: item.detail.sha256 },
+          screenshot: { path: item.screenshot.path, sha256: item.screenshot.sha256, imageCount: item.screenshot.imageCount },
+          candidate: root ? { path: root.candidatePath, sha256: root.candidateSha256, planSha256: root.planSha256 } : null,
+          structuralRepairs: clone(root?.structuralRepairs ?? []),
+          previews: previewBuild.previews.filter((preview) => preview.profileId === item.profileId),
+          evidenceCount: item.evidenceArchive.length,
+        };
+      }),
     });
   } catch (error) {
+    if (previewCheckpoint) {
+      const cleanup = previewBuild
+        ? await cleanupBound(previewBuild.ownedFiles, [previewBuild.outputRoot])
+        : { preserved: [], failures: [] };
+      if (cleanup.preserved.length || cleanup.failures.length) fail(`${error instanceof Error ? error.message : String(error)}; preview cleanup was incomplete while business artifacts were preserved.`);
+      fail(`${error instanceof Error ? error.message : String(error)}; business artifacts are preserved in ready-preview.json and the same prepare request may retry preview rendering only.`);
+    }
+    if (existingWorkflowRoot) throw error;
     const files = [...(rootBuild?.ownedFiles ?? []), ...(presentationBuild?.ownedFiles ?? []), ...(previewBuild?.ownedFiles ?? [])];
     const roots = [workflowRoot, previewBuild?.outputRoot, rootBuild?.stagingRoot, presentationBuild?.stagingRoot].filter(Boolean);
     const cleanup = await cleanupBound(files, roots);
@@ -806,41 +934,123 @@ export async function prepareReimbursementWorkflow(rawRequest, { testHooks } = {
 }
 
 export async function finalizeReimbursementWorkflow(rawRequest, { testHooks } = {}) {
-  exact(rawRequest, new Set(["statePath", "expectedGate1BindingDigest", "approvalText"]), "finalize request");
+  exact(rawRequest, new Set(["statePath", "expectedGate1BindingDigest", "approvalText", "independentEvidenceReviewPath", "independentEvidenceReviewSha256"]), "finalize request");
   if (rawRequest.approvalText !== GATE1_TEXT) fail("Gate 1 approval text is not exact.");
   const ready = await readState(rawRequest.statePath, WORKFLOW_GATE1_KIND);
   if (sha(rawRequest.expectedGate1BindingDigest, "expectedGate1BindingDigest") !== ready.state.gate1.bindingDigest) fail("Gate 1 binding digest differs from the displayed review package.");
-  await Promise.all([
-    ...ready.state.baselines.map((baseline) => assertBoundFile(baseline, `${baseline.profileId} baseline`)),
-    ...ready.state.rootBuild.artifacts.flatMap((artifact) => [
-      assertBoundFile(
-        { path: artifact.candidatePath, sha256: artifact.candidateSha256, size: artifact.candidateSize },
-        `${artifact.profileId} candidate`,
-      ),
-      assertBoundFile(
+  const invalidationPath = path.join(ready.state.workflowRoot, "gate1-invalidation.json");
+  const priorInvalidation = await readOptionalStableJson(invalidationPath);
+  if (priorInvalidation) {
+    const marker = object(priorInvalidation.value, "Gate 1 invalidation marker");
+    if (marker.kind !== "gate1-invalidation-v1" || marker.gate1BindingDigest !== ready.state.gate1.bindingDigest || canonicalDigest(withoutDigest(marker, "markerDigest")) !== marker.markerDigest) fail("Gate 1 invalidation marker is invalid.");
+    fail(`Gate 1 was permanently invalidated by full correspondence audit ${marker.fullCorrespondenceAuditDigest}; a corrected batch requires a new Gate 1.`);
+  }
+  const independentEvidenceReviewPath = path.resolve(text(rawRequest.independentEvidenceReviewPath, "independentEvidenceReviewPath"));
+  const independentEvidenceReviewSha256 = sha(rawRequest.independentEvidenceReviewSha256, "independentEvidenceReviewSha256");
+  const independentReviewStable = await readStableUtf8JsonFile(independentEvidenceReviewPath, { maxBytes: MAX_JSON_BYTES });
+  if (independentReviewStable.sha256 !== independentEvidenceReviewSha256) fail("independent evidence review SHA differs before Gate 2.");
+  const correspondencePath = path.join(ready.state.workflowRoot, "gate2-full-correspondence.json");
+  let correspondence;
+  let correspondenceFile;
+  // Gate 2 preview verification only rereads and hashes the already-bound Gate 1
+  // PNGs. Start it alongside full correspondence, but keep a settled wrapper so
+  // correspondence remains the first reported failure and no rejection escapes.
+  const gate2PreviewBuildSettled = buildReviewPreviews(
+    ready.state.workflowRoot,
+    ready.state.rootBuild,
+    ready.state.presentationBuild,
+    ready.state.certificate.sourceCoverageDigest,
+    testHooks,
+    "gate-2",
+    ready.state.previewBuild,
+  ).then(
+    (value) => ({ status: "fulfilled", value }),
+    (reason) => ({ status: "rejected", reason }),
+  );
+  try {
+  const existingCorrespondence = await readOptionalStableJson(correspondencePath);
+  if (existingCorrespondence) {
+    correspondence = object(existingCorrespondence.value, "full correspondence checkpoint");
+    if (
+      correspondence.kind !== FULL_CORRESPONDENCE_AUDIT_KIND
+      || canonicalDigest(withoutDigest(correspondence, "reportDigest")) !== correspondence.reportDigest
+      || correspondence.status !== "passed"
+      || correspondence.disposition !== "PASSED"
+      || correspondence.gate1BindingDigest !== ready.state.gate1.bindingDigest
+      || correspondence.independentEvidenceReviewSha256 !== independentEvidenceReviewSha256
+    ) fail("full correspondence checkpoint is invalid or bound to another Gate 1/review.");
+    correspondenceFile = { path: correspondencePath, sha256: existingCorrespondence.sha256, size: existingCorrespondence.size };
+    await Promise.all([
+      assertBoundFile(ready.state.manifest, "checkpoint manifest"),
+      ...ready.state.baselines.map((baseline) => assertBoundFile(baseline, `${baseline.profileId} checkpoint baseline`)),
+      ...ready.state.rootBuild.artifacts.flatMap((artifact) => [
+        assertBoundFile({ path: artifact.candidatePath, sha256: artifact.candidateSha256, size: artifact.candidateSize }, `${artifact.profileId} checkpoint candidate`),
+        assertBoundFile({ path: artifact.previewPath, sha256: artifact.previewSha256, size: artifact.previewSize }, `${artifact.profileId} checkpoint root preview`),
+        assertBoundFile({ path: artifact.planPath, sha256: artifact.planSha256, size: artifact.planSize }, `${artifact.profileId} checkpoint plan`),
+      ]),
+      ...ready.state.presentationBuild.artifacts.flatMap((artifact) => [
+        assertBoundFile(artifact.detail, `${artifact.profileId} checkpoint detail`),
+        assertBoundFile(artifact.screenshot, `${artifact.profileId} checkpoint screenshot`),
+        assertBoundFile(artifact.summary, `${artifact.profileId} checkpoint summary`),
+        ...artifact.supplements.map((supplement) => assertBoundFile(supplement, `${artifact.profileId} checkpoint supplement ${supplement.person}`)),
+        ...artifact.evidenceArchive.map((evidence) => assertBoundFile(evidence, `${artifact.profileId} checkpoint evidence ${evidence.evidenceId}`)),
+      ]),
+    ]);
+  } else {
+    await Promise.all([
+      ...ready.state.baselines.map((baseline) => assertBoundFile(baseline, `${baseline.profileId} baseline`)),
+      ...ready.state.rootBuild.artifacts.map((artifact) => assertBoundFile(
         { path: artifact.planPath, sha256: artifact.planSha256, size: artifact.planSize },
         `${artifact.profileId} candidate plan`,
-      ),
-    ]),
-    ...ready.state.presentationBuild.artifacts.flatMap((artifact) => [
-      assertBoundFile(artifact.detail, `${artifact.profileId} detail`),
-      assertBoundFile(artifact.screenshot, `${artifact.profileId} screenshot`),
-      assertBoundFile(artifact.summary, `${artifact.profileId} summary`),
-      ...(artifact.supplement ? [assertBoundFile(artifact.supplement, `${artifact.profileId} supplement`)] : []),
-      ...artifact.evidenceArchive.map((evidence) => assertBoundFile(evidence, `${artifact.profileId} evidence ${evidence.evidenceId}`)),
-    ]),
-    ...ready.state.previewBuild.previews.map((preview) => assertBoundFile(preview, `${preview.profileId} ${preview.role} preview`)),
-  ]);
-  const rootByProfile = new Map(ready.state.rootBuild.artifacts.map((item) => [item.profileId, item]));
-  const profiles = ready.state.baselines.map((baseline) => ({
-    profileId: baseline.profileId,
-    baselinePath: baseline.path,
-    baselineSha256: baseline.sha256,
-    candidatePath: rootByProfile.get(baseline.profileId).candidatePath,
-    candidateSha256: rootByProfile.get(baseline.profileId).candidateSha256,
-  }));
-  const finalAudit = await runBatchAudit(ready.state.workflowRoot, ready.state.certificate, profiles, "final");
-  const gate2PreviewBuild = await buildReviewPreviews(ready.state.workflowRoot, ready.state.rootBuild, ready.state.presentationBuild, testHooks, "gate-2", ready.state.previewBuild);
+      )),
+    ]);
+    try {
+      const { auditFullCorrespondence } = await import("./audit_full_correspondence.mjs");
+      correspondence = await auditFullCorrespondence({
+        gate1State: ready.state,
+        independentEvidenceReviewSnapshot: {
+          path: independentEvidenceReviewPath,
+          sha256: independentEvidenceReviewSha256,
+          size: independentReviewStable.size,
+          value: independentReviewStable.value,
+        },
+      }, { hooks: testHooks?.fullCorrespondenceHooks });
+    } catch (error) {
+      fail(`full correspondence audit could not complete; Gate 1 remains valid and may be retried: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    if (correspondence.disposition === "BLOCKED_RETRYABLE") {
+      const blockingCount = correspondence.blocking?.length ?? 0;
+      fail(`full correspondence audit was blocked by ${blockingCount} retryable condition(s); Gate 1 remains valid and may be retried with corrected review/input.`);
+    }
+    if (!new Set(["PASSED", "SUBSTANTIVE_MISMATCH"]).has(correspondence.disposition)) fail("full correspondence audit returned an invalid disposition; Gate 1 remains valid and may be retried.");
+    correspondenceFile = await writeExclusiveJson(correspondencePath, correspondence);
+    if (correspondence.disposition === "SUBSTANTIVE_MISMATCH") {
+      const markerCore = {
+        kind: "gate1-invalidation-v1",
+        gate1BindingDigest: ready.state.gate1.bindingDigest,
+        fullCorrespondenceAuditDigest: correspondence.reportDigest,
+        fullCorrespondenceAuditSha256: correspondenceFile.sha256,
+        independentEvidenceReviewDigest: correspondence.independentEvidenceReviewDigest,
+        reason: "full-correspondence-mismatch",
+      };
+      const marker = { ...markerCore, markerDigest: canonicalDigest(markerCore) };
+      await writeExclusiveJson(invalidationPath, marker);
+      const issueCount = ["missing", "extra", "mismatches", "duplicate", "unbound"].reduce((total, field) => total + correspondence[field].length, 0);
+      fail(`full correspondence audit found ${issueCount} mismatch(es); Gate 1 is permanently invalid and a corrected batch requires a new Gate 1.`);
+    }
+  }
+  } catch (error) {
+    await gate2PreviewBuildSettled;
+    throw error;
+  }
+  const finalAudit = {
+    kind: "gate2-full-correspondence-profile-audits-v1",
+    reportDigest: correspondence.reportDigest,
+    audits: correspondence.profileAudits,
+  };
+  const gate2PreviewBuildResult = await gate2PreviewBuildSettled;
+  if (gate2PreviewBuildResult.status === "rejected") throw gate2PreviewBuildResult.reason;
+  const gate2PreviewBuild = gate2PreviewBuildResult.value;
   try {
     const gate2 = gate2For(
       { ...ready.state.manifest, batch: { batchId: ready.state.manifest.batchId }, sourceCoverageDigest: ready.state.certificate.sourceCoverageDigest },
@@ -848,7 +1058,7 @@ export async function finalizeReimbursementWorkflow(rawRequest, { testHooks } = 
       finalAudit.audits,
       ready.state.baselines,
       gate2PreviewBuild.previewDigest,
-      gate2PreviewBuild,
+      correspondence,
     );
     const core = {
       ...stateCore(ready.state),
@@ -857,6 +1067,24 @@ export async function finalizeReimbursementWorkflow(rawRequest, { testHooks } = 
       requiresGate2Approval: true,
       finalAudit,
       finalAuditDigest: canonicalDigest(finalAudit),
+      fullCorrespondenceAudit: {
+        ...correspondenceFile,
+        reportDigest: correspondence.reportDigest,
+        independentEvidenceReviewDigest: correspondence.independentEvidenceReviewDigest,
+        status: correspondence.status,
+        disposition: correspondence.disposition,
+        coverage: correspondence.coverage,
+        totals: correspondence.totals,
+        issueCounts: Object.fromEntries(["missing", "extra", "mismatches", "duplicate", "unbound", "blocking"].map((field) => [field, correspondence[field].length])),
+        metrics: correspondence.metrics,
+      },
+      independentEvidenceReview: {
+        path: independentEvidenceReviewPath,
+        sha256: independentEvidenceReviewSha256,
+        size: independentReviewStable.size,
+        digest: correspondence.independentEvidenceReviewDigest,
+        reviewerRunId: correspondence.reviewerRunId,
+      },
       gate2PreviewBuild,
       gate2,
       previousState: { path: ready.path, sha256: ready.snapshot.sha256 },
@@ -872,7 +1100,29 @@ export async function finalizeReimbursementWorkflow(rawRequest, { testHooks } = 
       stateDigest: state.stateDigest,
       affectedProfileIds: state.affectedProfileIds,
       previewEnginePeakWorkingSetBytes: gate2PreviewBuild.enginePeakWorkingSetBytes,
-      review: buildReviewItems(ready.state.presentationBuild, gate2PreviewBuild),
+      fullCorrespondenceAudit: clone(state.fullCorrespondenceAudit),
+      review: ready.state.presentationBuild.artifacts.map((item) => {
+        const root = ready.state.rootBuild.artifacts.find((artifact) => artifact.profileId === item.profileId);
+        return {
+          profileId: item.profileId,
+          summary: item.summary.text,
+          detail: { path: item.detail.path, sha256: item.detail.sha256 },
+          screenshot: { path: item.screenshot.path, sha256: item.screenshot.sha256, imageCount: item.screenshot.imageCount },
+          candidate: root ? { path: root.candidatePath, sha256: root.candidateSha256, planSha256: root.planSha256 } : null,
+          structuralRepairs: clone(root?.structuralRepairs ?? []),
+          previews: gate2PreviewBuild.previews.filter((preview) => preview.profileId === item.profileId),
+          evidenceCount: item.evidenceArchive.length,
+          fullCorrespondenceAudit: {
+            path: state.fullCorrespondenceAudit.path,
+            sha256: state.fullCorrespondenceAudit.sha256,
+            reportDigest: state.fullCorrespondenceAudit.reportDigest,
+            status: state.fullCorrespondenceAudit.status,
+            coverage: state.fullCorrespondenceAudit.coverage,
+            totals: state.fullCorrespondenceAudit.totals,
+            issueCounts: state.fullCorrespondenceAudit.issueCounts,
+          },
+        };
+      }),
     });
   } catch (error) {
     const cleanup = await cleanupBound(gate2PreviewBuild.ownedFiles, [gate2PreviewBuild.outputRoot]);
@@ -912,10 +1162,22 @@ async function cleanupCreatedDirectories(directories) {
 }
 
 async function copyExclusiveBound(source, target) {
-  await fs.copyFile(source.path, target, fsConstants.COPYFILE_EXCL);
-  const stable = await readStableBinaryFile(target);
-  if (stable.sha256 !== source.sha256 || stable.size !== source.size) fail(`${target} differs from its approved source.`);
-  return { path: target, sha256: stable.sha256, size: stable.size };
+  let copied = false;
+  try {
+    await fs.copyFile(source.path, target, fsConstants.COPYFILE_EXCL);
+    copied = true;
+    const stable = await readStableBinaryFile(target);
+    if (stable.sha256 !== source.sha256 || stable.size !== source.size) fail(`${target} differs from its approved source.`);
+    return { path: target, sha256: stable.sha256, size: stable.size };
+  } catch (error) {
+    if (copied && error && typeof error === "object") {
+      const current = await readStableBinaryFile(target).catch(() => null);
+      if (current?.sha256 === source.sha256 && current.size === source.size) {
+        Object.defineProperty(error, "ownedFile", { configurable: true, value: { path: target, sha256: current.sha256, size: current.size } });
+      }
+    }
+    throw error;
+  }
 }
 
 async function rollbackPublished(entries) {
@@ -941,6 +1203,10 @@ export async function publishReimbursementWorkflow(rawRequest) {
   if (rawRequest.gate1ApprovalText !== GATE1_TEXT || rawRequest.gate2ApprovalText !== GATE2_TEXT) fail("both approval texts must be exact and supplied from the current task.");
   const ready = await readState(rawRequest.statePath, WORKFLOW_GATE2_KIND);
   if (sha(rawRequest.expectedGate1BindingDigest, "expectedGate1BindingDigest") !== ready.state.gate1.bindingDigest || sha(rawRequest.expectedGate2BindingDigest, "expectedGate2BindingDigest") !== ready.state.gate2.bindingDigest) fail("Gate binding digest differs from the reviewed state.");
+  await Promise.all([
+    assertBoundFile(ready.state.fullCorrespondenceAudit, "publish full correspondence audit"),
+    assertBoundFile(ready.state.independentEvidenceReview, "publish independent evidence review"),
+  ]);
   const registry = await loadProfileRegistry();
   const rootByProfile = new Map(ready.state.rootBuild.artifacts.map((item) => [item.profileId, item]));
   const presentationByProfile = new Map(ready.state.presentationBuild.artifacts.map((item) => [item.profileId, item]));
@@ -959,51 +1225,58 @@ export async function publishReimbursementWorkflow(rawRequest) {
       await Promise.all([
         assertBoundFile(baseline, `${baseline.profileId} publish baseline`),
         assertBoundFile({ path: root.candidatePath, sha256: root.candidateSha256, size: root.candidateSize }, `${baseline.profileId} publish candidate`),
-        assertBoundFile({ path: root.planPath, sha256: root.planSha256, size: root.planSize }, `${baseline.profileId} publish candidate plan`),
         assertBoundFile(presentation.detail, `${baseline.profileId} publish detail`),
         assertBoundFile(presentation.screenshot, `${baseline.profileId} publish screenshot`),
         assertBoundFile(presentation.summary, `${baseline.profileId} publish summary`),
-        ...(presentation.supplement ? [assertBoundFile(presentation.supplement, `${baseline.profileId} publish supplement`)] : []),
+        ...presentation.supplements.map((supplement) => assertBoundFile(supplement, `${baseline.profileId} publish supplement ${supplement.person}`)),
         ...presentation.evidenceArchive.map((evidence) => assertBoundFile(evidence, `${baseline.profileId} publish evidence ${evidence.evidenceId}`)),
         ...(previewsByProfile.get(baseline.profileId) ?? []).map((preview) => assertBoundFile(preview, `${baseline.profileId} publish ${preview.role} preview`)),
       ]);
-      const profileArchive = path.join(ready.state.manifest.archivePath, profile.archiveDirectoryName);
-      await ensureArchiveDirectory(profileArchive, `${baseline.profileId} archive directory`, createdDirectories);
-      const safePeriod = presentation.period.replace(/[<>:"/\\|?*]/gu, "-");
-      const screenshotArchiveDirectory = path.join(profileArchive, `${safePeriod}_${profile.targetCategory}_报销截图`);
-      await ensureArchiveDirectory(screenshotArchiveDirectory, `${baseline.profileId} screenshot archive directory`, createdDirectories);
-      const supplementEvidence = presentation.evidenceArchive.filter((item) => item.archiveKind === "supplement");
-      const supplementArchiveDirectory = supplementEvidence.length > 0
-        ? path.join(profileArchive, `${safePeriod}_${profile.targetCategory}_补报凭证`)
-        : null;
-      if (supplementArchiveDirectory) {
-        await ensureArchiveDirectory(supplementArchiveDirectory, `${baseline.profileId} supplement evidence archive directory`, createdDirectories);
+      const profileArchive = ready.state.manifest.archivePath;
+      const expectedArchiveName = `${presentation.period}_${profile.targetCategory}${presentation.supplementSuffix}`;
+      if (ready.state.affectedProfileIds.length === 1 && path.basename(profileArchive) !== expectedArchiveName) {
+        fail(`manifest archive folder must be named ${expectedArchiveName}.`);
       }
-      const archived = { evidenceArchive: [], supplementEvidenceArchive: [] };
-      const businessCopies = await Promise.all([
+      const screenshotRoot = path.join(profileArchive, "报销截图");
+      await ensureArchiveDirectory(screenshotRoot, `${baseline.profileId} screenshot root`, createdDirectories);
+      const screenshotArchiveDirectory = path.join(screenshotRoot, profile.screenshotMapSheetName);
+      await ensureArchiveDirectory(screenshotArchiveDirectory, `${baseline.profileId} screenshot archive directory`, createdDirectories);
+      const archived = { evidenceArchive: [], supplements: [] };
+      const ledgerEnd = `${Number(presentation.periodEndDate.slice(0, 4))}.${Number(presentation.periodEndDate.slice(5, 7))}.${Number(presentation.periodEndDate.slice(8, 10))}`;
+      const copyResults = await Promise.allSettled([
         copyExclusiveBound(presentation.detail, path.join(profileArchive, path.basename(presentation.detail.path))),
         copyExclusiveBound(presentation.screenshot, path.join(profileArchive, path.basename(presentation.screenshot.path))),
         copyExclusiveBound(presentation.summary, path.join(profileArchive, path.basename(presentation.summary.path))),
-        copyExclusiveBound({ path: root.candidatePath, sha256: root.candidateSha256, size: root.candidateSize }, path.join(profileArchive, `${safePeriod}_${profile.targetCategory}_候选总表.xlsx`)),
-        ...(presentation.supplement ? [copyExclusiveBound(presentation.supplement, path.join(profileArchive, path.basename(presentation.supplement.path)))] : []),
+        copyExclusiveBound({ path: root.candidatePath, sha256: root.candidateSha256, size: root.candidateSize }, path.join(profileArchive, `${profile.archiveStem}_截至${ledgerEnd}.xlsx`)),
+        ...presentation.supplements.map((supplement) => copyExclusiveBound(supplement, path.join(profileArchive, path.basename(supplement.path)))),
+        ...presentation.evidenceArchive.map((evidence) => copyExclusiveBound(evidence, path.join(screenshotArchiveDirectory, evidence.finalName))),
       ]);
-      [archived.detail, archived.screenshot, archived.summary, archived.candidateTable] = businessCopies;
-      if (presentation.supplement) archived.supplement = businessCopies[4];
-      const evidenceCopies = await Promise.all(presentation.evidenceArchive.map((evidence) => copyExclusiveBound(
-        evidence,
-        path.join(evidence.archiveKind === "supplement" ? supplementArchiveDirectory : screenshotArchiveDirectory, evidence.finalName),
-      )));
-      for (const [index, copied] of evidenceCopies.entries()) {
-        const evidence = presentation.evidenceArchive[index];
-        const target = evidence.archiveKind === "supplement" ? archived.supplementEvidenceArchive : archived.evidenceArchive;
-        target.push({ evidenceId: evidence.evidenceId, ...copied });
+      for (const result of copyResults) {
+        if (result.status === "fulfilled") archiveCopies.push(result.value);
+        else if (result.reason?.ownedFile) archiveCopies.push(result.reason.ownedFile);
       }
-      const copies = [...businessCopies, ...evidenceCopies];
-      archiveCopies.push(...copies);
+      const copyFailure = copyResults.find((result) => result.status === "rejected");
+      if (copyFailure) throw copyFailure.reason;
+      const copies = copyResults.map((result) => result.value);
+      [archived.detail, archived.screenshot, archived.summary, archived.snapshot] = copies;
+      const supplementOffset = 4;
+      archived.supplements = copies.slice(supplementOffset, supplementOffset + presentation.supplements.length)
+        .map((copied, index) => ({ person: presentation.supplements[index].person, ...copied }));
+      const evidenceOffset = supplementOffset + presentation.supplements.length;
+      archived.evidenceArchive = copies.slice(evidenceOffset).map((copied, index) => ({ evidenceId: presentation.evidenceArchive[index].evidenceId, ...copied }));
       const baselineStable = await readStableBinaryFile(baseline.path);
       const backupPath = path.join(ready.state.workflowRoot, `.rollback-${baseline.profileId}-${crypto.randomBytes(8).toString("hex")}.xlsx`);
-      const handle = await fs.open(backupPath, "wx", 0o600);
-      try { await handle.writeFile(copyStableBinaryBytes(baselineStable)); await handle.sync(); } finally { await handle.close(); }
+      let backupCreated = false;
+      try {
+        const handle = await fs.open(backupPath, "wx", 0o600);
+        backupCreated = true;
+        try { await handle.writeFile(copyStableBinaryBytes(baselineStable)); await handle.sync(); } finally { await handle.close(); }
+      } catch (error) {
+        if (backupCreated) {
+          try { await fs.unlink(backupPath); } catch (cleanupError) { if (cleanupError?.code !== "ENOENT") throw new Error(`${error instanceof Error ? error.message : String(error)}; incomplete rollback backup cleanup: ${backupPath}`, { cause: error }); }
+        }
+        throw error;
+      }
       const backup = await readStableBinaryFile(backupPath);
       const backupBinding = { path: backupPath, sha256: backup.sha256, size: backup.size };
       backups.push(backupBinding);
@@ -1035,10 +1308,10 @@ export async function publishReimbursementWorkflow(rawRequest) {
         }
         return results;
       })();
-    for (const item of publishResults) if (item.status === "fulfilled") published.push({ profileId: item.value.profileId, targetPath: item.value.targetPath, targetOriginallyAbsent: item.value.targetOriginallyAbsent, baselineSha256: item.value.baseline.sha256, candidateSha256: item.value.root.candidateSha256, backup: item.value.backup, result: item.value.result, archived: item.value.archived });
+    for (const item of publishResults) if (item.status === "fulfilled") published.push({ profileId: item.value.profileId, targetPath: item.value.targetPath, targetOriginallyAbsent: item.value.targetOriginallyAbsent, baselineSha256: item.value.baseline.sha256, candidateSha256: item.value.root.candidateSha256, localPatchCertificate: item.value.root.localPatchCertificate, backup: item.value.backup, result: item.value.result, archived: item.value.archived });
     const publishFailure = publishResults.find((item) => item.status === "rejected");
     if (publishFailure) throw publishFailure.reason;
-    const postProfiles = published.map((entry) => ({ profileId: entry.profileId, baselinePath: entry.backup.path, baselineSha256: entry.baselineSha256, candidatePath: entry.targetPath, candidateSha256: entry.candidateSha256 }));
+    const postProfiles = published.map((entry) => ({ profileId: entry.profileId, baselinePath: entry.backup.path, baselineSha256: entry.baselineSha256, candidatePath: entry.targetPath, candidateSha256: entry.candidateSha256, localPatchCertificate: entry.localPatchCertificate }));
     const postAudit = await runBatchAudit(ready.state.workflowRoot, ready.state.certificate, postProfiles, "post-publish");
     const postAuditByProfile = new Map(postAudit.audits.map((item) => [item.profile.profileId, item]));
     for (const entry of published) {
@@ -1051,13 +1324,12 @@ export async function publishReimbursementWorkflow(rawRequest) {
         batchId: ready.state.manifest.batchId,
         profileId: entry.profileId,
         root: { filename: path.basename(entry.targetPath), sha256: entry.candidateSha256 },
-        candidateTable: { filename: path.basename(entry.archived.candidateTable.path), sha256: entry.archived.candidateTable.sha256 },
+        snapshot: { filename: path.basename(entry.archived.snapshot.path), sha256: entry.archived.snapshot.sha256 },
         detail: { filename: path.basename(entry.archived.detail.path), sha256: entry.archived.detail.sha256 },
         screenshot: { filename: path.basename(entry.archived.screenshot.path), sha256: entry.archived.screenshot.sha256 },
         summary: { filename: path.basename(entry.archived.summary.path), sha256: entry.archived.summary.sha256 },
-        ...(entry.archived.supplement ? { supplement: { filename: path.basename(entry.archived.supplement.path), sha256: entry.archived.supplement.sha256 } } : {}),
         evidence: entry.archived.evidenceArchive.map((item) => ({ filename: path.basename(item.path), sha256: item.sha256 })),
-        supplementEvidence: entry.archived.supplementEvidenceArchive.map((item) => ({ filename: path.basename(item.path), sha256: item.sha256 })),
+        supplements: entry.archived.supplements.map((item) => ({ person: item.person, filename: path.basename(item.path), sha256: item.sha256 })),
         previews: (previewsByProfile.get(entry.profileId) ?? []).map((item) => ({ role: item.role, sourceSha256: item.sourceSha256, sha256: item.sha256, rangeAddress: item.rangeAddress })),
         manifestSha256: ready.state.manifest.sha256,
         factsDigest: ready.state.certificate.factsDigest,
@@ -1067,6 +1339,8 @@ export async function publishReimbursementWorkflow(rawRequest) {
         transitionDigest: audit.transitionDigest,
         gate1BindingDigest: ready.state.gate1.bindingDigest,
         gate2BindingDigest: ready.state.gate2.bindingDigest,
+        fullCorrespondenceAuditDigest: ready.state.fullCorrespondenceAudit.reportDigest,
+        independentEvidenceReviewDigest: ready.state.independentEvidenceReview.digest,
       };
       const auditDocument = { ...auditCore, auditDigest: canonicalDigest(auditCore) };
       const auditFile = await writeExclusiveJson(
@@ -1083,15 +1357,14 @@ export async function publishReimbursementWorkflow(rawRequest) {
         detail: entry.archived.detail,
         screenshot: entry.archived.screenshot,
         summary: entry.archived.summary,
-        candidateTable: entry.archived.candidateTable,
-        ...(entry.archived.supplement ? { supplement: entry.archived.supplement } : {}),
+        snapshot: entry.archived.snapshot,
+        supplements: entry.archived.supplements,
         evidenceArchive: entry.archived.evidenceArchive,
-        ...(entry.archived.supplementEvidenceArchive.length > 0 ? { supplementEvidenceArchive: entry.archived.supplementEvidenceArchive } : {}),
         publishAuditDigest: entry.publishAuditDigest,
       };
     });
     const receiptCore = { kind: WORKFLOW_RECEIPT_KIND, batchId: ready.state.manifest.batchId, affectedProfileIds: ready.state.affectedProfileIds, outputs, postPublishAuditDigest: canonicalDigest(postAudit) };
-    const cleanupFiles = [...backups, ...temporaryAuditFiles, ...ready.state.rootBuild.ownedFiles, ...ready.state.presentationBuild.ownedFiles, ...ready.state.previewBuild.ownedFiles, ...ready.state.gate2PreviewBuild.ownedFiles, { path: ready.path, sha256: ready.snapshot.sha256 }, ready.state.previousState];
+    const cleanupFiles = [...backups, ...temporaryAuditFiles, ...ready.state.rootBuild.ownedFiles, ...ready.state.presentationBuild.ownedFiles, ...ready.state.previewBuild.ownedFiles, ...ready.state.gate2PreviewBuild.ownedFiles, ready.state.fullCorrespondenceAudit, ready.state.previewCheckpoint, { path: ready.path, sha256: ready.snapshot.sha256 }, ready.state.previousState];
     const cleanup = await cleanupBound(cleanupFiles, [ready.state.workflowRoot, ready.state.previewBuild.outputRoot, ready.state.gate2PreviewBuild.outputRoot, ready.state.rootBuild.stagingRoot, ready.state.presentationBuild.stagingRoot]);
     return deepFreeze({ ...receiptCore, receiptDigest: canonicalDigest(receiptCore), cleanup });
   } catch (error) {

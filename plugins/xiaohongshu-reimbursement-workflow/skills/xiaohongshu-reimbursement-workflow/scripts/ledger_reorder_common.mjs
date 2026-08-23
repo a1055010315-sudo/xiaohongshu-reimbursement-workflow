@@ -718,12 +718,13 @@ export async function loadPlanRequest(requestPath) {
 }
 
 async function loadPackage(name) {
-  const require = createRequire(import.meta.url);
+  const runtimeRoot = path.resolve(path.dirname(process.execPath), "..");
+  const require = createRequire(path.join(runtimeRoot, "__codex_bundled_runtime__.cjs"));
   let resolved;
   try {
     resolved = require.resolve(name);
   } catch {
-    throw new Error(`${name} is unavailable; run with the bundled Node runtime and NODE_PATH.`);
+    throw new Error(`${name} is unavailable; run with the bundled Node runtime and workspace dependencies.`);
   }
   return import(pathToFileURL(resolved).href);
 }

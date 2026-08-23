@@ -226,7 +226,7 @@ function baselineFacts() {
       worksheet(sheetIdentities[0], [
         row(1, [cell("A1", 1, "日期"), cell("B1", 1, "项目")]),
         row(2, [
-          cell("A2", 1, "2026-08-13"),
+          cell("A2", 1, "2032-05-09"),
           cell("B2", 1, "旧项目"),
           cell("C2", 2, "10.00", { type: "n", value: { raw: "10.00", text: null }, numberFormat: { numFmtId: 2, formatCode: "0.00" } }),
           cell("D2", 2, "10.00", { type: "n", value: { raw: "10.00", text: null }, numberFormat: { numFmtId: 2, formatCode: "0.00" } }),

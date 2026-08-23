@@ -275,13 +275,13 @@ function sha256(value) {
 
 function manifestTransactions() {
   return [
-    { id: "TX-XHS", date: "2026-08-02", person: "新甲", project: "小红书新增", label: "新甲",
+    { id: "TX-XHS", date: "2032-04-17", person: "新甲", project: "小红书新增", label: "新甲",
       amount: "20.25", category: "小红书报销", profileId: "xiaohongshu", classification: "新组",
       sourceOrder: 10, settlement: "employee_reimbursement" },
-    { id: "TX-COMPANY", date: "2026-08-02", person: "新乙", project: "公司新增", label: "新乙",
+    { id: "TX-COMPANY", date: "2032-04-17", person: "新乙", project: "公司新增", label: "新乙",
       amount: "30", category: "公司报销", profileId: "company", classification: "公司组",
       sourceOrder: 20, settlement: "company_paid_no_reimbursement" },
-    { id: "TX-RESIDENCE", date: "2026-08-02", person: "新丙", project: "驻所新增", label: "新丙",
+    { id: "TX-RESIDENCE", date: "2032-04-17", person: "新丙", project: "驻所新增", label: "新丙",
       amount: "1.625", category: "驻所报销", profileId: "residence", classification: "驻所组",
       sourceOrder: 30, settlement: "employee_reimbursement" },
   ];
@@ -399,7 +399,7 @@ function makeInput(profileId, certificate, baselineSha256, candidateSha256) {
 
 function baseRecord(profileId, options = {}) {
   return {
-    date: options.date ?? "2026-08-01",
+    date: options.date ?? "2032-04-16",
     project: options.project ?? "基线-" + profileId,
     amount: options.amount ?? "10",
     person: options.person ?? "基线人员",
@@ -629,8 +629,8 @@ test("baseline same-date physical order is stable and cannot be caller-reordered
   const certificate = makeFactsCertificate();
   const profile = registry.profiles.xiaohongshu;
   const baselineRecords = [
-    baseRecord("xiaohongshu", { project: "基线甲", date: "2026-08-01", group: "g1" }),
-    baseRecord("xiaohongshu", { project: "基线乙", date: "2026-08-01", group: "g2", person: "基线乙" }),
+    baseRecord("xiaohongshu", { project: "基线甲", date: "2032-04-16", group: "g1" }),
+    baseRecord("xiaohongshu", { project: "基线乙", date: "2032-04-16", group: "g2", person: "基线乙" }),
   ];
   const baseline = await writeWorkbook("order-baseline.xlsx", baselineRecords, {
     sheetName: profile.managedRootSheetName,
@@ -651,8 +651,8 @@ test("baseline same-date physical order is stable and cannot be caller-reordered
 test("baseline groups crossing an insertion date fail closed instead of being split", async () => {
   const certificate = makeFactsCertificate();
   const baselineRecords = [
-    baseRecord("xiaohongshu", { date: "2026-08-01", project: "跨日甲", group: "cross", groupMode: "formula" }),
-    baseRecord("xiaohongshu", { date: "2026-08-03", project: "跨日乙", group: "cross", groupMode: "formula" }),
+    baseRecord("xiaohongshu", { date: "2032-04-16", project: "跨日甲", group: "cross", groupMode: "formula" }),
+    baseRecord("xiaohongshu", { date: "2032-04-18", project: "跨日乙", group: "cross", groupMode: "formula" }),
   ];
   const baseline = await writeWorkbook("cross-date-baseline.xlsx", baselineRecords, {
     sheetName: registry.profiles.xiaohongshu.managedRootSheetName,
@@ -705,11 +705,11 @@ test("baseline and manifest records never cross-merge", async () => {
     ...manifestTransactions()[0],
     person: "基线人员",
     classification: "基线组",
-    date: "2026-08-01",
+    date: "2032-04-16",
   }]);
   await assert.rejects(
     async () => runAudit(await pairFor("xiaohongshu", certificate, {
-      baseline: { date: "2026-08-01", groupMode: "formula" },
+      baseline: { date: "2032-04-16", groupMode: "formula" },
       transaction: { group: "baseline-group" },
     })),
     /cross.*group|baseline.*manifest|merge/iu,
@@ -895,15 +895,15 @@ test("one used source unit may support multiple same-profile and cross-profile t
 
 test("manifest sourceOrder controls only manifest peers while baseline same-date rows stay first", async () => {
   const transactions = [
-    { ...manifestTransactions()[0], id: "TX-XHS-Z", sourceOrder: 1, date: "2026-08-01", project: "来源顺序一", classification: "顺序一" },
-    { ...manifestTransactions()[0], id: "TX-XHS-A", sourceOrder: 2, date: "2026-08-01", project: "来源顺序二", classification: "顺序二" },
+    { ...manifestTransactions()[0], id: "TX-XHS-Z", sourceOrder: 1, date: "2032-04-16", project: "来源顺序一", classification: "顺序一" },
+    { ...manifestTransactions()[0], id: "TX-XHS-A", sourceOrder: 2, date: "2032-04-16", project: "来源顺序二", classification: "顺序二" },
   ].reverse();
   const certificate = makeFactsCertificate(transactions);
   const first = certificate.factsPreimage.transactions.find((item) => item.sourceOrder === 1);
   const second = certificate.factsPreimage.transactions.find((item) => item.sourceOrder === 2);
   const baselineRecords = [
-    baseRecord("xiaohongshu", { date: "2026-08-01", project: "基线同日甲", group: "baseline-a" }),
-    baseRecord("xiaohongshu", { date: "2026-08-01", project: "基线同日乙", person: "基线乙", group: "baseline-b" }),
+    baseRecord("xiaohongshu", { date: "2032-04-16", project: "基线同日甲", group: "baseline-a" }),
+    baseRecord("xiaohongshu", { date: "2032-04-16", project: "基线同日乙", person: "基线乙", group: "baseline-b" }),
   ];
   const accepted = await explicitPair(
     "xiaohongshu",
@@ -1084,7 +1084,7 @@ test("actual OOXML business extractor rejects field, date, row, merge, and out-o
   });
 
   const fieldCases = [
-    ["date", { date: "2026-08-03" }],
+    ["date", { date: "2032-04-18" }],
     ["project", { project: "篡改项目" }],
     ["amount", { amount: "20.251" }],
     ["person", { person: "篡改人员" }],
@@ -1107,7 +1107,7 @@ test("actual OOXML business extractor rejects field, date, row, merge, and out-o
   });
   await t.test("extra candidate row", async () => {
     const candidateRecords = validCandidate().concat([
-      baseRecord("xiaohongshu", { date: "2026-08-03", project: "额外行", person: "额外人员", group: "extra" }),
+      baseRecord("xiaohongshu", { date: "2032-04-18", project: "额外行", person: "额外人员", group: "extra" }),
     ]);
     await assert.rejects(
       async () => runAudit(await explicitPair("xiaohongshu", certificate, baselineRecords, candidateRecords)),
@@ -1129,10 +1129,10 @@ test("actual OOXML business extractor rejects field, date, row, merge, and out-o
 });
 
 test("actual A and D/E/F merge topology is independently enforced", async (t) => {
-  const sameDateTransaction = { ...manifestTransactions()[0], date: "2026-08-01", sourceOrder: 1 };
+  const sameDateTransaction = { ...manifestTransactions()[0], date: "2032-04-16", sourceOrder: 1 };
   const sameDateCertificate = makeFactsCertificate([sameDateTransaction]);
   const sameDateCanonical = sameDateCertificate.factsPreimage.transactions[0];
-  const baselineRecords = [baseRecord("xiaohongshu", { date: "2026-08-01" })];
+  const baselineRecords = [baseRecord("xiaohongshu", { date: "2032-04-16" })];
   const sameDateCandidate = baselineRecords.concat([transactionRecord(sameDateCanonical)]);
   await t.test("missing A merge", async () => {
     await assert.rejects(
@@ -1185,7 +1185,7 @@ test("actual A and D/E/F merge topology is independently enforced", async (t) =>
   });
   await t.test("extra cross-origin D/E/F merge", async () => {
     const crossBaseline = [baseRecord("xiaohongshu", {
-      date: "2026-08-01",
+      date: "2032-04-16",
       person: "合并人员",
       classification: "合并组",
     })];
@@ -1218,10 +1218,10 @@ test("actual A and D/E/F merge topology is independently enforced", async (t) =>
 });
 
 test("date style roles follow baseline records and new date masters", async () => {
-  const transaction = { ...manifestTransactions()[0], date: "2026-08-01", sourceOrder: 1 };
+  const transaction = { ...manifestTransactions()[0], date: "2032-04-16", sourceOrder: 1 };
   const certificate = makeFactsCertificate([transaction]);
   const canonical = certificate.factsPreimage.transactions[0];
-  const baselineRecords = [baseRecord("xiaohongshu", { date: "2026-08-03" })];
+  const baselineRecords = [baseRecord("xiaohongshu", { date: "2032-04-18" })];
   const movedBaseline = { ...baselineRecords[0], aStyle: 5 };
   await assert.rejects(
     async () => runAudit(await explicitPair(
@@ -1325,7 +1325,7 @@ test("production CLI accepts v2 and rejects v1, unknown arguments, SHA drift, an
 });
 
 test("large workbook audit growth remains near-linear across rows and merges", async () => {
-  const transaction = { ...manifestTransactions()[0], date: "2026-08-02", sourceOrder: 1 };
+  const transaction = { ...manifestTransactions()[0], date: "2032-04-17", sourceOrder: 1 };
   const certificate = makeFactsCertificate([transaction]);
   const canonical = certificate.factsPreimage.transactions[0];
   const makeBaseline = (count) => Array.from({ length: count }, (_, index) => {
@@ -1333,7 +1333,7 @@ test("large workbook audit growth remains near-linear across rows and merges", a
     const inPair = index % 4 < 2;
     const group = inPair ? "pair-" + pairIndex : "single-" + index;
     return baseRecord("xiaohongshu", {
-      date: "2026-08-01",
+      date: "2032-04-16",
       project: "large-row-" + String(index).padStart(5, "0"),
       amount: "1",
       person: "person-" + group,

@@ -22,7 +22,6 @@
       ],
       "detailSheetName": "本次报销明细",
       "screenshotMapSheetName": "小红书报销",
-      "archiveDirectoryName": "01_小红书专项",
       "archiveStem": "小红书支出总表",
       "preserveUnmanagedSheets": true
     },
@@ -42,7 +41,6 @@
       ],
       "detailSheetName": "本次报销明细",
       "screenshotMapSheetName": "公司报销",
-      "archiveDirectoryName": "02_公司专项",
       "archiveStem": "公司支出总表",
       "preserveUnmanagedSheets": true
     },
@@ -66,7 +64,6 @@
       ],
       "detailSheetName": "本次报销明细",
       "screenshotMapSheetName": "住所报销",
-      "archiveDirectoryName": "03_住所专项",
       "archiveStem": "驻所支出",
       "preserveUnmanagedSheets": true
     }

@@ -1,0 +1,338 @@
+{
+  "schemaVersion": 1,
+  "textTemplates": {
+    "summary-text": {
+      "file": "summary-text.txt",
+      "encoding": "utf-8",
+      "requiredPlaceholders": [
+        "YYYY年M月D日",
+        "<报销人1>",
+        "<报销人2>",
+        "<实报金额>",
+        "<含提成人员>",
+        "<提成期间>",
+        "<提成金额>",
+        "<补报人员>",
+        "<补报期间>",
+        "<补报笔数>",
+        "<补报金额>",
+        "<对公事项或主体>",
+        "<金额>",
+        "<实际报销总额>"
+      ],
+      "annotationKindLabels": {
+        "commission": "引流提成",
+        "bonus": "奖金",
+        "allowance": "补贴"
+      },
+      "sha256": "d024d1fca7e4cd49b7ccd90a8614bfd9483afba2e133f0b5232a205e752aadb4"
+    }
+  },
+  "templates": {
+    "current-detail": {
+      "file": "current-detail.xlsx",
+      "sheetName": "本次报销明细",
+      "dataStartRow": 7,
+      "dataStyleRow": 7,
+      "templateRowHeight": 24,
+      "staticMerges": [
+        "A1:F1",
+        "A2:F2",
+        "A3:B3",
+        "C3:D3",
+        "E3:F3",
+        "A4:B4",
+        "C4:D4",
+        "E4:F4",
+        "A5:C5",
+        "D5:F5"
+      ],
+      "outputMergePolicy": {
+        "personGroup": true,
+        "sameDate": true,
+        "expenseGroup": true,
+        "description": true,
+        "dataAreaDefault": "none"
+      },
+      "outputRowHeightPolicy": {
+        "title": 32,
+        "subtitle": 15,
+        "summaryLabel": 15,
+        "summaryValue": 15,
+        "notes": 24,
+        "header": 26,
+        "group": 15,
+        "default": "template",
+        "longText": 42,
+        "description": 28,
+        "allowImageLayoutAdjustment": false
+      },
+      "styleRoles": {
+        "title": 1,
+        "subtitle": 2,
+        "summaryLabel": 3,
+        "companySummaryLabel": 4,
+        "feeSummaryLabel": 5,
+        "summaryValue": 6,
+        "companySummaryValue": 7,
+        "feeSummaryValue": 9,
+        "header": 12,
+        "groupLabel": 13,
+        "groupTotal": 14,
+        "date": 15,
+        "text": 16,
+        "amount": 17,
+        "feeTotal": 18,
+        "classification": 19,
+        "settlement": 19,
+        "description": 0,
+        "summaryValue0": 6,
+        "summaryValue1": 75,
+        "summaryValue2": 76,
+        "summaryValue3": 77,
+        "companySummaryValue0": 7,
+        "companySummaryValue1": 78,
+        "companySummaryValue2": 79,
+        "companySummaryValue3": 80,
+        "feeSummaryValue0": 9,
+        "feeSummaryValue1": 81,
+        "feeSummaryValue2": 82,
+        "feeSummaryValue3": 83,
+        "groupTotal0": 14,
+        "groupTotal1": 84,
+        "groupTotal2": 85,
+        "groupTotal3": 86,
+        "amount0": 17,
+        "amount1": 87,
+        "amount2": 88,
+        "amount3": 89,
+        "feeTotal0": 18,
+        "feeTotal1": 90,
+        "feeTotal2": 91,
+        "feeTotal3": 92,
+        "companyNote": 10,
+        "feeNote": 11
+      },
+      "sha256": "bd079debb29891193bd85f42d19ea9e46d483ab94de78f7bb66413cbba8a54dd",
+      "moneyNumberFormats": [
+        "0",
+        "0.0",
+        "0.00",
+        "0.000"
+      ],
+      "moneyStyleRoles": [
+        "summaryValue",
+        "companySummaryValue",
+        "feeSummaryValue",
+        "groupTotal",
+        "amount",
+        "feeTotal"
+      ]
+    },
+    "screenshot-map": {
+      "file": "screenshot-map.xlsx",
+      "sheetName": "报销明细对应截图表",
+      "dataStartRow": 2,
+      "dataStyleRow": 2,
+      "templateRowHeight": 60,
+      "staticMerges": [],
+      "outputMergePolicy": {
+        "personGroup": false,
+        "sameDate": false,
+        "expenseGroup": false,
+        "dataAreaDefault": "none"
+      },
+      "outputRowHeightPolicy": {
+        "noImage": 60,
+        "image": 172.5,
+        "allowImageLayoutAdjustment": true
+      },
+      "styleRoles": {
+        "header": 6,
+        "oddDate": 102,
+        "oddText": 103,
+        "oddAmount": 104,
+        "oddNote": 105,
+        "image": 106,
+        "evenDate": 19,
+        "evenText": 20,
+        "evenAmount": 21,
+        "evenNote": 17,
+        "oddAmount0": 104,
+        "oddAmount1": 107,
+        "oddAmount2": 108,
+        "oddAmount3": 109,
+        "evenAmount0": 21,
+        "evenAmount1": 110,
+        "evenAmount2": 111,
+        "evenAmount3": 112
+      },
+      "sha256": "cd29b440cdf06005a5a7b408a991c1f67d9d937b7ab8dbc5607f5562dfeeffc7",
+      "moneyNumberFormats": [
+        "0",
+        "0.0",
+        "0.00",
+        "0.000"
+      ],
+      "moneyStyleRoles": [
+        "oddAmount",
+        "evenAmount"
+      ],
+      "outputFillPolicy": {
+        "bodyOdd": "FFFFFCF4",
+        "bodyEven": "FFFFF7E6",
+        "image": "FFF5F8FA"
+      },
+      "outputImagePolicy": {
+        "maxWidthPx": 320,
+        "maxHeightPx": 220,
+        "fit": "contain",
+        "align": "center"
+      }
+    },
+    "supplement-detail": {
+      "file": "supplement-detail.xlsx",
+      "sheetName": "补报明细",
+      "dataStartRow": 5,
+      "dataStyleRow": 5,
+      "templateRowHeight": 30,
+      "staticMerges": [
+        "A1:F1",
+        "A2:F2",
+        "A3:F3"
+      ],
+      "outputMergePolicy": {
+        "personGroup": false,
+        "sameDate": true,
+        "expenseGroup": true,
+        "footer": true,
+        "dataAreaDefault": "none"
+      },
+      "outputRowHeightPolicy": {
+        "title": 34,
+        "subtitle": 28,
+        "longSubtitle": 30,
+        "summary": 24,
+        "header": 24,
+        "default": "template",
+        "longText": 38,
+        "footer": 28,
+        "allowImageLayoutAdjustment": false
+      },
+      "styleRoles": {
+        "title": 4,
+        "subtitle": 9,
+        "summaryLabel": 13,
+        "companySummaryLabel": 13,
+        "feeSummaryLabel": 13,
+        "summaryValue": 32,
+        "companySummaryValue": 32,
+        "feeSummaryValue": 32,
+        "header": 18,
+        "groupLabel": 23,
+        "groupTotal": 32,
+        "date": 31,
+        "text": 24,
+        "amount": 32,
+        "feeTotal": 32,
+        "classification": 23,
+        "settlement": 23,
+        "spacer": 0,
+        "summaryValue0": 32,
+        "summaryValue1": 35,
+        "summaryValue2": 36,
+        "summaryValue3": 37,
+        "companySummaryValue0": 32,
+        "companySummaryValue1": 35,
+        "companySummaryValue2": 36,
+        "companySummaryValue3": 37,
+        "feeSummaryValue0": 32,
+        "feeSummaryValue1": 35,
+        "feeSummaryValue2": 36,
+        "feeSummaryValue3": 37,
+        "groupTotal0": 32,
+        "groupTotal1": 35,
+        "groupTotal2": 36,
+        "groupTotal3": 37,
+        "amount0": 32,
+        "amount1": 35,
+        "amount2": 36,
+        "amount3": 37,
+        "feeTotal0": 32,
+        "feeTotal1": 35,
+        "feeTotal2": 36,
+        "feeTotal3": 37,
+        "footerValue0": 34,
+        "footerValue1": 38,
+        "footerValue2": 39,
+        "footerValue3": 40,
+        "footerLabel": 30,
+        "footerValue": 34
+      },
+      "sha256": "55e5eb420a1c5573c349462cf33670c874f7d5adfd105635f1e953953b7b2f86",
+      "moneyNumberFormats": [
+        "0",
+        "0.0",
+        "0.00",
+        "0.000"
+      ],
+      "moneyStyleRoles": [
+        "summaryValue",
+        "companySummaryValue",
+        "feeSummaryValue",
+        "groupTotal",
+        "amount",
+        "feeTotal",
+        "footerValue"
+      ]
+    },
+    "ledger-batch-preview": {
+      "file": "ledger-batch-preview.xlsx",
+      "sheetName": "本批总表增量",
+      "dataStartRow": 2,
+      "dataStyleRow": 2,
+      "templateRowHeight": 30,
+      "staticMerges": [],
+      "outputMergePolicy": {
+        "personGroup": false,
+        "sameDate": true,
+        "expenseGroup": true,
+        "dataAreaDefault": "none"
+      },
+      "outputRowHeightPolicy": {
+        "default": "template",
+        "allowImageLayoutAdjustment": false
+      },
+      "styleRoles": {
+        "headerDate": 2,
+        "headerText": 3,
+        "headerAmount": 4,
+        "date": 73,
+        "text": 74,
+        "amount": 75,
+        "total": 75,
+        "person": 74,
+        "classification": 74,
+        "amount0": 75,
+        "amount1": 77,
+        "amount2": 78,
+        "amount3": 79,
+        "total0": 75,
+        "total1": 77,
+        "total2": 78,
+        "total3": 79
+      },
+      "sha256": "9d02904b6dc87e5c2f4bfd22d191fe0c1df05dc547723313b00924bae0829faa",
+      "moneyNumberFormats": [
+        "0",
+        "0.0",
+        "0.00",
+        "0.000"
+      ],
+      "moneyStyleRoles": [
+        "amount",
+        "total"
+      ]
+    }
+  }
+}
