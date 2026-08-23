@@ -19,7 +19,7 @@ import {
   archiveCompactDisbursementWorkflow,
   auditCompactDisbursementCandidate,
 } from "../scripts/run_compact_disbursement_workflow.mjs";
-import { readStableBinaryFile } from "../scripts/workflow_primitives.mjs";
+import { readStableBinaryFile, sha256Bytes } from "../scripts/workflow_primitives.mjs";
 import { createCompactDisbursementProductionFixture } from "./disbursement-production-fixture.mjs";
 
 const execFileAsync = promisify(execFile);
@@ -101,6 +101,47 @@ test("one explicit archive call performs fresh review, atomic publication, final
   });
 });
 
+test("strict manifest v2 completes reimbursement-only, salary-only, and mixed archives without legacy prerequisites", async (t) => {
+  const cases = [
+    { name: "reimbursement-only", options: { profileIds: ["xiaohongshu"], reimbursementTransactionCount: 8, includeSalary: false } },
+    { name: "salary-only", options: { profileIds: [], reimbursementTransactionCount: 0, includeSalary: true } },
+    { name: "mixed", options: { profileIds: ["xiaohongshu"], reimbursementTransactionCount: 8, includeSalary: true } },
+  ];
+  for (const entry of cases) {
+    await t.test(entry.name, async () => {
+      await withProductionSandbox({
+        manifestVersion: 2,
+        reimbursementMode: "fresh_evidence",
+        requestedUniqueVoucherCount: 3,
+        ...entry.options,
+      }, async ({ fixture }) => {
+        const receipt = await archiveCompactDisbursementWorkflow(requestFor(fixture));
+        await assertStrictFinalArchive(fixture, receipt);
+        assert.equal(receipt.cleanup.removed, true);
+        assert.equal(fixture.manifest.sourceFiles.some((file) => file.usage.includes("salary_certificate_attestation")), false);
+        assert.equal(fixture.manifest.sourceFiles.some((file) => file.usage.includes("original_manifest_attestation")), false);
+        assert.equal(fixture.manifest.sourceFiles.some((file) => file.usage.includes("publish_receipt_attestation")), false);
+      });
+    });
+  }
+});
+
+test("published_archive manifest v2 completes a full archive without original manifest or publish receipt", async () => {
+  await withProductionSandbox({
+    manifestVersion: 2,
+    reimbursementMode: "published_archive",
+    profileIds: ["xiaohongshu"],
+    reimbursementTransactionCount: 8,
+    includeSalary: false,
+    requestedUniqueVoucherCount: 3,
+  }, async ({ fixture }) => {
+    const receipt = await archiveCompactDisbursementWorkflow(requestFor(fixture));
+    await assertStrictFinalArchive(fixture, receipt);
+    assert.equal(fixture.manifest.reimbursementSources[0].attestations, undefined);
+    assert.equal(receipt.cleanup.removed, true);
+  });
+});
+
 test("archive request is exact and old multi-step request kinds are closed", async () => {
   await withProductionSandbox({ reimbursementTransactionCount: 6, requestedUniqueVoucherCount: 3 }, async ({ fixture }) => {
     const request = requestFor(fixture);
@@ -148,8 +189,10 @@ test("owner binding rejects staging-token reuse for a different request", async 
       }),
       /simulated owner crash/u,
     );
+    const differentManifestPath = path.join(fixture.root, "different-manifest.json");
+    await fs.copyFile(fixture.manifestPath, differentManifestPath);
     await assert.rejects(
-      archiveCompactDisbursementWorkflow({ ...request, manifestPath: path.join(fixture.root, "different-manifest.json") }),
+      archiveCompactDisbursementWorkflow({ ...request, manifestPath: differentManifestPath }),
       /owner marker is invalid or belongs to another archive request/u,
     );
   });

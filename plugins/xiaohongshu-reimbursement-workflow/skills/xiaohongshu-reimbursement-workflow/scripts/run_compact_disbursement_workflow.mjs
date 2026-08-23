@@ -1396,11 +1396,10 @@ export async function archiveCompactDisbursementWorkflow(rawRequest, { testHooks
   const manifest = Object.freeze({ path: manifestPath, sha256: manifestSha256 });
   const archiveRequestDigest = canonicalDigest({ kind: rawRequest.kind, stagingToken, manifestPath, manifestSha256 });
   const workflowRoot = path.join(path.resolve(os.tmpdir()), `${WORKFLOW_PREFIX}${stagingToken}`);
-  const opened = await openOwnedWorkflow({ workflowRoot, stagingToken, archiveRequestDigest, manifest, testHooks });
-
   const initialAudit = await auditDisbursementManifest({ manifestPath, manifestSha256 });
   const boundSourcePaths = boundSourcePathsFromAudit(initialAudit);
   const archiveParentIdentity = await capturePlainDirectoryIdentity(initialAudit.batch.archiveParentPath, "archive parent");
+  const opened = await openOwnedWorkflow({ workflowRoot, stagingToken, archiveRequestDigest, manifest, testHooks });
   const baseContext = Object.freeze({
     stagingToken,
     workflowRoot,
