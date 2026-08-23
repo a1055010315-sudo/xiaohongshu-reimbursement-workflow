@@ -3,6 +3,8 @@ import fs from "node:fs/promises";
 import { constants as fsConstants, realpathSync } from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
+import { Writable } from "node:stream";
+import { pipeline as runStreamPipeline } from "node:stream/promises";
 import { pathToFileURL } from "node:url";
 import { TextDecoder } from "node:util";
 
@@ -269,9 +271,14 @@ async function callTestHook(testHooks, name, context) {
   if (hook) await hook(context);
 }
 
-async function readBoundedHandle(handle, expectedSize, { maxBytes, chunkSize, testHooks, phase, inputLabel }) {
+async function readBoundedHandle(handle, expectedSize, { maxBytes, chunkSize, testHooks, phase, inputLabel, compareBytes = null }) {
   if (expectedSize > maxBytes) throw stableInputError(`exceeds the ${maxBytes}-byte limit`, undefined, inputLabel);
-  const chunks = [];
+  if (compareBytes !== null && (!(compareBytes instanceof Uint8Array) || compareBytes.byteLength !== expectedSize)) {
+    throw stableInputError("changed between stable reads", undefined, inputLabel);
+  }
+  const retainedBytes = compareBytes === null ? Buffer.allocUnsafe(expectedSize) : null;
+  const scratch = compareBytes === null ? null : Buffer.allocUnsafe(Math.max(1, Math.min(chunkSize, expectedSize || 1)));
+  const digest = crypto.createHash("sha256");
   let totalBytes = 0;
   const reportRead = async (bytesRead) => {
     totalBytes += bytesRead;
@@ -281,11 +288,17 @@ async function readBoundedHandle(handle, expectedSize, { maxBytes, chunkSize, te
 
   while (totalBytes < expectedSize) {
     const requestSize = Math.min(chunkSize, expectedSize - totalBytes, maxBytes + 1 - totalBytes);
-    const buffer = Buffer.allocUnsafe(requestSize);
-    const result = await handle.read(buffer, 0, requestSize, totalBytes);
+    const readOffset = totalBytes;
+    const buffer = retainedBytes ?? scratch;
+    const bufferOffset = retainedBytes ? readOffset : 0;
+    const result = await handle.read(buffer, bufferOffset, requestSize, readOffset);
     if (!result || result.bytesRead <= 0) throw stableInputError("was truncated during read", undefined, inputLabel);
     if (result.bytesRead > requestSize) throw stableInputError("returned an invalid read length", undefined, inputLabel);
-    chunks.push(result.bytesRead === requestSize ? buffer : buffer.subarray(0, result.bytesRead));
+    const chunk = buffer.subarray(bufferOffset, bufferOffset + result.bytesRead);
+    digest.update(chunk);
+    if (compareBytes !== null && !chunk.equals(compareBytes.subarray(readOffset, readOffset + result.bytesRead))) {
+      throw stableInputError("changed between stable reads", undefined, inputLabel);
+    }
     await reportRead(result.bytesRead);
   }
 
@@ -295,7 +308,7 @@ async function readBoundedHandle(handle, expectedSize, { maxBytes, chunkSize, te
     await reportRead(extra.bytesRead);
     throw stableInputError("grew during bounded read", undefined, inputLabel);
   }
-  return Buffer.concat(chunks, totalBytes);
+  return Object.freeze({ bytes: retainedBytes, sha256: digest.digest("hex") });
 }
 
 async function readStablePhase(filePath, phase, options) {
@@ -312,13 +325,14 @@ async function readStablePhase(filePath, phase, options) {
     }
     const expectedSize = safeSize(openedStats, options.maxBytes, options.inputLabel);
     await callTestHook(options.testHooks, "afterOpen", { phase, filePath });
-    const bytes = await readBoundedHandle(handle, expectedSize, { ...options, phase });
+    const content = await readBoundedHandle(handle, expectedSize, { ...options, phase });
     const afterStats = await handle.stat();
     if (!sameFingerprint(openedFingerprint, fileFingerprint(afterStats))) {
       throw stableInputError("changed while being read", undefined, options.inputLabel);
     }
     return Object.freeze({
-      bytes,
+      bytes: content.bytes,
+      sha256: content.sha256,
       size: expectedSize,
       canonicalPath: before.canonicalPath,
       fingerprint: openedFingerprint,
@@ -359,13 +373,12 @@ export async function readStableUtf8JsonFile(filePath, {
   await callTestHook(testHooks, "afterInitialRead", { filePath: absolutePath, size: initial.size });
   await assertStablePathCurrent(absolutePath, initial);
   await callTestHook(testHooks, "beforeFreshRead", { filePath: absolutePath });
-  const fresh = await readStablePhase(absolutePath, "fresh", options);
+  const fresh = await readStablePhase(absolutePath, "fresh", { ...options, compareBytes: initial.bytes });
   if (
     fresh.canonicalPath !== initial.canonicalPath
     || !sameFingerprint(fresh.fingerprint, initial.fingerprint)
     || fresh.size !== initial.size
-    || sha256Bytes(fresh.bytes) !== sha256Bytes(initial.bytes)
-    || Buffer.compare(fresh.bytes, initial.bytes) !== 0
+    || fresh.sha256 !== initial.sha256
   ) {
     throw stableInputError("changed between stable reads");
   }
@@ -381,7 +394,7 @@ export async function readStableUtf8JsonFile(filePath, {
   return Object.freeze({
     value,
     size: initial.size,
-    sha256: sha256Bytes(initial.bytes),
+    sha256: initial.sha256,
   });
 }
 
@@ -403,14 +416,13 @@ export async function readStableBinaryFile(filePath, {
   await callTestHook(testHooks, "afterInitialRead", { filePath: absolutePath, size: initial.size });
   await assertStablePathCurrent(absolutePath, initial);
   await callTestHook(testHooks, "beforeFreshRead", { filePath: absolutePath });
-  const fresh = await readStablePhase(absolutePath, "fresh", options);
-  const initialSha256 = sha256Bytes(initial.bytes);
+  const fresh = await readStablePhase(absolutePath, "fresh", { ...options, compareBytes: initial.bytes });
+  const initialSha256 = initial.sha256;
   if (
     fresh.canonicalPath !== initial.canonicalPath
     || !sameFingerprint(fresh.fingerprint, initial.fingerprint)
     || fresh.size !== initial.size
-    || sha256Bytes(fresh.bytes) !== initialSha256
-    || Buffer.compare(fresh.bytes, initial.bytes) !== 0
+    || fresh.sha256 !== initialSha256
   ) {
     throw stableInputError("changed between stable reads", undefined, options.inputLabel);
   }
@@ -420,7 +432,7 @@ export async function readStableBinaryFile(filePath, {
     size: initial.size,
     sha256: initialSha256,
   });
-  stableBinaryBytes.set(snapshot, Buffer.from(initial.bytes));
+  stableBinaryBytes.set(snapshot, initial.bytes);
   return snapshot;
 }
 
@@ -460,6 +472,60 @@ export function loadBundledDependency(packageName) {
   const loaded = require(resolved);
   bundledDependencyCache.set(packageName, loaded);
   return loaded;
+}
+
+export async function inspectFullyDecodedImageBytes(bytes, {
+  failOn = "error",
+  limitInputPixels = 100_000_000,
+  autoOrient = false,
+} = {}) {
+  if (!(bytes instanceof Uint8Array) || bytes.byteLength < 1) {
+    throw new Error("Full image decode requires non-empty bytes.");
+  }
+  if (!new Set(["none", "truncated", "error", "warning"]).has(failOn)) {
+    throw new Error("Full image decode failOn mode is invalid.");
+  }
+  if (!Number.isSafeInteger(limitInputPixels) || limitInputPixels < 1) {
+    throw new Error("Full image decode pixel limit must be a positive safe integer.");
+  }
+  const SharpModule = loadBundledDependency("sharp");
+  const sharp = SharpModule.default ?? SharpModule;
+  const input = sharp(bytes, { failOn, limitInputPixels });
+  const decoder = (autoOrient ? input.rotate() : input).raw();
+  let info;
+  let decodedBytes = 0;
+  const captureInfo = (value) => { info = value; };
+  decoder.once("info", captureInfo);
+  const sink = new Writable({
+    write(chunk, _encoding, callback) {
+      decodedBytes += chunk.length;
+      callback();
+    },
+  });
+  // Node's pipeline owns teardown of both the Sharp decoder and the sink on
+  // error or premature close, so a damaged image cannot leave a native
+  // decoder or dangling listener behind before the next validation.
+  try {
+    await runStreamPipeline(decoder, sink);
+  } finally {
+    decoder.off("info", captureInfo);
+  }
+  const width = info?.width;
+  const height = info?.height;
+  if (
+    !Number.isSafeInteger(width)
+    || !Number.isSafeInteger(height)
+    || width < 1
+    || height < 1
+    || !Number.isSafeInteger(info?.channels)
+    || info.channels < 1
+    || !Number.isSafeInteger(info?.size)
+    || info.size < 1
+    || decodedBytes !== info.size
+  ) {
+    throw new Error("Full image decode did not stream complete pixels and dimensions.");
+  }
+  return Object.freeze({ width, height });
 }
 
 function bundledRuntimeDependencyRoots() {
@@ -579,13 +645,25 @@ export async function mapSettledLimit(items, limit, worker) {
     startedCount,
   });
   if (hasFailure) {
-    const propagatedError = primaryError instanceof Error
+    let propagatedError = primaryError instanceof Error
       ? primaryError
       : new Error("Limited worker rejected with a non-Error reason.", { cause: primaryError });
-    Object.defineProperty(propagatedError, "settledDetails", {
-      configurable: true,
-      value: details,
-    });
+    try {
+      Object.defineProperty(propagatedError, "settledDetails", {
+        configurable: true,
+        value: details,
+      });
+    } catch {
+      // Frozen, sealed, or conflicting Error objects must not discard the
+      // settlement inventory that callers need to clean already-finished work.
+      propagatedError = new Error(propagatedError.message || "Limited worker failed.", {
+        cause: propagatedError,
+      });
+      Object.defineProperty(propagatedError, "settledDetails", {
+        configurable: true,
+        value: details,
+      });
+    }
     throw propagatedError;
   }
   return details;

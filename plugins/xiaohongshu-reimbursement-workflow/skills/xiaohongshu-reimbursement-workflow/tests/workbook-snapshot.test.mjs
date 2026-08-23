@@ -205,6 +205,25 @@ test("shared primitives preserve canonical digest semantics and settled limiter 
     assert.equal(normalized.settledDetails.settled[0].status, "rejected");
     assert.equal(normalized.settledDetails.settled[1], undefined);
   }
+
+  const frozenPrimary = Object.freeze(new Error("frozen limiter failure"));
+  let frozenRejection;
+  try {
+    await mapSettledLimit([0, 1], 2, async (value) => {
+      if (value === 0) throw frozenPrimary;
+      await new Promise((resolve) => setImmediate(resolve));
+      return "peer-finished";
+    });
+  } catch (error) {
+    frozenRejection = error;
+  }
+  assert.ok(frozenRejection instanceof Error);
+  assert.notEqual(frozenRejection, frozenPrimary);
+  assert.equal(frozenRejection.cause, frozenPrimary);
+  assert.match(frozenRejection.message, /frozen limiter failure/u);
+  assert.equal(frozenRejection.settledDetails.startedCount, 2);
+  assert.equal(frozenRejection.settledDetails.settled[0].reason, frozenPrimary);
+  assert.deepEqual(frozenRejection.settledDetails.settled[1], { status: "fulfilled", value: "peer-finished" });
 });
 
 test("stable file snapshots hide bytes, bind identity, and close handles on failure", async (context) => {

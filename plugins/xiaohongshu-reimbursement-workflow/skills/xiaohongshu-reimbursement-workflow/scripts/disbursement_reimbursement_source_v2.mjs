@@ -1031,7 +1031,19 @@ function identifyExplicitArchiveRoot(source, review, fileById, registry) {
   return candidates[0];
 }
 
-async function auditPublishedArchiveSource(source, review, fileById, registry, archiveLayout) {
+function declaredPublishedArchiveFileIds(source) {
+  const declaredFileIds = [...source.inputFileIds, ...Object.values(source.attestations ?? {})];
+  if (new Set(declaredFileIds).size !== declaredFileIds.length) fail(`${source.id} declares duplicate input/attestation file ids.`);
+  return Object.freeze(declaredFileIds);
+}
+
+async function callSourceAuditTestHook(testHooks, name, context) {
+  const hook = testHooks?.[name];
+  if (hook !== undefined && typeof hook !== "function") throw new Error(`Published archive test hook ${name} must be a function.`);
+  if (hook) await hook(context);
+}
+
+async function auditPublishedArchiveSource(source, review, fileById, registry, archiveLayout, declaredFileIds, loadFile) {
   if (source.mode !== "published_archive" || review.mode !== "published_archive") fail(`${source.id} is not a published_archive source.`);
   const profile = registry.profiles[source.profileId];
   if (!profile) fail(`${source.id} has unknown profile ${source.profileId}.`);
@@ -1041,8 +1053,6 @@ async function auditPublishedArchiveSource(source, review, fileById, registry, a
     end: normalizeDisbursementIsoDate(review.facts.reimbursementPeriod.end, `${review.id}.reimbursementPeriod.end`),
   };
   if (period.start > period.end) fail(`${source.id} sourceReview reimbursementPeriod is reversed.`);
-  const declaredFileIds = [...source.inputFileIds, ...Object.values(source.attestations ?? {})];
-  if (new Set(declaredFileIds).size !== declaredFileIds.length) fail(`${source.id} declares duplicate input/attestation file ids.`);
   if (canonicalDigest([...review.reviewedFileIds].sort()) !== canonicalDigest([...declaredFileIds].sort())) {
     fail(`${source.id} sourceReview reviewedFileIds do not exactly cover explicit source files.`);
   }
@@ -1050,7 +1060,7 @@ async function auditPublishedArchiveSource(source, review, fileById, registry, a
   for (const [index, fileId] of declaredFileIds.entries()) {
     const file = fileById.get(fileId);
     if (!file) fail(`${source.id} references missing sourceFiles id ${fileId}.`);
-    loaded.push(await loadBoundSourceFile(file, `${source.id}.files[${index}]`));
+    loaded.push(await loadFile(file, `${source.id}.files[${index}]`));
   }
   const loadedById = new Map(loaded.map((item) => [item.fileId, item]));
   const loadedByPath = new Map(loaded.map((item) => [pathKey(item.path), item]));
@@ -1139,7 +1149,7 @@ async function auditPublishedArchiveSource(source, review, fileById, registry, a
  * Audits normalized v2 published-archive reimbursement sources without scanning
  * any directory. Every byte read is named by inputFileIds or attestations.
  */
-export async function auditDisbursementReimbursementSourcesV2(rawInput) {
+export async function auditDisbursementReimbursementSourcesV2(rawInput, { testHooks } = {}) {
   exact(rawInput, new Set(["sourceFiles", "reimbursementSources", "reimbursementReviews"]), new Set(), "input");
   const sourceFiles = array(rawInput.sourceFiles, "sourceFiles");
   const reimbursementSources = array(rawInput.reimbursementSources, "reimbursementSources");
@@ -1160,28 +1170,73 @@ export async function auditDisbursementReimbursementSourcesV2(rawInput) {
   const sourceIds = new Set();
   const rootClaimBySourceId = new Map();
   const profileIdsByRoot = new Map();
+  const declaredFileIdsBySourceId = new Map();
+  const remainingFileUses = new Map();
   for (const source of reimbursementSources) {
     if (sourceIds.has(source.id)) fail(`reimbursement source ${source.id} is duplicated.`);
     sourceIds.add(source.id);
     const review = reviewBySource.get(source.id);
     if (!review) fail(`sourceReview for ${source.id} is missing.`);
+    const declaredFileIds = declaredPublishedArchiveFileIds(source);
+    declaredFileIdsBySourceId.set(source.id, declaredFileIds);
     const root = identifyExplicitArchiveRoot(source, review, fileById, registry);
     rootClaimBySourceId.set(source.id, root);
     const key = pathKey(root);
     if (!profileIdsByRoot.has(key)) profileIdsByRoot.set(key, new Set());
     profileIdsByRoot.get(key).add(source.profileId);
+    for (const fileId of declaredFileIds) {
+      remainingFileUses.set(fileId, (remainingFileUses.get(fileId) ?? 0) + 1);
+    }
   }
+  const loadedFileCache = new Map();
+  const fileLoadCounts = new Map();
+  const loadFile = async (file, field) => {
+    const remaining = remainingFileUses.get(file.id);
+    if (!Number.isSafeInteger(remaining) || remaining < 1) fail(`${field} has no remaining declared source-file use.`);
+    let pending = loadedFileCache.get(file.id);
+    if (!pending) {
+      pending = loadBoundSourceFile(file, field);
+      fileLoadCounts.set(file.id, (fileLoadCounts.get(file.id) ?? 0) + 1);
+      // Unique files stay owned only by the current source. Repeated files
+      // retain one parsed Promise until their final declared consumer.
+      if (remaining > 1) loadedFileCache.set(file.id, pending);
+    }
+    const next = remaining - 1;
+    if (next === 0) remainingFileUses.delete(file.id);
+    else remainingFileUses.set(file.id, next);
+    try {
+      const loaded = await pending;
+      if (next === 0) {
+        if (loadedFileCache.get(file.id) === pending) loadedFileCache.delete(file.id);
+      }
+      return loaded;
+    } catch (error) {
+      if (loadedFileCache.get(file.id) === pending) loadedFileCache.delete(file.id);
+      throw error;
+    }
+  };
   const sources = [];
   for (const source of reimbursementSources) {
     const review = reviewBySource.get(source.id);
     const root = rootClaimBySourceId.get(source.id);
     const profileIds = profileIdsByRoot.get(pathKey(root));
-    sources.push(await auditPublishedArchiveSource(source, review, fileById, registry, {
+    const auditedSource = await auditPublishedArchiveSource(source, review, fileById, registry, {
       root,
       shared: profileIds.size > 1,
       profileIds: registry.profileOrder.filter((profileId) => profileIds.has(profileId)),
+    }, declaredFileIdsBySourceId.get(source.id), loadFile);
+    sources.push(auditedSource);
+    const retainedEntries = await Promise.all([...loadedFileCache.entries()].map(async ([fileId, pending]) => [fileId, await pending]));
+    const sortedRetained = retainedEntries.sort(([left], [right]) => left.localeCompare(right, "en"));
+    await callSourceAuditTestHook(testHooks, "afterSourceAudited", deepFreeze({
+      sourceId: source.id,
+      retainedFileIds: sortedRetained.map(([fileId]) => fileId),
+      retainedBytes: sortedRetained.reduce((sum, [, loaded]) => sum + loaded.size, 0),
+      remainingUses: Object.fromEntries([...remainingFileUses.entries()].sort(([left], [right]) => left.localeCompare(right, "en"))),
+      fileLoadCounts: Object.fromEntries([...fileLoadCounts.entries()].sort(([left], [right]) => left.localeCompare(right, "en"))),
     }));
   }
+  if (remainingFileUses.size !== 0 || loadedFileCache.size !== 0) fail("published archive source-file cache accounting did not close.");
   if (reviewBySource.size !== sources.length) fail("reimbursementReviews contains a review without a reimbursement source.");
   const body = {
     kind: DISBURSEMENT_REIMBURSEMENT_SOURCE_AUDIT_KIND,

@@ -13,7 +13,7 @@ import { validateCompletePdfBytes } from "./disbursement_manifest.mjs";
 import {
   canonicalDigest,
   copyStableBinaryBytes,
-  loadBundledDependency,
+  inspectFullyDecodedImageBytes,
   parseStrictJson,
   readStableBinaryFile,
   readStableUtf8JsonFile,
@@ -36,8 +36,6 @@ const FILE_KINDS = new Set(["json", "text", "workbook", "image", "pdf"]);
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ORDINARY_MANIFEST_AUDITOR = path.join(SCRIPT_DIR, "audit_batch_manifest.mjs");
 const execFileAsync = promisify(execFile);
-const SharpModule = loadBundledDependency("sharp");
-const sharp = SharpModule.default ?? SharpModule;
 
 function fail(message) {
   throw new Error(`Disbursement Fresh Source v2 ${message}`);
@@ -172,21 +170,22 @@ async function validateImage(bytes, field) {
     repairedMissingJpegEoi = true;
   }
   try {
-    const decoded = await sharp(validationBytes, { failOn: "error", limitInputPixels: MAX_IMAGE_PIXELS })
-      .rotate()
-      .raw()
-      .toBuffer({ resolveWithObject: true });
+    const decoded = await inspectFullyDecodedImageBytes(validationBytes, {
+      failOn: "error",
+      limitInputPixels: MAX_IMAGE_PIXELS,
+      autoOrient: true,
+    });
     if (
-      !Number.isSafeInteger(decoded.info.width)
-      || !Number.isSafeInteger(decoded.info.height)
-      || decoded.info.width < 1
-      || decoded.info.height < 1
+      !Number.isSafeInteger(decoded.width)
+      || !Number.isSafeInteger(decoded.height)
+      || decoded.width < 1
+      || decoded.height < 1
     ) fail(`${field} image dimensions are invalid.`);
     return {
       mode: "full-pixel-decode",
       imageKind: signature.imageKind,
-      width: decoded.info.width,
-      height: decoded.info.height,
+      width: decoded.width,
+      height: decoded.height,
       repairedMissingJpegEoi,
     };
   } catch (error) {

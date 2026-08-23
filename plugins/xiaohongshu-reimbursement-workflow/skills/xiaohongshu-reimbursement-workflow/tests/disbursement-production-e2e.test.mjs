@@ -420,6 +420,37 @@ test("candidate and source TOCTOU changes stop publication", async (t) => {
     });
   });
 
+  await t.test("published archive mutation after candidate audit is caught by the fresh audit", async () => {
+    await withProductionSandbox({
+      manifestVersion: 2,
+      reimbursementMode: "published_archive",
+      profileIds: ["xiaohongshu"],
+      reimbursementTransactionCount: 8,
+      includeSalary: false,
+      requestedUniqueVoucherCount: 3,
+    }, async ({ fixture }) => {
+      const source = fixture.manifest.sourceFiles.find((file) => file.usage.includes("published_reimbursement_artifact"));
+      assert.ok(source);
+      const expectedFinalPath = path.join(fixture.root, fixture.expectedBatchName);
+      const entriesBefore = await fs.readdir(expectedFinalPath).catch((error) => {
+        if (error?.code === "ENOENT") return null;
+        throw error;
+      });
+      await assert.rejects(
+        archiveCompactDisbursementWorkflow(requestFor(fixture), {
+          testHooks: {
+            async afterCandidateAudited() {
+              await fs.appendFile(source.path, Buffer.from([0]));
+            },
+          },
+        }),
+        /SHA-256 differs from its sourceFiles binding/u,
+      );
+      if (entriesBefore === null) await assert.rejects(fs.access(expectedFinalPath), /ENOENT/u);
+      else assert.deepEqual(await fs.readdir(expectedFinalPath), entriesBefore);
+    });
+  });
+
   await t.test("v2 source mutation after stage verification is caught before atomic rename", async () => {
     await withProductionSandbox({
       manifestVersion: 2,

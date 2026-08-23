@@ -10,6 +10,7 @@ import {
 } from "../scripts/disbursement_fresh_source_v2.mjs";
 import {
   canonicalDigest,
+  inspectFullyDecodedImageBytes,
   loadBundledDependency,
   sha256Bytes,
 } from "../scripts/workflow_primitives.mjs";
@@ -215,6 +216,50 @@ test("fresh evidence rejects changed bytes, kind disguise, and damaged image pay
     const source = await writeSource(root, { id: "evidence-1", name: "broken.png", bytes: valid.subarray(0, Math.max(16, Math.floor(valid.length / 2))), kind: "image", usage: ["fresh_reimbursement_evidence"] });
     await assert.rejects(auditDisbursementFreshSourcesV2(freshInput([source])), /damaged|incompletely decodable|decode/iu);
   });
+});
+
+test("streamed image decode tears down failures, premature close, and remains reusable", { concurrency: false, timeout: 15_000 }, async () => {
+  const valid = await pngBytes(73);
+  const damaged = valid.subarray(0, Math.max(16, Math.floor(valid.length / 2)));
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    await assert.rejects(
+      inspectFullyDecodedImageBytes(damaged, { failOn: "error", limitInputPixels: 1_000_000 }),
+    );
+  }
+  const concurrentFailures = await Promise.allSettled(Array.from({ length: 4 }, () => (
+    inspectFullyDecodedImageBytes(damaged, { failOn: "error", limitInputPixels: 1_000_000 })
+  )));
+  assert.equal(concurrentFailures.every((entry) => entry.status === "rejected"), true);
+  assert.equal(sharp.counters().queue, 0);
+  assert.equal(sharp.counters().process, 0);
+
+  const probe = sharp(valid);
+  const sharpPrototype = Object.getPrototypeOf(probe);
+  probe.destroy();
+  const originalRaw = sharpPrototype.raw;
+  let prematurelyClosedDecoder;
+  sharpPrototype.raw = function patchedRaw(...args) {
+    const decoder = originalRaw.apply(this, args);
+    prematurelyClosedDecoder = decoder;
+    queueMicrotask(() => decoder.destroy());
+    return decoder;
+  };
+  try {
+    await assert.rejects(
+      inspectFullyDecodedImageBytes(valid, { failOn: "error", limitInputPixels: 1_000_000 }),
+      (error) => error?.code === "ERR_STREAM_PREMATURE_CLOSE",
+    );
+  } finally {
+    sharpPrototype.raw = originalRaw;
+  }
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(prematurelyClosedDecoder?.destroyed, true);
+  assert.equal(sharp.counters().queue, 0);
+  assert.equal(sharp.counters().process, 0);
+  assert.deepEqual(
+    await inspectFullyDecodedImageBytes(valid, { failOn: "error", limitInputPixels: 1_000_000 }),
+    { width: 24, height: 16 },
+  );
 });
 
 test("salary workbook and image pass without certificate and expose honest review-bound semantics", async (t) => {

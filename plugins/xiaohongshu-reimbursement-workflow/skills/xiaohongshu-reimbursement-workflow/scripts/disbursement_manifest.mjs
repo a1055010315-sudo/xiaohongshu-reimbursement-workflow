@@ -7,6 +7,7 @@ import { Worker } from "node:worker_threads";
 import {
   canonicalDigest,
   copyStableBinaryBytes,
+  inspectFullyDecodedImageBytes,
   loadBundledDependency,
   mapSettledLimit,
   parseStrictJson,
@@ -47,6 +48,7 @@ const MAX_PDF_OPERATORS_PER_PAGE = 100_000;
 const MAX_PDF_OPERATORS_TOTAL = 1_000_000;
 const MAX_PDF_WORKER_DIAGNOSTIC_BYTES = 64 * 1024;
 const PDF_PARSE_TIMEOUT_MS = 30_000;
+const MAX_CONCURRENT_PDF_WORKERS = 2;
 const PROFILE_SET = new Set(DISBURSEMENT_PROFILE_ORDER);
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ORDINARY_MANIFEST_AUDITOR = path.join(SCRIPT_DIR, "audit_batch_manifest.mjs");
@@ -54,6 +56,37 @@ const PDF_VALIDATOR_WORKER = new URL("./validate_disbursement_pdf_worker.mjs", i
 const execFileAsync = promisify(execFile);
 const JSZipModule = loadBundledDependency("jszip");
 const JSZip = JSZipModule.default ?? JSZipModule;
+const pdfWorkerQueue = [];
+let activePdfWorkers = 0;
+
+function pumpPdfWorkerQueue() {
+  while (activePdfWorkers < MAX_CONCURRENT_PDF_WORKERS && pdfWorkerQueue.length > 0) {
+    const task = pdfWorkerQueue.shift();
+    activePdfWorkers += 1;
+    Promise.resolve()
+      .then(task.operation)
+      .then(task.resolve, task.reject)
+      .finally(() => {
+        activePdfWorkers -= 1;
+        pumpPdfWorkerQueue();
+      });
+  }
+}
+
+function schedulePdfWorker(operation) {
+  return new Promise((resolve, reject) => {
+    pdfWorkerQueue.push({ operation, resolve, reject });
+    pumpPdfWorkerQueue();
+  });
+}
+
+export function inspectDisbursementPdfWorkerQueue() {
+  return Object.freeze({
+    active: activePdfWorkers,
+    queued: pdfWorkerQueue.length,
+    limit: MAX_CONCURRENT_PDF_WORKERS,
+  });
+}
 
 function fail(message) {
   throw new Error(`Compact Disbursement Manifest ${message}`);
@@ -282,16 +315,15 @@ async function validateImageBytes(bytes, signature, field) {
     repairedMissingJpegEoi = true;
   }
   try {
-    const SharpModule = loadBundledDependency("sharp");
-    const sharp = SharpModule.default ?? SharpModule;
-    const result = await sharp(validationBytes, { failOn: "error", limitInputPixels: 100_000_000 })
-      .rotate()
-      .raw()
-      .toBuffer({ resolveWithObject: true });
-    if (!Number.isSafeInteger(result.info.width) || !Number.isSafeInteger(result.info.height) || result.info.width < 1 || result.info.height < 1) {
+    const result = await inspectFullyDecodedImageBytes(validationBytes, {
+      failOn: "error",
+      limitInputPixels: 100_000_000,
+      autoOrient: true,
+    });
+    if (!Number.isSafeInteger(result.width) || !Number.isSafeInteger(result.height) || result.width < 1 || result.height < 1) {
       fail(`${field} image dimensions are invalid.`);
     }
-    return Object.freeze({ width: result.info.width, height: result.info.height, repairedMissingJpegEoi });
+    return Object.freeze({ width: result.width, height: result.height, repairedMissingJpegEoi });
   } catch (error) {
     fail(`${field} image decode failed: ${error instanceof Error ? error.message : String(error)}`);
   }
@@ -321,11 +353,16 @@ export async function validateCompletePdfBytes(bytes, field = "PDF voucher") {
   if (bytes.byteLength < 1 || bytes.byteLength > MAX_VOUCHER_BYTES) {
     fail(`${field} PDF must be between 1 byte and 25 MiB.`);
   }
+  // Bind the exact submitted bytes before the operation can wait in the
+  // global worker queue. The caller may otherwise mutate its Uint8Array while
+  // earlier PDF validations are still occupying both worker slots.
+  const workerBytes = Uint8Array.from(bytes);
+  return schedulePdfWorker(async () => {
   const worker = new Worker(PDF_VALIDATOR_WORKER, {
     type: "module",
     execArgv: [],
     workerData: {
-      bytes: Uint8Array.from(bytes),
+      bytes: workerBytes,
       maxPages: MAX_PDF_PAGES,
       maxOperatorsPerPage: MAX_PDF_OPERATORS_PER_PAGE,
       maxOperatorsTotal: MAX_PDF_OPERATORS_TOTAL,
@@ -337,6 +374,7 @@ export async function validateCompletePdfBytes(bytes, field = "PDF voucher") {
       maxYoungGenerationSizeMb: 64,
       stackSizeMb: 8,
     },
+    transferList: [workerBytes.buffer],
   });
   const stdoutDone = collectWorkerOutput(worker.stdout);
   const stderrDone = collectWorkerOutput(worker.stderr);
@@ -386,6 +424,7 @@ export async function validateCompletePdfBytes(bytes, field = "PDF voucher") {
   return Object.freeze({
     pageCount: outcome.message.pageCount,
     totalOperators: outcome.message.totalOperators,
+  });
   });
 }
 

@@ -404,6 +404,63 @@ test("published archive without original manifest or receipt reconstructs stable
   assert.equal(first.sources[0].reviewBoundFacts.some((item) => item.field === "batchId" && item.corroboration === "none"), true);
 });
 
+test("shared published files are loaded once and retained only until their final source consumer", async () => {
+  const sharedFileIds = [...fixture.baseInputFileIds];
+  const firstAttestationId = "ORIGINAL-MANIFEST";
+  const secondAttestationId = "MAPPED-MANIFEST";
+  const declaredIds = [...sharedFileIds, firstAttestationId, secondAttestationId];
+  const sourceFiles = declaredIds.map((id) => ({ ...fixture.filesById.get(id) }));
+  const makeSource = (id, attestationId) => ({
+    id,
+    profileId: "xiaohongshu",
+    mode: "published_archive",
+    inputFileIds: [...sharedFileIds],
+    attestations: { originalManifestFileId: attestationId },
+  });
+  const makeReview = (sourceId, attestationId) => ({
+    id: `REVIEW-${sourceId}`,
+    sourceId,
+    mode: "published_archive",
+    reviewedFileIds: [...sharedFileIds, attestationId],
+    facts: {
+      batchId: "ordinary-batch-s02",
+      reimbursementPeriod: { ...PERIOD },
+      transactions: REVIEW_TRANSACTIONS.map((item) => ({ ...item })),
+    },
+  });
+  const states = [];
+  const result = await auditDisbursementReimbursementSourcesV2({
+    sourceFiles,
+    reimbursementSources: [
+      makeSource("SOURCE-CACHE-1", firstAttestationId),
+      makeSource("SOURCE-CACHE-2", secondAttestationId),
+    ],
+    reimbursementReviews: [
+      makeReview("SOURCE-CACHE-1", firstAttestationId),
+      makeReview("SOURCE-CACHE-2", secondAttestationId),
+    ],
+  }, {
+    testHooks: {
+      afterSourceAudited(state) {
+        states.push(state);
+      },
+    },
+  });
+
+  const expectedSharedBytes = (await Promise.all(sharedFileIds.map(async (fileId) => (
+    await readStableBinaryFile(fixture.filesById.get(fileId).path)
+  ).size))).reduce((sum, size) => sum + size, 0);
+  assert.equal(result.sources.length, 2);
+  assert.equal(states.length, 2);
+  assert.deepEqual([...states[0].retainedFileIds].sort(), [...sharedFileIds].sort());
+  assert.equal(states[0].retainedBytes, expectedSharedBytes);
+  assert.deepEqual(states[1].retainedFileIds, []);
+  assert.equal(states[1].retainedBytes, 0);
+  for (const fileId of declaredIds) assert.equal(states[1].fileLoadCounts[fileId], 1);
+  assert.equal(firstAttestationId in states[0].remainingUses, false);
+  assert.equal(secondAttestationId in states[0].remainingUses, true);
+});
+
 test("real publisher zero-evidence shape has no drawing, media, anchors, or evidence archive and remains valid", async () => {
   const transactions = [{
     id: "TX-NO-EVIDENCE",

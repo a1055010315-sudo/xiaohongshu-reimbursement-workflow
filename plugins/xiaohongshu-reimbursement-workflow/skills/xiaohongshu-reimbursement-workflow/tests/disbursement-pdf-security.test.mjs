@@ -8,7 +8,11 @@ import test from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 
-import { auditDisbursementManifest, validateCompletePdfBytes } from "../scripts/disbursement_manifest.mjs";
+import {
+  auditDisbursementManifest,
+  inspectDisbursementPdfWorkerQueue,
+  validateCompletePdfBytes,
+} from "../scripts/disbursement_manifest.mjs";
 import { importBundledDependency, sha256Bytes } from "../scripts/workflow_primitives.mjs";
 import { createCompactDisbursementProductionFixture } from "./disbursement-production-fixture.mjs";
 
@@ -261,10 +265,49 @@ test("manifest audit and real archive CLI preserve valid PDF voucher capability"
 });
 
 test("parallel valid PDF validation stays isolated from worker diagnostics", async () => {
-  const results = await Promise.all(Array.from({ length: 4 }, (_, index) => (
+  const pending = Array.from({ length: 4 }, (_, index) => (
     validateCompletePdfBytes(onePagePdf({ content: `q\n${index} ${index} m\nQ` }), `parallel fixture ${index}`)
-  )));
+  ));
+  assert.deepEqual(inspectDisbursementPdfWorkerQueue(), { active: 2, queued: 2, limit: 2 });
+  const results = await Promise.all(pending);
   assert.deepEqual(results.map((entry) => entry.pageCount), [1, 1, 1, 1]);
+  assert.deepEqual(inspectDisbursementPdfWorkerQueue(), { active: 0, queued: 0, limit: 2 });
+});
+
+test("PDF validation binds the submitted view before immediate mutation or queue waiting", { concurrency: false }, async () => {
+  const immediateSource = onePagePdf({ content: "q\n10 10 m\nQ" });
+  const immediateControl = await validateCompletePdfBytes(Buffer.from(immediateSource), "immediate mutation control");
+  const immediateBytes = Buffer.from(immediateSource);
+  const immediate = validateCompletePdfBytes(immediateBytes, "immediate mutation fixture");
+  immediateBytes.fill(0);
+  assert.deepEqual(await immediate, immediateControl);
+
+  const viewSource = onePagePdf({ content: "q\n15 15 m\nQ" });
+  const backing = Buffer.concat([Buffer.alloc(11, 0x11), viewSource, Buffer.alloc(13, 0x22)]);
+  const view = new Uint8Array(backing.buffer, backing.byteOffset + 11, viewSource.length);
+  const viewControl = await validateCompletePdfBytes(Uint8Array.from(view), "offset view control");
+  const offsetPending = validateCompletePdfBytes(view, "offset view mutation fixture");
+  backing.fill(0);
+  assert.deepEqual(await offsetPending, viewControl);
+
+  const queuedSource = onePagePdf({ content: "q\n20 20 m\nQ" });
+  const queuedControl = await validateCompletePdfBytes(Buffer.from(queuedSource), "queued mutation control");
+  const blockers = [
+    validateCompletePdfBytes(onePagePdf({ content: "q\n1 1 m\nQ" }), "queue blocker 1"),
+    validateCompletePdfBytes(onePagePdf({ content: "q\n2 2 m\nQ" }), "queue blocker 2"),
+  ];
+  const queuedBytes = Buffer.from(queuedSource);
+  const queued = validateCompletePdfBytes(queuedBytes, "queued mutation fixture");
+  const pending = [...blockers, queued];
+  try {
+    assert.deepEqual(inspectDisbursementPdfWorkerQueue(), { active: 2, queued: 1, limit: 2 });
+    queuedBytes.fill(0);
+    const [, , queuedResult] = await Promise.all(pending);
+    assert.deepEqual(queuedResult, queuedControl);
+  } finally {
+    await Promise.allSettled(pending);
+  }
+  assert.deepEqual(inspectDisbursementPdfWorkerQueue(), { active: 0, queued: 0, limit: 2 });
 });
 
 test("PDF-looking header and EOF bytes without a catalog are rejected", async () => {

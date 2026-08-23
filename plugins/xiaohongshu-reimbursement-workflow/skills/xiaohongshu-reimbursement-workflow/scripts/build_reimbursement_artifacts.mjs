@@ -9,6 +9,7 @@ import { loadArtifactTemplates } from "./template_assets.mjs";
 import {
   canonicalDigest,
   copyStableBinaryBytes,
+  inspectFullyDecodedImageBytes,
   loadBundledDependency,
   mapSettledLimit,
   readStableBinaryFile,
@@ -27,8 +28,6 @@ const MAX_IMAGE_BYTES = 25 * 1024 * 1024;
 const SUMMARY_ANNOTATION_KINDS = new Set(["commission", "bonus", "allowance"]);
 const JSZipModule = loadBundledDependency("jszip");
 const JSZip = JSZipModule.default ?? JSZipModule;
-const SharpModule = loadBundledDependency("sharp");
-const sharp = SharpModule.default ?? SharpModule;
 const imageMetadataCache = new Map();
 const GENERATED_THEME_XML = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" name="Codex Reimbursement"><a:themeElements><a:clrScheme name="Codex"><a:dk1><a:srgbClr val="1F2937"/></a:dk1><a:lt1><a:srgbClr val="FFFFFF"/></a:lt1><a:dk2><a:srgbClr val="176B4D"/></a:dk2><a:lt2><a:srgbClr val="DDEFE6"/></a:lt2><a:accent1><a:srgbClr val="176B4D"/></a:accent1><a:accent2><a:srgbClr val="E94B64"/></a:accent2><a:accent3><a:srgbClr val="FFE4C2"/></a:accent3><a:accent4><a:srgbClr val="6B7280"/></a:accent4><a:accent5><a:srgbClr val="0EA5E9"/></a:accent5><a:accent6><a:srgbClr val="8B5CF6"/></a:accent6><a:hlink><a:srgbClr val="0563C1"/></a:hlink><a:folHlink><a:srgbClr val="954F72"/></a:folHlink></a:clrScheme><a:fontScheme name="Codex"><a:majorFont><a:latin typeface="Microsoft YaHei"/><a:ea typeface="Microsoft YaHei"/><a:cs typeface="Microsoft YaHei"/></a:majorFont><a:minorFont><a:latin typeface="Microsoft YaHei"/><a:ea typeface="Microsoft YaHei"/><a:cs typeface="Microsoft YaHei"/></a:minorFont></a:fontScheme><a:fmtScheme name="Codex"><a:fillStyleLst/><a:lnStyleLst/><a:effectStyleLst/><a:bgFillStyleLst/></a:fmtScheme></a:themeElements></a:theme>';
 
@@ -616,10 +615,12 @@ export async function inspectEvidenceImage(bytes, field = "image") {
   try {
     const hasJpegEoi = structural.extension !== "jpg" || (bytes.length >= 2 && bytes[bytes.length - 2] === 0xff && bytes[bytes.length - 1] === 0xd9);
     const validationBytes = hasJpegEoi ? bytes : Buffer.concat([bytes, Buffer.from([0xff, 0xd9])]);
-    const decoded = await sharp(validationBytes, { failOn: "warning", limitInputPixels: 100_000_000 })
-      .raw()
-      .toBuffer({ resolveWithObject: true });
-    if (decoded.info.width !== structural.width || decoded.info.height !== structural.height || decoded.data.length === 0) fail(`${field} decoded pixels differ from its original bytes.`);
+    const decoded = await inspectFullyDecodedImageBytes(validationBytes, {
+      failOn: "warning",
+      limitInputPixels: 100_000_000,
+      autoOrient: false,
+    });
+    if (decoded.width !== structural.width || decoded.height !== structural.height) fail(`${field} decoded pixels differ from its original bytes.`);
   } catch (error) {
     fail(`${field} cannot be decoded safely.`, error);
   }

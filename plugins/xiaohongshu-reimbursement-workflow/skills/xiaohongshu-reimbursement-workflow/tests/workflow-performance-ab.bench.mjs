@@ -634,18 +634,22 @@ export function __benchmarkArtifactMetrics() { return structuredClone(__artifact
   source = replaceOnce(source, "async function loadEvidence(manifest) {", `async function loadEvidence(manifest) {
   const __evidenceStarted = performance.now();`);
   source = replaceOnce(source,
-    "const loaded = await mapSettledInInputOrder(jobs, 3, async (job) => {\n    const stable = await readStableBinaryFile(job.filePath, { maxBytes: MAX_IMAGE_BYTES });",
-    `const loaded = await mapSettledInInputOrder(jobs, 3, async (job) => {
+    "loaded = await mapSettledLimit(jobs, 3, async (job, index) => {\n      const stable = await readStableBinaryFile(job.filePath, { maxBytes: MAX_IMAGE_BYTES });",
+    `loaded = await mapSettledLimit(jobs, 3, async (job, index) => {
       const __stableReadStarted = performance.now();
       const stable = await readStableBinaryFile(job.filePath, { maxBytes: MAX_IMAGE_BYTES });
       __artifactProfile.evidenceStableReadMs += performance.now() - __stableReadStarted;
       __artifactProfile.evidenceStableReadCount += 1;`);
   source = replaceOnce(source,
-    "metadata = await inspectEvidenceImage(bytes, `evidence ${job.evidenceId}`);",
-    `const __decodeStarted = performance.now();
-        metadata = await inspectEvidenceImage(bytes, \`evidence \${job.evidenceId}\`);
-        __artifactProfile.evidenceDecodeMs += performance.now() - __decodeStarted;
-        __artifactProfile.evidenceDecodeCount += 1;`);
+    ": scheduleDecode(() => inspectEvidenceImage(bytes, `evidence ${job.evidenceId}`)).then(",
+    `: scheduleDecode(async () => {
+              const __decodeStarted = performance.now();
+              try { return await inspectEvidenceImage(bytes, \`evidence \${job.evidenceId}\`); }
+              finally {
+                __artifactProfile.evidenceDecodeMs += performance.now() - __decodeStarted;
+                __artifactProfile.evidenceDecodeCount += 1;
+              }
+            }).then(`);
   source = replaceOnce(source,
     "for (const id of usedIds) if (!evidence.has(id)) fail(`transaction evidence ${id} is not bound to a stable file.`);\n  return evidence;",
     `for (const id of usedIds) if (!evidence.has(id)) fail(\`transaction evidence \${id} is not bound to a stable file.\`);

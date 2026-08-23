@@ -796,19 +796,21 @@ async function createOrRecoverOwnedWorkflow({ workflowRoot, stagingToken, archiv
 }
 
 async function prepareAndAuditCandidate(context, testHooks) {
-  const expected = expectedRecordFromBytes(await buildDisbursementArchiveBytes(context.initialAudit));
   const candidateRoot = path.join(context.workflowRoot, "candidate");
   const existing = await fs.lstat(candidateRoot).catch((error) => errorCode(error, "ENOENT") ? null : Promise.reject(error));
   let candidate;
+  let expected;
   let recovered = false;
   if (existing) {
     if (!existing.isDirectory() || existing.isSymbolicLink()) fail("recovered candidate root is not a plain directory.");
+    expected = expectedRecordFromBytes(await buildDisbursementArchiveBytes(context.initialAudit));
     const recoveryAudit = await auditCompactDisbursementCandidate(context.initialAudit, candidateRoot, expected);
     if (recoveryAudit.status !== "passed") fail("recovered candidate differs from the freshly verified archive inputs.");
     candidate = candidateRecordFromExisting(candidateRoot, expected);
     recovered = true;
   } else {
     candidate = candidateRecord(await buildDisbursementArchive(context.initialAudit, candidateRoot));
+    expected = expectedRecordFromCandidate(candidate);
   }
   await testHooks?.afterCandidateBuilt?.({ ...context, candidate, recovered });
   const candidateAudit = await auditCompactDisbursementCandidate(context.initialAudit, candidateRoot, expectedRecordFromCandidate(candidate));
