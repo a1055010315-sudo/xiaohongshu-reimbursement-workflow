@@ -1,11 +1,11 @@
 {
   "kind": "xiaohongshu-reimbursement-workflow-install-validation-v6",
-  "generatedAt": "2026-08-24T07:41:18.6357898Z",
+  "generatedAt": "2026-08-24T09:12:54.4930654Z",
   "mode": "fresh-release-zip-extraction-and-install-validation",
   "package": {
-    "fileName": "xiaohongshu-reimbursement-workflow-0.5.0+codex.20260824072912.zip",
-    "size": 690140,
-    "sha256": "69da6993d56aed2852ceaddedbacb2b63a467eced3977272ded0ff2dba3dabd0",
+    "fileName": "xiaohongshu-reimbursement-workflow-0.5.0+codex.20260824090501.zip",
+    "size": 690564,
+    "sha256": "bb19b3c62de30726940cf4d6290b3ae821232cbfbf3e7b37b468707b7e8d1325",
     "sidecarVerified": true,
     "rootEntries": [
       ".agents",
@@ -14,23 +14,24 @@
       "README.md"
     ],
     "fileCount": 97,
+    "sourceMirrorDigest": "4de8e39e2e2518af3f1c4097f192f1e07769cb2daac6b1c494468756a07057cd",
     "sourceMirrorExact": true
   },
   "marketplace": {
     "name": "xiaohongshu-finance",
-    "root": "<local-release-root>/xiaohongshu-finance-0.5.0+codex.20260824072912-69da6993",
+    "root": "<local-release-root>/xiaohongshu-finance-0.5.0+codex.20260824090501-bb19b3c",
     "sourcePath": "./plugins/xiaohongshu-reimbursement-workflow",
     "installation": "AVAILABLE",
     "authentication": "ON_INSTALL"
   },
   "plugin": {
     "name": "xiaohongshu-reimbursement-workflow",
-    "version": "0.5.0+codex.20260824072912",
-    "manifestSha256": "72063f7f8c70b0d7df56ad0fa4161cfc127d600a58bcd36e27e0f5ce6e4ef4be",
+    "version": "0.5.0+codex.20260824090501",
+    "manifestSha256": "8713f3ea4cd1a2675c0773d77b7ab7c2867c405ccc86bf237ac5d2c341044db1",
     "treeDigestAlgorithm": "sha256(sorted relativePath + NUL + fileSha256 + LF)",
-    "skillTreeSha256": "5c65284ee270c62129fa58b3005a0d4c6d4f6e2cf6a471fa50a8287521997753",
+    "skillTreeSha256": "da21f9235e7a34e218904b5c21e14d31ed10c2fb41f4aa463b12fab212a82325",
     "skillFileCount": 93,
-    "packageTreeSha256": "cf5d99a4b310e6a9df6dbca985654a6df89ba87912496558263fd509b19149a4",
+    "packageTreeSha256": "8890cd61e4f3eaf20ea1cc6072744c636354834c523ee8494a10ff11808c2ec5",
     "packageFileCount": 94,
     "extractedTreeExact": true,
     "installedTreeExact": true
@@ -40,48 +41,43 @@
     "gitDiffCheck": "passed",
     "skillValidation": "Skill is valid!",
     "pluginValidation": "Plugin validation passed",
+    "candidateFocusedSummary": "27 tests: 26 passed, 0 failed, 1 benchmark skipped",
     "gate2FocusedSummary": "62 tests: 62 passed, 0 failed, 0 skipped",
-    "testSummary": "580 tests: 574 passed, 0 failed, 6 conditional skips",
+    "testSummary": "581 tests: 575 passed, 0 failed, 6 conditional skips",
     "privacyScan": "no local paths, batch names, amounts, or real claimant names matched",
-    "independentCodeReview": "no unresolved P1 or P2"
+    "independentCodeReview": "no unresolved P1, P2, or blocking P3"
   },
   "performance": {
     "baselineVersion": "0.5.0+codex.20260823170757",
     "renderer": "fake",
     "samplesPerVersionPerTemperature": 11,
     "warmupsPerVersionPerTemperature": 2,
-    "report": "O-acceptance-release-20260824072912-fake-11x2.json",
-    "reportSha256": "088d5e6b7fd959036d23a1d020c348c948580bbdb991e5a615512e937b5d60af",
+    "report": "O-acceptance-release-20260824090501-fake-11x2.json",
+    "reportSha256": "f61ecbdfb14a6387b2aca1d879c472cf4d079e4cb4649535c154289518e589c6",
     "acceptancePassed": true,
-    "coldP50RegressionPercent": 3.163,
-    "coldP95RegressionPercent": 1.165,
-    "hotP50ImprovementPercent": 3.200,
-    "hotP95ImprovementPercent": 6.298,
-    "coldPeakRssImprovementPercent": 2.816,
-    "hotPeakRssImprovementPercent": 0.617,
+    "coldP50RegressionPercent": 0.601,
+    "coldP95RegressionPercent": 0.443,
+    "hotP50ImprovementPercent": 3.135,
+    "hotP95RegressionPercent": 4.519,
+    "coldPeakRssImprovementPercent": 2.340,
+    "hotPeakRssImprovementPercent": 0.210,
     "outputEquivalent": true,
     "previewPngsDistinct": true
   },
   "activation": {
     "pluginId": "xiaohongshu-reimbursement-workflow@xiaohongshu-finance",
-    "installedVersion": "0.5.0+codex.20260824072912",
+    "installedVersion": "0.5.0+codex.20260824090501",
     "installed": true,
     "enabled": true,
-    "installedPath": "<codex-plugin-cache>/xiaohongshu-finance/xiaohongshu-reimbursement-workflow/0.5.0+codex.20260824072912",
+    "installedPath": "<codex-plugin-cache>/xiaohongshu-finance/xiaohongshu-reimbursement-workflow/0.5.0+codex.20260824090501",
     "installedFileCount": 94,
     "installedTreeExact": true
-  },
-  "supersededCandidate": {
-    "version": "0.5.0+codex.20260824065414",
-    "disposition": "not released: pre-commit privacy scan found two real claimant-name literals in a regression test",
-    "fix": "replaced both literals with synthetic test names and reran focused, full, static, privacy, performance, package, and install validation",
-    "zipAndReleaseRootAtOriginalPaths": false
   },
   "isolation": {
     "temporaryCliAtOriginalPath": false,
     "temporaryCleanup": "sent to Windows Recycle Bin after exact-path and reparse-point verification",
     "baselineReleaseRootRetained": true,
-    "businessFilesReadOrModified": false,
-    "forwardBusinessTest": "pending isolated new task"
+    "businessFilesModified": false,
+    "forwardBusinessTest": "pending second isolated new task"
   }
 }

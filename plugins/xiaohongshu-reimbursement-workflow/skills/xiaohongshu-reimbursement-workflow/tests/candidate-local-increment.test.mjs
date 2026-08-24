@@ -47,10 +47,10 @@ function headerRow() {
   return `<x:row r="1" ht="22" customHeight="1">${["日期", "支出明细", "支出金额", "合计", "支出人", "备注"].map((value, index) => tCell(`${String.fromCharCode(65 + index)}1`, 2, value)).join("")}</x:row>`;
 }
 
-function dataRow(row, { date = "2032-01-01", project = `历史-${row}`, amount = "1", person = "历史人员", classification = "历史分类", shared = false, formulaText = null, sentinel = `sentinel-${row}` } = {}) {
+function dataRow(row, { date = "2032-01-01", project = `历史-${row}`, amount = "1", person = "历史人员", classification = "历史分类", shared = false, formulaText = null, sentinel = `sentinel-${row}`, height = "24" } = {}) {
   const sharedFormula = row === 2 ? `<x:f t="shared" si="0">SUM(C${row}:C${row})</x:f>` : '<x:f t="shared" si="0"/>';
   const formula = formulaText !== null ? `<x:c r="D${row}" s="4" t="n"><x:f>${escaped(formulaText)}</x:f><x:v>${amount}</x:v></x:c>` : shared ? `<x:c r="D${row}" s="4" t="n">${sharedFormula}<x:v>${amount}</x:v></x:c>` : nCell(`D${row}`, 4, amount);
-  return `<x:row r="${row}" ht="24" customHeight="1">${nCell(`A${row}`, 1, dateSerial(date))}${tCell(`B${row}`, 2, project)}${nCell(`C${row}`, 3, amount)}${formula}${tCell(`E${row}`, 2, person)}${tCell(`F${row}`, 2, classification)}${tCell(`G${row}`, 2, sentinel)}${nCell(`H${row}`, 3, row)}</x:row>`;
+  return `<x:row r="${row}" ht="${height}" customHeight="1">${nCell(`A${row}`, 1, dateSerial(date))}${tCell(`B${row}`, 2, project)}${nCell(`C${row}`, 3, amount)}${formula}${tCell(`E${row}`, 2, person)}${tCell(`F${row}`, 2, classification)}${tCell(`G${row}`, 2, sentinel)}${nCell(`H${row}`, 3, row)}</x:row>`;
 }
 
 function splitGroupTailRow(row, { date, project, amount, sentinel = `sentinel-${row}` }) {
@@ -136,7 +136,8 @@ test("1500-row current append preserves every historical row byte and projects p
     assert.equal(locality.historicalBusinessValueReadCount, 0);
     assert.equal(locality.rewrittenHistoricalRowCount, 0);
     assert.equal(locality.preservedHistoricalRowCount, 1503);
-    assert.ok(locality.styleRowsInspected <= 32, `style scan escaped its local window: ${locality.styleRowsInspected}`);
+    assert.equal(locality.standardStyleWindowRadius, 64);
+    assert.ok(locality.styleRowsInspected <= locality.standardStyleWindowRadius, `style scan escaped its local window: ${locality.styleRowsInspected}`);
     assert.equal(artifact.audit.auditOperations.patchWorksheetCallCount, 0, "independent audit must not rebuild the historical worksheet");
     assert.equal(artifact.audit.auditOperations.historicalBusinessValueReadCount, 0);
     assert.equal(artifact.audit.auditOperations.zipEntryPayloadInflateCount, 7, "audit inflates only workbook/rels/managed sheet plus baseline styles");
@@ -157,6 +158,46 @@ test("1500-row current append preserves every historical row byte and projects p
     assert.match(previewSheet, /dimension ref="A1:F3"/u);
     assert.match(previewSheet, /匿名当期甲/u);
     assert.doesNotMatch(previewSheet, /sentinel-|历史-/u);
+  } finally {
+    if (stagingRoot) await fs.rm(stagingRoot, { recursive: true, force: true });
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("current append accepts the nearest merge-free standard style row 46 rows before the insertion point", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "codex-xhs-candidate-style-distance-46-")); let stagingRoot;
+  try {
+    const rows = [headerRow()];
+    for (let row = 1254; row <= 1272; row += 1) rows.push(dataRow(row, { height: "30" }));
+    rows.push(dataRow(1273, { amount: "1", formulaText: "SUM(C1273:C1317)" }).replace('<x:v>1</x:v></x:c><x:c r="E1273"', '<x:v>45</x:v></x:c><x:c r="E1273"'));
+    for (let row = 1274; row <= 1317; row += 1) rows.push(splitGroupTailRow(row, { date: "2032-01-01", project: `合并历史-${row}`, amount: "1" }));
+    const baseline = await writeWorkbook(path.join(root, "小红书支出总表.xlsx"), {
+      rows,
+      merges: ["D1273:D1317", "E1273:E1317", "F1273:F1317"],
+      dimensionEndRow: 1317,
+      printEndRow: 1317,
+    });
+    const result = await build(baseline, [{ id: "TX-STYLE-46", date: "2032-08-01", amount: "2", project: "匿名距离回归" }]);
+    stagingRoot = result.stagingRoot;
+    const artifact = result.artifacts[0];
+    const locality = artifact.audit.projection.locality;
+    const insertion = artifact.localPatchCertificate.transform.insertions[0];
+    assert.equal(locality.standardStyleWindowRadius, 64);
+    assert.equal(locality.styleRowsInspected, 64);
+    assert.equal(locality.historicalBusinessValueReadCount, 0);
+    assert.equal(locality.globalHistoricalBusinessScanCount, 0);
+    assert.equal(locality.rewrittenHistoricalRowCount, 0);
+    assert.equal(artifact.audit.auditOperations.zipEntryPayloadInflateCount, 7);
+    assert.equal(insertion.beforeRow, 1318);
+    assert.equal(insertion.styleSource.row, 1272);
+    assert.equal(insertion.beforeRow - insertion.styleSource.row, 46);
+    assert.equal(insertion.styleSource.height, "30");
+    const zip = await JSZip.loadAsync(await fs.readFile(artifact.candidatePath));
+    const sheet = await zip.file("xl/worksheets/sheet1.xml").async("string");
+    assert.match(sheet, /<x:row r="1318"[^>]*>[\s\S]*匿名距离回归/u);
+    assert.match(sheet, /<x:mergeCell ref="D1273:D1317"\/>/u);
+    assert.match(sheet, /<x:mergeCell ref="E1273:E1317"\/>/u);
+    assert.match(sheet, /<x:mergeCell ref="F1273:F1317"\/>/u);
   } finally {
     if (stagingRoot) await fs.rm(stagingRoot, { recursive: true, force: true });
     await fs.rm(root, { recursive: true, force: true });

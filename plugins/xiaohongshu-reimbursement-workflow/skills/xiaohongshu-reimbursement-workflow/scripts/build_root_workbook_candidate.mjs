@@ -39,7 +39,7 @@ const JSZipModule = loadBundledDependency("jszip");
 const JSZip = JSZipModule.default ?? JSZipModule;
 const SaxModule = loadBundledDependency("sax");
 const sax = SaxModule.default ?? SaxModule;
-const STANDARD_STYLE_WINDOW_RADIUS = 32;
+const STANDARD_STYLE_WINDOW_RADIUS = 64;
 const zipPartByteCaches = new WeakMap();
 let sharedRootAuditSession = null;
 
