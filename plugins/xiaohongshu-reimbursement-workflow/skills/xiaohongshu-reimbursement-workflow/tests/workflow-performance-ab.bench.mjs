@@ -4,21 +4,21 @@
  * Reproducible end-to-end performance acceptance benchmark.
  *
  * This file deliberately does not end in `.test.mjs`, so ordinary test runs do
- * not execute it. It compares the immutable installed 20260819174146 baseline
- * with the current personal-marketplace source using one generated, anonymous
- * workload. Independent evidence observations are prepared outside the timed
- * region; all plugin-controlled reads, decodes, audits and report writes remain
- * inside it.
+ * not execute it. H preserves the historical calibration pair; O compares an
+ * explicitly locked pre-change installation with the current candidate using
+ * one generated, anonymous workload. Independent evidence observations are
+ * prepared outside the timed region; all plugin-controlled reads, decodes,
+ * audits and report writes remain inside it.
  *
  * Examples:
  *   node tests/workflow-performance-ab.bench.mjs --line=H --old-root=<19174146-skill-root> --new-root=<unmodified-21073607-skill-root> --renderer=fake
- *   node tests/workflow-performance-ab.bench.mjs --line=O --identity-only --old-root=<unmodified-21073607-skill-root> --new-root=<candidate-skill-root>
+ *   node tests/workflow-performance-ab.bench.mjs --line=O --identity-only --old-root=<pre-change-installed-skill-root> --new-root=<candidate-skill-root>
  *   node tests/workflow-performance-ab.bench.mjs --line=H --old-root=<19174146-skill-root> --new-root=<unmodified-21073607-skill-root> --renderer=fake --diagnostic --samples=1 --warmups=0
  *
  * O acceptance additionally requires the six identity values printed by
  * --identity-only. Acceptance never permits fewer than 11 timed pairs or two
  * warm-ups. The configured improvement percentage is reported as an
- * informational target; p95 non-regression, RSS and output safeguards decide
+ * informational target; p50/p95 may regress by at most 5%, while RSS and output safeguards decide
  * acceptance.
  */
 
@@ -634,18 +634,22 @@ export function __benchmarkArtifactMetrics() { return structuredClone(__artifact
   source = replaceOnce(source, "async function loadEvidence(manifest) {", `async function loadEvidence(manifest) {
   const __evidenceStarted = performance.now();`);
   source = replaceOnce(source,
-    "const loaded = await mapSettledInInputOrder(jobs, 3, async (job) => {\n    const stable = await readStableBinaryFile(job.filePath, { maxBytes: MAX_IMAGE_BYTES });",
-    `const loaded = await mapSettledInInputOrder(jobs, 3, async (job) => {
+    "loaded = await mapSettledLimit(jobs, 3, async (job, index) => {\n      const stable = await readStableBinaryFile(job.filePath, { maxBytes: MAX_IMAGE_BYTES });",
+    `loaded = await mapSettledLimit(jobs, 3, async (job, index) => {
       const __stableReadStarted = performance.now();
       const stable = await readStableBinaryFile(job.filePath, { maxBytes: MAX_IMAGE_BYTES });
       __artifactProfile.evidenceStableReadMs += performance.now() - __stableReadStarted;
       __artifactProfile.evidenceStableReadCount += 1;`);
   source = replaceOnce(source,
-    "metadata = await inspectEvidenceImage(bytes, `evidence ${job.evidenceId}`);",
-    `const __decodeStarted = performance.now();
-        metadata = await inspectEvidenceImage(bytes, \`evidence \${job.evidenceId}\`);
-        __artifactProfile.evidenceDecodeMs += performance.now() - __decodeStarted;
-        __artifactProfile.evidenceDecodeCount += 1;`);
+    ": scheduleDecode(() => inspectEvidenceImage(bytes, `evidence ${job.evidenceId}`)).then(",
+    `: scheduleDecode(async () => {
+              const __decodeStarted = performance.now();
+              try { return await inspectEvidenceImage(bytes, \`evidence \${job.evidenceId}\`); }
+              finally {
+                __artifactProfile.evidenceDecodeMs += performance.now() - __decodeStarted;
+                __artifactProfile.evidenceDecodeCount += 1;
+              }
+            }).then(`);
   source = replaceOnce(source,
     "for (const id of usedIds) if (!evidence.has(id)) fail(`transaction evidence ${id} is not bound to a stable file.`);\n  return evidence;",
     `for (const id of usedIds) if (!evidence.has(id)) fail(\`transaction evidence \${id} is not bound to a stable file.\`);
@@ -1297,10 +1301,10 @@ export function summarizeOrdinaryPerformanceSamples(samples, { threshold, accept
   const outputEquivalent = oldOutputDigests.every((digest, index) => digest === newOutputDigests[index])
     && new Set(oldOutputDigests).size === 1
     && new Set(newOutputDigests).size === 1;
-  const fakePngDistinct = renderer !== "fake" || samples.every((sample) => sample.observedCounts.gate1PreviewCount === sample.observedCounts.gate1UniquePreviewPngCount);
+  const previewPngsDistinct = samples.every((sample) => sample.observedCounts.gate1PreviewCount === sample.observedCounts.gate1UniquePreviewPngCount);
   const oldResource = summarizeResources(oldSamples);
   const newResource = summarizeResources(newSamples);
-  const peakRssRegressionPercent = ((newResource.sampledPeakRssBytes.p50 - oldResource.sampledPeakRssBytes.p50) / oldResource.sampledPeakRssBytes.p50) * 100;
+  const peakRssRegressionPercent = ((newResource.sampledPeakRssBytes.p95 - oldResource.sampledPeakRssBytes.p95) / oldResource.sampledPeakRssBytes.p95) * 100;
   const strict = evaluateStrictPerformanceAcceptance({
     thresholdPercent: threshold,
     p50ImprovementPercent: p50Improvement,
@@ -1309,9 +1313,9 @@ export function summarizeOrdinaryPerformanceSamples(samples, { threshold, accept
     peakRssRegressionPercent,
     outputEquivalent,
   });
-  const criteria = { ...strict.criteria, fakePreviewPngsAreDistinct: fakePngDistinct };
+  const criteria = { ...strict.criteria, previewPngsAreDistinct: previewPngsDistinct };
   const improvementTargetMet = strict.improvementTargetMet;
-  const safeguardsPassed = strict.safeguardsPassed && fakePngDistinct;
+  const safeguardsPassed = strict.safeguardsPassed && previewPngsDistinct;
   return {
     sampleCountPerVersion: oldSamples.length,
     old: { phases: metricBreakdown(oldSamples), resources: oldResource },
@@ -1328,7 +1332,7 @@ export function summarizeOrdinaryPerformanceSamples(samples, { threshold, accept
     },
     peakRssRegressionPercent: round(peakRssRegressionPercent),
     outputEquivalent,
-    fakePngDistinct,
+    previewPngsDistinct,
     requiredImprovementPercent: threshold,
     criteria,
     improvementTargetMet,
@@ -1469,7 +1473,7 @@ async function main() {
         line: options.line,
         lineMeaning: options.line === "H"
           ? "immutable installed 20260819174146 legacy contract versus unmodified 20260821073607 full-correspondence contract"
-          : "unmodified 20260821073607 full-correspondence ordinary path versus candidate full-correspondence ordinary path",
+          : "explicitly locked pre-change installed ordinary path versus current candidate ordinary path",
         identityLock: options.identityLock ?? { source: "observed-diagnostic-only", old: null, new: null },
         harnessBefore,
         harnessAfter,

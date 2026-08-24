@@ -1,12 +1,12 @@
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
-import { Worker } from "node:worker_threads";
 
 import {
   canonicalDigest,
   copyStableBinaryBytes,
+  inspectFullyDecodedImageBytes,
   loadBundledDependency,
   mapSettledLimit,
   parseStrictJson,
@@ -27,6 +27,10 @@ import {
   paymentMethodDisplay,
   resolveVisibleDisbursementStatus,
 } from "./disbursement_domain.mjs";
+import {
+  dispatchDisbursementManifestVersion,
+  validateDisbursementManifestV2,
+} from "./disbursement_manifest_v2_contract.mjs";
 
 export const DISBURSEMENT_MANIFEST_KIND = "disbursement-archive-manifest-v1";
 export const DISBURSEMENT_AUDIT_KIND = "compact-disbursement-audit-v1";
@@ -41,15 +45,56 @@ const MAX_SALARY_ARTIFACT_BYTES = 100 * 1024 * 1024;
 const MAX_PDF_PAGES = 1_000;
 const MAX_PDF_OPERATORS_PER_PAGE = 100_000;
 const MAX_PDF_OPERATORS_TOTAL = 1_000_000;
-const MAX_PDF_WORKER_DIAGNOSTIC_BYTES = 64 * 1024;
+const MAX_PDF_VALIDATOR_DIAGNOSTIC_BYTES = 64 * 1024;
 const PDF_PARSE_TIMEOUT_MS = 30_000;
+const PDF_VALIDATOR_CLEANUP_TIMEOUT_MS = 2_000;
+const MAX_CONCURRENT_PDF_VALIDATORS = 2;
+const PDF_VALIDATOR_ENV_OVERRIDES = new Set(["NODE_OPTIONS", "DISABLE_SYSTEM_FONTS_LOAD"]);
 const PROFILE_SET = new Set(DISBURSEMENT_PROFILE_ORDER);
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ORDINARY_MANIFEST_AUDITOR = path.join(SCRIPT_DIR, "audit_batch_manifest.mjs");
-const PDF_VALIDATOR_WORKER = new URL("./validate_disbursement_pdf_worker.mjs", import.meta.url);
+const PDF_VALIDATOR_ENTRY = fileURLToPath(new URL("./validate_disbursement_pdf_process.mjs", import.meta.url));
 const execFileAsync = promisify(execFile);
 const JSZipModule = loadBundledDependency("jszip");
 const JSZip = JSZipModule.default ?? JSZipModule;
+const pdfValidatorQueue = [];
+let activePdfValidators = 0;
+
+function pumpPdfValidatorQueue() {
+  while (activePdfValidators < MAX_CONCURRENT_PDF_VALIDATORS && pdfValidatorQueue.length > 0) {
+    const task = pdfValidatorQueue.shift();
+    activePdfValidators += 1;
+    let slotRelease;
+    const releaseSlot = () => {
+      activePdfValidators -= 1;
+      pumpPdfValidatorQueue();
+    };
+    Promise.resolve()
+      .then(() => task.operation((promise) => {
+        slotRelease = Promise.resolve(promise).catch(() => {});
+      }))
+      .then(task.resolve, task.reject)
+      .finally(() => {
+        if (slotRelease) slotRelease.then(releaseSlot);
+        else releaseSlot();
+      });
+  }
+}
+
+function schedulePdfValidation(operation) {
+  return new Promise((resolve, reject) => {
+    pdfValidatorQueue.push({ operation, resolve, reject });
+    pumpPdfValidatorQueue();
+  });
+}
+
+export function inspectDisbursementPdfValidatorQueueForTests() {
+  return Object.freeze({
+    active: activePdfValidators,
+    queued: pdfValidatorQueue.length,
+    limit: MAX_CONCURRENT_PDF_VALIDATORS,
+  });
+}
 
 function fail(message) {
   throw new Error(`Compact Disbursement Manifest ${message}`);
@@ -278,38 +323,63 @@ async function validateImageBytes(bytes, signature, field) {
     repairedMissingJpegEoi = true;
   }
   try {
-    const SharpModule = loadBundledDependency("sharp");
-    const sharp = SharpModule.default ?? SharpModule;
-    const result = await sharp(validationBytes, { failOn: "error", limitInputPixels: 100_000_000 })
-      .rotate()
-      .raw()
-      .toBuffer({ resolveWithObject: true });
-    if (!Number.isSafeInteger(result.info.width) || !Number.isSafeInteger(result.info.height) || result.info.width < 1 || result.info.height < 1) {
+    const result = await inspectFullyDecodedImageBytes(validationBytes, {
+      failOn: "error",
+      limitInputPixels: 100_000_000,
+      autoOrient: true,
+    });
+    if (!Number.isSafeInteger(result.width) || !Number.isSafeInteger(result.height) || result.width < 1 || result.height < 1) {
       fail(`${field} image dimensions are invalid.`);
     }
-    return Object.freeze({ width: result.info.width, height: result.info.height, repairedMissingJpegEoi });
+    return Object.freeze({ width: result.width, height: result.height, repairedMissingJpegEoi });
   } catch (error) {
     fail(`${field} image decode failed: ${error instanceof Error ? error.message : String(error)}`);
   }
 }
 
-function collectWorkerOutput(stream) {
+function collectValidatorOutput(stream) {
   const chunks = [];
   let size = 0;
   let overflow = false;
   stream.on("data", (chunk) => {
     const bytes = Buffer.from(chunk);
-    const remaining = Math.max(0, MAX_PDF_WORKER_DIAGNOSTIC_BYTES - size);
-    if (size < MAX_PDF_WORKER_DIAGNOSTIC_BYTES) {
+    const remaining = Math.max(0, MAX_PDF_VALIDATOR_DIAGNOSTIC_BYTES - size);
+    if (size < MAX_PDF_VALIDATOR_DIAGNOSTIC_BYTES) {
       chunks.push(bytes.subarray(0, remaining));
       size += Math.min(bytes.length, remaining);
     }
     if (bytes.length > remaining) overflow = true;
   });
-  return new Promise((resolve) => stream.on("end", () => resolve({
-    text: Buffer.concat(chunks).toString("utf8"),
-    overflow,
-  })));
+  return new Promise((resolve, reject) => {
+    stream.once("error", reject);
+    stream.once("end", () => resolve({
+      text: Buffer.concat(chunks).toString("utf8"),
+      overflow,
+    }));
+  });
+}
+
+function pdfValidatorEnvironment() {
+  const env = Object.fromEntries(
+    Object.entries(process.env).filter(([key]) => !PDF_VALIDATOR_ENV_OVERRIDES.has(key.toUpperCase())),
+  );
+  return {
+    ...env,
+    NODE_OPTIONS: "",
+    DISABLE_SYSTEM_FONTS_LOAD: "1",
+  };
+}
+
+async function settlesWithin(promise, timeoutMs) {
+  let timeout;
+  try {
+    return await Promise.race([
+      Promise.resolve(promise).then(() => true, () => true),
+      new Promise((resolve) => { timeout = setTimeout(() => resolve(false), timeoutMs); }),
+    ]);
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 export async function validateCompletePdfBytes(bytes, field = "PDF voucher") {
@@ -317,71 +387,120 @@ export async function validateCompletePdfBytes(bytes, field = "PDF voucher") {
   if (bytes.byteLength < 1 || bytes.byteLength > MAX_VOUCHER_BYTES) {
     fail(`${field} PDF must be between 1 byte and 25 MiB.`);
   }
-  const worker = new Worker(PDF_VALIDATOR_WORKER, {
-    type: "module",
-    execArgv: [],
-    workerData: {
-      bytes: Uint8Array.from(bytes),
-      maxPages: MAX_PDF_PAGES,
-      maxOperatorsPerPage: MAX_PDF_OPERATORS_PER_PAGE,
-      maxOperatorsTotal: MAX_PDF_OPERATORS_TOTAL,
-    },
-    stdout: true,
-    stderr: true,
-    resourceLimits: {
-      maxOldGenerationSizeMb: 256,
-      maxYoungGenerationSizeMb: 64,
-      stackSizeMb: 8,
-    },
+  // Bind the exact submitted bytes before the operation can wait in the
+  // global validator queue. The caller may otherwise mutate its Uint8Array
+  // while earlier PDF validations are still occupying both process slots.
+  const validatorBytes = Uint8Array.from(bytes);
+  return schedulePdfValidation(async (holdSlotUntil) => {
+  // pdfjs loads a native canvas/Skia dependency in Node. Keep that native
+  // lifecycle outside the workflow process so an access violation fails this
+  // validation closed instead of terminating the entire reimbursement run.
+  const validator = spawn(process.execPath, [
+    "--max-old-space-size=256",
+    "--max-semi-space-size=32",
+    "--stack-size=8192",
+    PDF_VALIDATOR_ENTRY,
+    String(MAX_VOUCHER_BYTES),
+    String(MAX_PDF_PAGES),
+    String(MAX_PDF_OPERATORS_PER_PAGE),
+    String(MAX_PDF_OPERATORS_TOTAL),
+  ], {
+    env: pdfValidatorEnvironment(),
+    shell: false,
+    stdio: ["pipe", "pipe", "pipe", "pipe"],
+    windowsHide: true,
   });
-  const stdoutDone = collectWorkerOutput(worker.stdout);
-  const stderrDone = collectWorkerOutput(worker.stderr);
-  const outcomePromise = new Promise((resolve, reject) => {
-    let message;
-    let messageCount = 0;
-    worker.on("message", (value) => {
-      message = value;
-      messageCount += 1;
-    });
-    worker.once("error", reject);
-    worker.once("exit", (code) => resolve({ code, message, messageCount }));
+  const stdoutDone = collectValidatorOutput(validator.stdout);
+  const stderrDone = collectValidatorOutput(validator.stderr);
+  const protocolDone = collectValidatorOutput(validator.stdio[3]);
+  const inputDone = new Promise((resolve) => {
+    let settled = false;
+    const finish = (error) => {
+      if (settled) return;
+      settled = true;
+      resolve(error);
+    };
+    validator.stdin.once("error", finish);
+    validator.stdin.end(validatorBytes, () => finish(undefined));
   });
+  const closePromise = new Promise((resolve) => {
+    validator.once("close", (code, signal) => resolve({ code, signal }));
+  });
+  const errorPromise = new Promise((_, reject) => {
+    validator.once("error", reject);
+  });
+  const outcomePromise = Promise.race([closePromise, errorPromise]);
   let timeout;
-  let outcome;
+  let completed;
   try {
-    outcome = await Promise.race([
-      outcomePromise,
+    completed = await Promise.race([
+      Promise.all([outcomePromise, inputDone, stdoutDone, stderrDone, protocolDone]),
       new Promise((_, reject) => {
         timeout = setTimeout(() => reject(new Error(`PDF parser exceeded ${PDF_PARSE_TIMEOUT_MS} ms`)), PDF_PARSE_TIMEOUT_MS);
         timeout.unref?.();
       }),
     ]);
   } catch (error) {
-    await worker.terminate().catch(() => {});
+    const killRequested = validator.kill("SIGKILL");
+    validator.stdin.destroy();
+    validator.stdout.destroy();
+    validator.stderr.destroy();
+    validator.stdio[3].destroy();
+    const cleanup = closePromise;
+    if (!await settlesWithin(cleanup, PDF_VALIDATOR_CLEANUP_TIMEOUT_MS)) {
+      holdSlotUntil(cleanup);
+      validator.unref();
+      const killStatus = killRequested ? "" : " and SIGKILL could not be delivered";
+      fail(`${field} PDF full parse failed: ${error instanceof Error ? error.message : String(error)}; validator termination was not confirmed within ${PDF_VALIDATOR_CLEANUP_TIMEOUT_MS} ms${killStatus}.`);
+    }
     fail(`${field} PDF full parse failed: ${error instanceof Error ? error.message : String(error)}`);
   } finally {
     clearTimeout(timeout);
   }
-  const [stdout, stderr] = await Promise.all([stdoutDone, stderrDone]);
+  const [outcome, inputError, stdout, stderr, protocol] = completed;
   const diagnostic = [stdout.text, stderr.text].filter(Boolean).join(" | ").trim();
-  if (stdout.overflow || stderr.overflow || diagnostic) {
+  if (stdout.overflow || stderr.overflow || stdout.text.length > 0 || stderr.text.length > 0) {
     fail(`${field} PDF parser emitted a warning or error${diagnostic ? `: ${diagnostic.slice(0, 4_000)}` : "."}`);
   }
+  if (outcome.code !== 0 || outcome.signal) {
+    const status = outcome.signal ? `signal ${outcome.signal}` : `code ${outcome.code}`;
+    fail(`${field} PDF full parse failed: validator exited with ${status}.`);
+  }
+  if (inputError) {
+    fail(`${field} PDF full parse failed: validator input could not be delivered.`);
+  }
+  if (protocol.overflow || !protocol.text) {
+    fail(`${field} PDF full parse failed: validator protocol output is missing or too large.`);
+  }
+  let message;
+  try {
+    message = parseStrictJson(protocol.text, { maxDepth: 4 });
+  } catch (error) {
+    fail(`${field} PDF full parse failed: validator protocol is invalid.`);
+  }
+  const keys = message && typeof message === "object" && !Array.isArray(message)
+    ? Object.keys(message).sort()
+    : [];
   if (
-    outcome.code !== 0
-    || outcome.messageCount !== 1
-    || !outcome.message
-    || typeof outcome.message !== "object"
-    || outcome.message.ok !== true
-    || !Number.isSafeInteger(outcome.message.pageCount)
-    || !Number.isSafeInteger(outcome.message.totalOperators)
+    keys.join(",") !== "ok,pageCount,totalOperators"
+    || message.ok !== true
+    || !Number.isSafeInteger(message.pageCount)
+    || message.pageCount < 1
+    || message.pageCount > MAX_PDF_PAGES
+    || !Number.isSafeInteger(message.totalOperators)
+    || message.totalOperators < 0
+    || message.totalOperators > MAX_PDF_OPERATORS_TOTAL
+    || message.totalOperators > message.pageCount * MAX_PDF_OPERATORS_PER_PAGE
   ) {
-    const detail = outcome.message?.error ? `: ${String(outcome.message.error).slice(0, 2_000)}` : ".";
+    const detail = keys.join(",") === "error,ok" && message.ok === false && typeof message.error === "string"
+      ? `: ${message.error.slice(0, 2_000)}`
+      : ".";
     fail(`${field} PDF full parse failed${detail}`);
   }
   return Object.freeze({
-    pageCount: outcome.message.pageCount,
-    totalOperators: outcome.message.totalOperators,
+    pageCount: message.pageCount,
+    totalOperators: message.totalOperators,
+  });
   });
 }
 
@@ -400,7 +519,7 @@ async function validateWorkbookBytes(bytes, field) {
   if (!/<sheet\b/iu.test(workbookXml)) fail(`${field} XLSX must contain at least one worksheet.`);
 }
 
-async function validateBoundBinary(filePath, expectedSha256, field, { salaryKind } = {}) {
+export async function validateBoundDisbursementBinary(filePath, expectedSha256, field, { salaryKind, expectedKind } = {}) {
   const stable = await readStableBinaryFile(filePath, {
     maxBytes: salaryKind ? MAX_SALARY_ARTIFACT_BYTES : MAX_VOUCHER_BYTES,
   });
@@ -413,6 +532,9 @@ async function validateBoundBinary(filePath, expectedSha256, field, { salaryKind
   else if (signature.kind === "workbook") await validateWorkbookBytes(bytes, field);
   if (salaryKind && signature.kind !== salaryKind) fail(`${field} content does not match finalArtifactKind.`);
   if (!salaryKind && !new Set(["image", "pdf"]).has(signature.kind)) fail(`${field} must be an image or PDF voucher.`);
+  if (expectedKind && signature.kind !== expectedKind) {
+    fail(`${field} declared kind ${expectedKind} does not match actual content kind ${signature.kind}.`);
+  }
   return Object.freeze({ stable, bytes, signature, image });
 }
 
@@ -424,12 +546,13 @@ function sortedUnique(values) {
   return [...new Set(values)].sort();
 }
 
-export async function auditDisbursementManifest({ manifestPath, manifestSha256 }) {
+async function auditDisbursementManifestV1({ manifestPath, manifestSha256 }, options = {}) {
   const resolvedManifestPath = absolutePath(manifestPath, "manifestPath");
   const expectedManifestSha256 = sha(manifestSha256, "manifestSha256");
-  const manifestSnapshot = await readStableUtf8JsonFile(resolvedManifestPath, { maxBytes: MAX_JSON_BYTES });
+  const manifestSnapshot = options.manifestSnapshot
+    ?? await readStableUtf8JsonFile(resolvedManifestPath, { maxBytes: MAX_JSON_BYTES });
   if (manifestSnapshot.sha256 !== expectedManifestSha256) fail("manifest SHA-256 differs from the request binding.");
-  const raw = manifestSnapshot.value;
+  const raw = options.rawOverride ?? manifestSnapshot.value;
   exact(raw,
     new Set(["kind", "version", "batch", "reimbursementSources", "salaryArtifacts", "vouchers", "rows", "expected"]),
     new Set(), "manifest");
@@ -450,8 +573,20 @@ export async function auditDisbursementManifest({ manifestPath, manifestSha256 }
     });
   }
 
+  let reimbursementSources;
+  let salaryArtifacts;
+  let salaryById;
+  let voucherEntries;
+  let voucherById;
+  if (options.prepared) {
+    ({ reimbursementSources, salaryArtifacts, salaryById, voucherEntries, voucherById } = options.prepared);
+    if (!Array.isArray(reimbursementSources) || !Array.isArray(salaryArtifacts) || !(salaryById instanceof Map)
+      || !Array.isArray(voucherEntries) || !(voucherById instanceof Map)) {
+      fail("prepared v2 source audit did not expose the complete compatibility shape.");
+    }
+  } else {
   const registry = await loadProfileRegistry();
-  const reimbursementSources = [];
+  reimbursementSources = [];
   const sourceById = new Map();
   const reimbursementCertificateDigests = new Set();
   const reimbursementBatchProfileKeys = new Set();
@@ -498,8 +633,8 @@ export async function auditDisbursementManifest({ manifestPath, manifestSha256 }
     fail("batch.reimbursementPeriod must be omitted when no reimbursement source is present.");
   }
 
-  const salaryArtifacts = [];
-  const salaryById = new Map();
+  salaryArtifacts = [];
+  salaryById = new Map();
   const salarySlotKeys = new Set();
   const salaryArtifactDigests = new Set();
   const salaryCertificateDigests = new Set();
@@ -531,7 +666,7 @@ export async function auditDisbursementManifest({ manifestPath, manifestSha256 }
     if (salaryCertificateDigests.has(certificate.certificateDigest)) fail(`${field} reuses one salary certificate in multiple slots.`);
     salaryArtifactDigests.add(artifactSha256);
     salaryCertificateDigests.add(certificate.certificateDigest);
-    const validated = await validateBoundBinary(artifactPath, artifactSha256, `${field}.artifact`, { salaryKind: finalArtifactKind });
+    const validated = await validateBoundDisbursementBinary(artifactPath, artifactSha256, `${field}.artifact`, { salaryKind: finalArtifactKind });
     const normalized = Object.freeze({
       artifactId,
       month,
@@ -550,8 +685,8 @@ export async function auditDisbursementManifest({ manifestPath, manifestSha256 }
     salaryById.set(artifactId, normalized);
   }
 
-  const voucherEntries = [];
-  const voucherById = new Map();
+  voucherEntries = [];
+  voucherById = new Map();
   const voucherReadJobs = new Map();
   for (const [index, entry] of array(raw.vouchers, "vouchers").entries()) {
     const field = `vouchers[${index}]`;
@@ -569,12 +704,13 @@ export async function auditDisbursementManifest({ manifestPath, manifestSha256 }
   const readJobs = [...voucherReadJobs.entries()];
   const settled = await mapSettledLimit(readJobs, 4, async ([readKey, entry]) => ({
     readKey,
-    validated: await validateBoundBinary(entry.voucherPath, entry.voucherSha256, `${entry.field}.voucher`),
+    validated: await validateBoundDisbursementBinary(entry.voucherPath, entry.voucherSha256, `${entry.field}.voucher`),
   }));
   const voucherRuntimeByReadKey = new Map(settled.settled.map((item) => [item.value.readKey, item.value.validated]));
   for (const entry of voucherEntries) {
     const readKey = `${process.platform === "win32" ? entry.voucherPath.toLowerCase() : entry.voucherPath}\u0000${entry.voucherSha256}`;
     entry.validated = voucherRuntimeByReadKey.get(readKey);
+  }
   }
 
   const referencedTransactionKeys = new Set();
@@ -875,6 +1011,9 @@ export async function auditDisbursementManifest({ manifestPath, manifestSha256 }
     closureStatus,
     factsDigest: canonicalDigest(factsCore),
     sourceBindingDigest: canonicalDigest(sourceBindingCore),
+    ...(Array.isArray(options.auditWarnings) && options.auditWarnings.length
+      ? { warnings: Object.freeze(options.auditWarnings.map((entry) => Object.freeze({ ...entry }))) }
+      : {}),
   };
   const bytesByDigest = new Map();
   for (const entry of voucherEntries) {
@@ -887,17 +1026,21 @@ export async function auditDisbursementManifest({ manifestPath, manifestSha256 }
     if (!boundSourcePathMap.has(key)) boundSourcePathMap.set(key, resolved);
   };
   addBoundSourcePath(resolvedManifestPath);
-  for (const entry of reimbursementSources) {
-    addBoundSourcePath(entry.originalManifestPath);
-    addBoundSourcePath(entry.publishReceiptPath);
-    for (const filePath of entry.verifiedPublishedSource.originalManifestFilePaths) addBoundSourcePath(filePath);
-    for (const binding of entry.verifiedPublishedSource.artifactBindings) addBoundSourcePath(binding.path);
+  if (options.prepared) {
+    for (const filePath of options.prepared.boundSourcePaths) addBoundSourcePath(filePath);
+  } else {
+    for (const entry of reimbursementSources) {
+      addBoundSourcePath(entry.originalManifestPath);
+      addBoundSourcePath(entry.publishReceiptPath);
+      for (const filePath of entry.verifiedPublishedSource.originalManifestFilePaths) addBoundSourcePath(filePath);
+      for (const binding of entry.verifiedPublishedSource.artifactBindings) addBoundSourcePath(binding.path);
+    }
+    for (const entry of salaryArtifacts) {
+      addBoundSourcePath(entry.artifactPath);
+      addBoundSourcePath(entry.certificatePath);
+    }
+    for (const entry of voucherEntries) addBoundSourcePath(entry.voucherPath);
   }
-  for (const entry of salaryArtifacts) {
-    addBoundSourcePath(entry.artifactPath);
-    addBoundSourcePath(entry.certificatePath);
-  }
-  for (const entry of voucherEntries) addBoundSourcePath(entry.voucherPath);
   const boundSourcePaths = Object.freeze([...boundSourcePathMap.values()].sort((left, right) => left.localeCompare(right)));
   Object.defineProperty(result, "runtime", {
     configurable: false,
@@ -906,4 +1049,41 @@ export async function auditDisbursementManifest({ manifestPath, manifestSha256 }
     writable: false,
   });
   return Object.freeze(result);
+}
+
+export async function auditDisbursementManifest({ manifestPath, manifestSha256 }) {
+  const resolvedManifestPath = absolutePath(manifestPath, "manifestPath");
+  const expectedManifestSha256 = sha(manifestSha256, "manifestSha256");
+  const manifestSnapshot = await readStableUtf8JsonFile(resolvedManifestPath, { maxBytes: MAX_JSON_BYTES });
+  if (manifestSnapshot.sha256 !== expectedManifestSha256) fail("manifest SHA-256 differs from the request binding.");
+  const version = dispatchDisbursementManifestVersion(manifestSnapshot.value);
+  if (version === 1) {
+    return auditDisbursementManifestV1({ manifestPath: resolvedManifestPath, manifestSha256: expectedManifestSha256 }, {
+      manifestSnapshot,
+      auditWarnings: [{
+        code: "DISBURSEMENT_MANIFEST_V1_DEPRECATED",
+        message: "Manifest v1 remains supported but is deprecated; use strict manifest v2 for new archive tasks.",
+      }],
+    });
+  }
+  const normalized = validateDisbursementManifestV2(manifestSnapshot.value);
+  const { prepareDisbursementManifestV2Audit } = await import("./disbursement_manifest_v2_auditor.mjs");
+  const prepared = await prepareDisbursementManifestV2Audit(normalized, {
+    validateBoundBinary: validateBoundDisbursementBinary,
+  });
+  const compatibilityRaw = {
+    kind: DISBURSEMENT_MANIFEST_KIND,
+    version: 1,
+    batch: structuredClone(normalized.batch),
+    reimbursementSources: [],
+    salaryArtifacts: [],
+    vouchers: [],
+    rows: structuredClone(normalized.rows),
+    expected: structuredClone(normalized.expected),
+  };
+  return auditDisbursementManifestV1({ manifestPath: resolvedManifestPath, manifestSha256: expectedManifestSha256 }, {
+    manifestSnapshot,
+    rawOverride: compatibilityRaw,
+    prepared,
+  });
 }

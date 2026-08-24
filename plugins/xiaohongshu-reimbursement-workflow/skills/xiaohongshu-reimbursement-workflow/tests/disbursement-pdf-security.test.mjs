@@ -8,7 +8,11 @@ import test from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 
-import { auditDisbursementManifest, validateCompletePdfBytes } from "../scripts/disbursement_manifest.mjs";
+import {
+  auditDisbursementManifest,
+  inspectDisbursementPdfValidatorQueueForTests,
+  validateCompletePdfBytes,
+} from "../scripts/disbursement_manifest.mjs";
 import { importBundledDependency, sha256Bytes } from "../scripts/workflow_primitives.mjs";
 import { createCompactDisbursementProductionFixture } from "./disbursement-production-fixture.mjs";
 
@@ -139,6 +143,48 @@ test("strict PDF validator accepts a complete one-page voucher", async () => {
   assert.deepEqual(result, { pageCount: 1, totalOperators: 2 });
 });
 
+test("manifest v2 voucher kind must match fully validated image and PDF content", async (t) => {
+  const scenarios = [
+    { name: "image declared as PDF", actualKind: "image", declaredKind: "pdf" },
+    { name: "PDF declared as image", actualKind: "pdf", declaredKind: "image" },
+  ];
+  for (const scenario of scenarios) {
+    await t.test(scenario.name, async () => {
+      const root = await fs.mkdtemp(path.join(os.tmpdir(), "codex-disbursement-v2-voucher-kind-"));
+      try {
+        const fixture = await createCompactDisbursementProductionFixture({
+          root,
+          manifestVersion: 2,
+          reimbursementMode: "fresh_evidence",
+          profileIds: [],
+          reimbursementTransactionCount: 0,
+          includeSalary: true,
+          requestedUniqueVoucherCount: 1,
+        });
+        const manifest = structuredClone(fixture.manifest);
+        const voucherFile = manifest.sourceFiles.find((file) => file.usage.includes("payout_voucher"));
+        assert.ok(voucherFile);
+        if (scenario.actualKind === "pdf") {
+          const bytes = onePagePdf();
+          voucherFile.path = path.join(root, "actual-voucher.pdf");
+          voucherFile.sha256 = sha256Bytes(bytes);
+          await fs.writeFile(voucherFile.path, bytes, { flag: "wx" });
+        }
+        voucherFile.kind = scenario.declaredKind;
+        const manifestBytes = Buffer.from(`${JSON.stringify(manifest)}\n`, "utf8");
+        const manifestPath = path.join(root, `mismatched-${scenario.actualKind}-voucher.json`);
+        await fs.writeFile(manifestPath, manifestBytes, { flag: "wx" });
+        await assert.rejects(
+          auditDisbursementManifest({ manifestPath, manifestSha256: sha256Bytes(manifestBytes) }),
+          new RegExp(`declared kind ${scenario.declaredKind} does not match actual content kind ${scenario.actualKind}`, "u"),
+        );
+      } finally {
+        await fs.rm(root, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
 test("valid PDF validation works when imported from --input-type=module eval", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "codex-disbursement-pdf-eval-import-"));
   try {
@@ -161,6 +207,115 @@ test("valid PDF validation works when imported from --input-type=module eval", a
     assert.deepEqual(JSON.parse(stdout), { pageCount: 1, totalOperators: 2 });
   } finally {
     await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("PDF validator process failures stay fail-closed and the queue recovers", async () => {
+  const manifestUrl = pathToFileURL(fileURLToPath(new URL("../scripts/disbursement_manifest.mjs", import.meta.url))).href;
+  const program = `
+    import assert from "node:assert/strict";
+    import { EventEmitter } from "node:events";
+    import { createRequire, syncBuiltinESMExports } from "node:module";
+    import { PassThrough, Writable } from "node:stream";
+    const require = createRequire(import.meta.url);
+    const childProcess = require("node:child_process");
+    const originalSpawn = childProcess.spawn;
+    let mode = "crash";
+    let killCount = 0;
+    let lastChild;
+    childProcess.spawn = () => {
+      const child = new EventEmitter();
+      lastChild = child;
+      child.stdin = new Writable({ write(_chunk, _encoding, callback) { callback(); } });
+      child.stdout = new PassThrough();
+      child.stderr = new PassThrough();
+      const protocol = new PassThrough();
+      child.stdio = [child.stdin, child.stdout, child.stderr, protocol];
+      child.kill = () => {
+        killCount += 1;
+        if (mode === "hang-error") {
+          queueMicrotask(() => child.emit("error", new Error("synthetic SIGKILL failure")));
+          return false;
+        }
+        return true;
+      };
+      child.unref = () => {};
+      queueMicrotask(() => {
+        if (mode.startsWith("hang")) return;
+        if (mode === "whitespace") child.stdout.end("\\n");
+        else child.stdout.end();
+        child.stderr.end();
+        if (mode === "success" || mode === "whitespace") {
+          protocol.end(JSON.stringify({ ok: true, pageCount: 1, totalOperators: 2 }));
+        } else if (mode === "invalid-success") {
+          protocol.end(JSON.stringify({ ok: true, pageCount: 0, totalOperators: -1 }));
+        } else {
+          protocol.end();
+        }
+        child.emit("close", mode === "crash" ? 3221225477 : 0, null);
+      });
+      return child;
+    };
+    syncBuiltinESMExports();
+    try {
+      const url = new URL(${JSON.stringify(manifestUrl)});
+      url.searchParams.set("process-isolation-test", String(Date.now()));
+      const manifest = await import(url.href);
+      const bytes = new Uint8Array([1]);
+      const emptyQueue = { active: 0, queued: 0, limit: 2 };
+      await assert.rejects(manifest.validateCompletePdfBytes(bytes, "crash fixture"), /validator exited with code 3221225477/u);
+      assert.deepEqual(manifest.inspectDisbursementPdfValidatorQueueForTests(), emptyQueue);
+      mode = "invalid-success";
+      await assert.rejects(manifest.validateCompletePdfBytes(bytes, "invalid protocol fixture"), /PDF full parse failed/u);
+      assert.deepEqual(manifest.inspectDisbursementPdfValidatorQueueForTests(), emptyQueue);
+      mode = "whitespace";
+      await assert.rejects(manifest.validateCompletePdfBytes(bytes, "diagnostic fixture"), /parser emitted a warning or error/u);
+      assert.deepEqual(manifest.inspectDisbursementPdfValidatorQueueForTests(), emptyQueue);
+      mode = "hang-error";
+      const originalSetTimeout = globalThis.setTimeout;
+      const originalClearTimeout = globalThis.clearTimeout;
+      globalThis.setTimeout = (callback) => { queueMicrotask(callback); return { unref() {} }; };
+      globalThis.clearTimeout = () => {};
+      try {
+        await assert.rejects(
+          manifest.validateCompletePdfBytes(bytes, "timeout fixture"),
+          /exceeded 30000 ms.*termination was not confirmed.*SIGKILL could not be delivered/u,
+        );
+      } finally {
+        globalThis.setTimeout = originalSetTimeout;
+        globalThis.clearTimeout = originalClearTimeout;
+      }
+      assert.equal(killCount, 1);
+      assert.deepEqual(manifest.inspectDisbursementPdfValidatorQueueForTests(), { active: 1, queued: 0, limit: 2 });
+      lastChild.emit("close", null, "SIGKILL");
+      await new Promise((resolve) => originalSetTimeout(resolve, 0));
+      assert.deepEqual(manifest.inspectDisbursementPdfValidatorQueueForTests(), emptyQueue);
+      mode = "success";
+      assert.deepEqual(await manifest.validateCompletePdfBytes(bytes, "recovery fixture"), { pageCount: 1, totalOperators: 2 });
+      assert.deepEqual(manifest.inspectDisbursementPdfValidatorQueueForTests(), emptyQueue);
+      process.stdout.write("ok");
+    } finally {
+      childProcess.spawn = originalSpawn;
+      syncBuiltinESMExports();
+    }
+  `;
+  const { stdout, stderr } = await execFileAsync(process.execPath, ["--input-type=module", "-e", program], {
+    encoding: "utf8",
+    windowsHide: true,
+    timeout: 30_000,
+  });
+  assert.equal(stderr, "");
+  assert.equal(stdout, "ok");
+});
+
+test("PDF validator process does not inherit NODE_OPTIONS", { concurrency: false }, async () => {
+  const original = process.env.NODE_OPTIONS;
+  process.env.NODE_OPTIONS = "--xhs-invalid-option-must-not-reach-validator";
+  try {
+    assert.deepEqual(await validateCompletePdfBytes(onePagePdf(), "NODE_OPTIONS isolation fixture"), { pageCount: 1, totalOperators: 2 });
+  } finally {
+    if (original === undefined) delete process.env.NODE_OPTIONS;
+    else process.env.NODE_OPTIONS = original;
   }
 });
 
@@ -218,11 +373,50 @@ test("manifest audit and real archive CLI preserve valid PDF voucher capability"
   }
 });
 
-test("parallel valid PDF validation stays isolated from worker diagnostics", async () => {
-  const results = await Promise.all(Array.from({ length: 4 }, (_, index) => (
+test("parallel valid PDF validation stays isolated from validator process diagnostics", async () => {
+  const pending = Array.from({ length: 4 }, (_, index) => (
     validateCompletePdfBytes(onePagePdf({ content: `q\n${index} ${index} m\nQ` }), `parallel fixture ${index}`)
-  )));
+  ));
+  assert.deepEqual(inspectDisbursementPdfValidatorQueueForTests(), { active: 2, queued: 2, limit: 2 });
+  const results = await Promise.all(pending);
   assert.deepEqual(results.map((entry) => entry.pageCount), [1, 1, 1, 1]);
+  assert.deepEqual(inspectDisbursementPdfValidatorQueueForTests(), { active: 0, queued: 0, limit: 2 });
+});
+
+test("PDF validation binds the submitted view before immediate mutation or queue waiting", { concurrency: false }, async () => {
+  const immediateSource = onePagePdf({ content: "q\n10 10 m\nQ" });
+  const immediateControl = await validateCompletePdfBytes(Buffer.from(immediateSource), "immediate mutation control");
+  const immediateBytes = Buffer.from(immediateSource);
+  const immediate = validateCompletePdfBytes(immediateBytes, "immediate mutation fixture");
+  immediateBytes.fill(0);
+  assert.deepEqual(await immediate, immediateControl);
+
+  const viewSource = onePagePdf({ content: "q\n15 15 m\nQ" });
+  const backing = Buffer.concat([Buffer.alloc(11, 0x11), viewSource, Buffer.alloc(13, 0x22)]);
+  const view = new Uint8Array(backing.buffer, backing.byteOffset + 11, viewSource.length);
+  const viewControl = await validateCompletePdfBytes(Uint8Array.from(view), "offset view control");
+  const offsetPending = validateCompletePdfBytes(view, "offset view mutation fixture");
+  backing.fill(0);
+  assert.deepEqual(await offsetPending, viewControl);
+
+  const queuedSource = onePagePdf({ content: "q\n20 20 m\nQ" });
+  const queuedControl = await validateCompletePdfBytes(Buffer.from(queuedSource), "queued mutation control");
+  const blockers = [
+    validateCompletePdfBytes(onePagePdf({ content: "q\n1 1 m\nQ" }), "queue blocker 1"),
+    validateCompletePdfBytes(onePagePdf({ content: "q\n2 2 m\nQ" }), "queue blocker 2"),
+  ];
+  const queuedBytes = Buffer.from(queuedSource);
+  const queued = validateCompletePdfBytes(queuedBytes, "queued mutation fixture");
+  const pending = [...blockers, queued];
+  try {
+    assert.deepEqual(inspectDisbursementPdfValidatorQueueForTests(), { active: 2, queued: 1, limit: 2 });
+    queuedBytes.fill(0);
+    const [, , queuedResult] = await Promise.all(pending);
+    assert.deepEqual(queuedResult, queuedControl);
+  } finally {
+    await Promise.allSettled(pending);
+  }
+  assert.deepEqual(inspectDisbursementPdfValidatorQueueForTests(), { active: 0, queued: 0, limit: 2 });
 });
 
 test("PDF-looking header and EOF bytes without a catalog are rejected", async () => {
@@ -277,7 +471,7 @@ test("real pypdf AES-256 PDF with empty user password is rejected by the real ar
       },
     );
     await assert.rejects(fs.access(path.join(root, fixture.expectedBatchName)), /ENOENT/u);
-    await fs.access(path.join(root, `codex-xhs-disbursement-${stagingToken}`));
+    await assert.rejects(fs.access(path.join(root, `codex-xhs-disbursement-${stagingToken}`)), /ENOENT/u);
   } finally {
     await fs.rm(root, { recursive: true, force: true });
   }

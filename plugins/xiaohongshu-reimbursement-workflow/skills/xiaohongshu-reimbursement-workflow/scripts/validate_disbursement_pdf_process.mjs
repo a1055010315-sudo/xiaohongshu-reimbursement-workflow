@@ -1,4 +1,4 @@
-import { parentPort, workerData } from "node:worker_threads";
+import fs from "node:fs";
 
 import { importBundledDependency } from "./workflow_primitives.mjs";
 
@@ -7,13 +7,38 @@ function positiveLimit(value, field) {
   return value;
 }
 
+async function readBoundedStdin(maxBytes) {
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of process.stdin) {
+    size += chunk.length;
+    if (size > maxBytes) throw new Error(`PDF input exceeds the ${maxBytes} byte limit.`);
+    chunks.push(chunk);
+  }
+  if (size < 1) throw new Error("PDF input is empty.");
+  const bytes = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return bytes;
+}
+
+function writeProtocol(value) {
+  const bytes = Buffer.from(JSON.stringify(value), "utf8");
+  if (bytes.length > 64 * 1024 || fs.writeSync(3, bytes) !== bytes.length) {
+    throw new Error("PDF validator protocol output could not be written completely.");
+  }
+}
+
 async function parseCompletePdf() {
-  if (!parentPort) throw new Error("PDF validator must run in a worker thread.");
-  const bytes = workerData?.bytes;
-  if (!(bytes instanceof Uint8Array)) throw new Error("PDF worker bytes must be a Uint8Array.");
-  const maxPages = positiveLimit(workerData.maxPages, "maxPages");
-  const maxOperatorsPerPage = positiveLimit(workerData.maxOperatorsPerPage, "maxOperatorsPerPage");
-  const maxOperatorsTotal = positiveLimit(workerData.maxOperatorsTotal, "maxOperatorsTotal");
+  if (process.argv.length !== 6) throw new Error("PDF validator arguments are invalid.");
+  const maxBytes = positiveLimit(Number(process.argv[2]), "maxBytes");
+  const maxPages = positiveLimit(Number(process.argv[3]), "maxPages");
+  const maxOperatorsPerPage = positiveLimit(Number(process.argv[4]), "maxOperatorsPerPage");
+  const maxOperatorsTotal = positiveLimit(Number(process.argv[5]), "maxOperatorsTotal");
+  const bytes = await readBoundedStdin(maxBytes);
   const pdfjs = await importBundledDependency("pdfjs-dist");
   if (typeof pdfjs.getDocument !== "function" || !pdfjs.VerbosityLevel) {
     throw new Error("bundled pdfjs-dist does not expose the required parser API");
@@ -25,7 +50,7 @@ async function parseCompletePdf() {
   let result;
   try {
     loadingTask = pdfjs.getDocument({
-      data: Uint8Array.from(bytes),
+      data: bytes,
       stopAtErrors: true,
       verbosity: pdfjs.VerbosityLevel.WARNINGS,
       disableRange: true,
@@ -91,9 +116,12 @@ async function parseCompletePdf() {
 }
 
 parseCompletePdf().then(
-  (result) => parentPort.postMessage(result),
-  (error) => parentPort.postMessage({
+  (result) => writeProtocol(result),
+  (error) => writeProtocol({
     ok: false,
     error: error instanceof Error ? error.message : String(error),
   }),
-);
+).catch((error) => {
+  process.stderr.write(`PDF validator protocol failure: ${error instanceof Error ? error.message : String(error)}\n`);
+  process.exitCode = 1;
+});

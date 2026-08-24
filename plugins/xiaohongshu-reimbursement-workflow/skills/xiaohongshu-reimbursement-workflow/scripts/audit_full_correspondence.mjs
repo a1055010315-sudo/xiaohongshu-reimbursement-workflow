@@ -15,6 +15,7 @@ import {
 
 export const INDEPENDENT_EVIDENCE_REVIEW_KIND = "independent-evidence-review-v1";
 export const FULL_CORRESPONDENCE_AUDIT_KIND = "gate2-full-correspondence-v1";
+export const GATE1_RESTART_REQUIRED_ERROR_CODE = "XHS_GATE1_RESTART_REQUIRED";
 
 const SHA_RE = /^[0-9a-f]{64}$/u;
 const MAX_JSON_BYTES = 16 * 1024 * 1024;
@@ -22,6 +23,7 @@ const MAX_SOURCE_BYTES = 25 * 1024 * 1024;
 const SOURCE_CONCURRENCY = 4;
 const JSZipModule = loadBundledDependency("jszip");
 const JSZip = JSZipModule.default ?? JSZipModule;
+const verifiedManifestSnapshots = new WeakSet();
 
 class CorrespondenceValidationError extends Error {}
 
@@ -29,9 +31,20 @@ function fail(message) {
   throw new CorrespondenceValidationError(`Full Correspondence Auditor ${message}`);
 }
 
+function failGate1RestartRequired(message, cause) {
+  const error = new CorrespondenceValidationError(`Full Correspondence Auditor ${message}`, cause ? { cause } : undefined);
+  error.code = GATE1_RESTART_REQUIRED_ERROR_CODE;
+  throw error;
+}
+
 function isRetryableInfrastructureError(error) {
   const codes = new Set(["EACCES", "EPERM", "EBUSY", "EMFILE", "ENFILE", "ENOMEM", "EIO", "ETIMEDOUT", "ENOENT"]);
   for (let current = error, depth = 0; current && depth < 8; current = current.cause, depth += 1) if (codes.has(current.code)) return true;
+  return false;
+}
+
+function hasErrorCode(error, expectedCode) {
+  for (let current = error, depth = 0; current && depth < 8; current = current.cause, depth += 1) if (current.code === expectedCode) return true;
   return false;
 }
 
@@ -73,6 +86,28 @@ function exact(value, keys, field) {
   object(value, field);
   for (const key of Object.keys(value)) if (!keys.has(key)) fail(`${field} contains unknown field ${key}.`);
   for (const key of keys) if (!Object.hasOwn(value, key)) fail(`${field} is missing ${key}.`);
+}
+
+export async function readVerifiedGate1ManifestSnapshot(manifestBinding, { testHooks } = {}) {
+  object(manifestBinding, "Gate 1 manifest binding");
+  const manifestPath = path.resolve(text(manifestBinding.path, "Gate 1 manifest binding.path"));
+  const expectedSha256 = sha(manifestBinding.sha256, "Gate 1 manifest binding.sha256");
+  const expectedSize = manifestBinding.size;
+  if (expectedSize !== undefined && (!Number.isSafeInteger(expectedSize) || expectedSize < 1)) {
+    fail("Gate 1 manifest binding.size must be a positive safe integer when supplied.");
+  }
+  let stable;
+  try {
+    stable = await readStableUtf8JsonFile(manifestPath, { maxBytes: MAX_JSON_BYTES, testHooks });
+  } catch (error) {
+    if (isRetryableInfrastructureError(error) && !hasErrorCode(error, "ENOENT")) throw error;
+    failGate1RestartRequired("manifest could not be read after Gate 1", error);
+  }
+  if (stable.sha256 !== expectedSha256) failGate1RestartRequired("manifest bytes changed after Gate 1");
+  if (expectedSize !== undefined && stable.size !== expectedSize) failGate1RestartRequired("manifest size changed after Gate 1");
+  const snapshot = Object.freeze({ path: manifestPath, ...stable });
+  verifiedManifestSnapshots.add(snapshot);
+  return snapshot;
 }
 
 function clone(value) {
@@ -142,7 +177,7 @@ function serialToIso(raw, date1904) {
 }
 
 function issueStore() {
-  const result = { missing: [], extra: [], mismatches: [], duplicate: [], unbound: [], blocking: [] };
+  const result = { missing: [], extra: [], mismatches: [], duplicate: [], unbound: [], reviewFindings: [], blocking: [] };
   const add = (kind, code, detail = {}) => {
     if (!Object.hasOwn(result, kind)) fail(`internal issue kind ${kind} is invalid.`);
     result[kind].push({ code, ...detail });
@@ -169,12 +204,20 @@ function sortIssues(issues) {
   });
 }
 
-function compare(add, actual, expected, detail) {
+function compareAs(add, kind, actual, expected, detail) {
   if (canonicalDigest(publicValue(actual)) !== canonicalDigest(publicValue(expected))) {
-    add("mismatches", detail.code, { ...without(detail, "code"), expected: publicValue(expected), actual: publicValue(actual) });
+    add(kind, detail.code, { ...without(detail, "code"), expected: publicValue(expected), actual: publicValue(actual) });
     return false;
   }
   return true;
+}
+
+function compare(add, actual, expected, detail) {
+  return compareAs(add, "mismatches", actual, expected, detail);
+}
+
+function compareReviewFinding(add, actual, expected, detail) {
+  return compareAs(add, "reviewFindings", actual, expected, detail);
 }
 
 function cellMap(sheet) {
@@ -300,12 +343,20 @@ function runs(items, keySelector) {
   return result;
 }
 
-function validateTabularRows({ add, sheet, expected, startRow, profileId, artifact, person, transactionResults }) {
+function reimbursementAttribute(transaction, evidenceFiles) {
+  const settlementText = transaction.settlement === "company_paid_no_reimbursement" ? "对公已付不实报" : "实报";
+  const hasVoucher = transaction.evidence.some((evidenceId) => evidenceFiles.get(evidenceId)?.usage === "voucher");
+  return `${settlementText}；${hasVoucher ? "有截图" : "无截图"}`;
+}
+
+function validateTabularRows({ add, sheet, expected, startRow, profileId, artifact, person, transactionResults, evidenceFiles }) {
   const cells = cellMap(sheet);
   const dateRuns = runs(expected, (item) => item.date);
   const feeRuns = runs(expected, (item) => JSON.stringify([item.classification, item.settlement]));
+  const attributeRuns = runs(expected, (item) => reimbursementAttribute(item, evidenceFiles));
   const dateByStart = new Map(dateRuns.map((run) => [run.start, run]));
   const feeByStart = new Map(feeRuns.map((run) => [run.start, run]));
+  const attributeByStart = new Map(attributeRuns.map((run) => [run.start, run]));
   for (const [index, transaction] of expected.entries()) {
     const row = startRow + index;
     const location = `${artifact}!${row}`;
@@ -323,7 +374,7 @@ function validateTabularRows({ add, sheet, expected, startRow, profileId, artifa
       sourceAmount: transaction.sourceAmount,
       person: transaction.person,
       classification: transaction.classification,
-      settlement: transaction.settlement === "company_paid_no_reimbursement" ? "对公已付不实报" : "实报",
+      settlement: reimbursementAttribute(transaction, evidenceFiles),
     };
     compare(add, actual, wanted, { code: "transaction-row-mismatch", profileId, transactionId: transaction.id, artifact, location });
     markTransactionCheck(transactionResults, transaction.id, artifact, { row });
@@ -336,7 +387,11 @@ function validateTabularRows({ add, sheet, expected, startRow, profileId, artifa
       requireFormula(add, formulaCell, `SUM(C${row}:C${endRow})`, { profileId, transactionId: transaction.id, artifact, location: `D${row}` });
       const expectedTotal = sum(expected.slice(feeRun.start, feeRun.end + 1), (item) => item.sourceMilliunits);
       compare(add, amount(asAmount(cellScalar(formulaCell), `${artifact}!D${row}`)), amount(expectedTotal), { code: "formula-total-mismatch", profileId, transactionId: transaction.id, artifact, location: `D${row}` });
-      if (endRow > row) for (const column of [4, 5, 6]) requireMerge(add, sheet, mergeRef(column, row, column, endRow), { profileId, transactionId: transaction.id, artifact, location });
+      if (endRow > row) for (const column of [4, 5]) requireMerge(add, sheet, mergeRef(column, row, column, endRow), { profileId, transactionId: transaction.id, artifact, location });
+    }
+    const attributeRun = attributeByStart.get(index);
+    if (attributeRun && attributeRun.end > attributeRun.start) {
+      requireMerge(add, sheet, mergeRef(6, row, 6, row + attributeRun.end - attributeRun.start), { profileId, transactionId: transaction.id, artifact, location });
     }
   }
 }
@@ -686,8 +741,11 @@ function validateSummaryAnnotations(manifest, certificate, transactionsById, add
 function validateReview(review, state, sourceByRef, transactions, annotations, annotationResults, add, block) {
   let reviewBlocked = false;
   const blockReview = (code, detail = {}) => { reviewBlocked = true; block(code, detail); };
+  const findReviewConflict = (code, detail = {}) => add("reviewFindings", code, detail);
   const pendingSemanticComparisons = [];
-  exact(review, new Set(["kind", "reviewerRunId", "gate1BindingDigest", "sourceCoverageDigest", "independence", "observations", "annotationObservations"]), "independent evidence review");
+  const reviewKeys = new Set(["kind", "reviewerRunId", "gate1BindingDigest", "sourceCoverageDigest", "independence", "observations", "annotationObservations"]);
+  if (Object.hasOwn(review, "findingResolution")) reviewKeys.add("findingResolution");
+  exact(review, reviewKeys, "independent evidence review");
   if (review.kind !== INDEPENDENT_EVIDENCE_REVIEW_KIND) fail("independent evidence review kind is unsupported.");
   text(review.reviewerRunId, "independent evidence review reviewerRunId");
   if (review.gate1BindingDigest !== state.gate1.bindingDigest || review.sourceCoverageDigest !== state.certificate.sourceCoverageDigest) fail("independent evidence review Gate 1/source binding differs.");
@@ -725,7 +783,7 @@ function validateReview(review, state, sourceByRef, transactions, annotations, a
     const source = sourceByRef.get(sourceRef);
     const observation = observations.get(sourceRef);
     if (!observation) {
-      blockReview("independent-review-observation-missing", { sourceRef, fileId: source?.file.id, artifact: "independent-evidence-review" });
+      findReviewConflict("independent-review-observation-missing", { sourceRef, fileId: source?.file.id, artifact: "independent-evidence-review" });
       continue;
     }
     if (source) {
@@ -734,7 +792,7 @@ function validateReview(review, state, sourceByRef, transactions, annotations, a
     for (const fact of observation.facts) {
       const transaction = transactionById.get(fact.transactionId);
       if (!transaction || !expectedTransactions.has(fact.transactionId)) {
-        blockReview("independent-review-fact-transaction-unbound", { sourceRef, transactionId: fact.transactionId, fileId: source?.file.id, artifact: "independent-evidence-review" });
+        findReviewConflict("independent-review-fact-transaction-unbound", { sourceRef, transactionId: fact.transactionId, fileId: source?.file.id, artifact: "independent-evidence-review" });
         continue;
       }
       if (!aggregated.has(fact.transactionId)) aggregated.set(fact.transactionId, new Map());
@@ -745,7 +803,7 @@ function validateReview(review, state, sourceByRef, transactions, annotations, a
       }
     }
   }
-  for (const sourceRef of observations.keys()) if (!expectedByRef.has(sourceRef)) blockReview("independent-review-observation-extra", { sourceRef, artifact: "independent-evidence-review" });
+  for (const sourceRef of observations.keys()) if (!expectedByRef.has(sourceRef)) findReviewConflict("independent-review-observation-extra", { sourceRef, artifact: "independent-evidence-review" });
   for (const [index, annotation] of annotationObservations.entries()) for (const sourceRef of annotation.sourceRefs) {
     if (!expectedByRef.has(sourceRef)) blockReview("independent-review-annotation-source-ref-unbound", { annotationObservationIndex: index, sourceRef, artifact: "independent-evidence-review" });
   }
@@ -762,7 +820,7 @@ function validateReview(review, state, sourceByRef, transactions, annotations, a
     const identityDigest = canonicalDigest(without(expected, "amount"));
     const matchIndexes = [...unusedAnnotationObservations].filter((index) => canonicalDigest(without(annotationObservations[index], "amount")) === identityDigest);
     if (matchIndexes.length === 0) {
-      blockReview("independent-review-summary-annotation-missing", { annotationIndex, artifact: "independent-evidence-review", expected: without(expected, "amount") });
+      findReviewConflict("independent-review-summary-annotation-missing", { annotationIndex, artifact: "independent-evidence-review", expected: without(expected, "amount") });
     } else if (matchIndexes.length > 1) {
       blockReview("independent-review-summary-annotation-ambiguous", { annotationIndex, artifact: "independent-evidence-review", matchIndexes });
     } else {
@@ -774,7 +832,7 @@ function validateReview(review, state, sourceByRef, transactions, annotations, a
       if (!amountMatches) pendingSemanticComparisons.push({ actual: annotationObservations[matchIndex].amount, expected: expected.amount, detail: { code: "independent-review-summary-annotation-amount-mismatch", annotationIndex, artifact: "independent-evidence-review" } });
     }
   }
-  for (const annotationObservationIndex of unusedAnnotationObservations) blockReview("independent-review-summary-annotation-extra", {
+  for (const annotationObservationIndex of unusedAnnotationObservations) findReviewConflict("independent-review-summary-annotation-extra", {
     annotationObservationIndex,
     artifact: "independent-evidence-review",
     actual: clone(annotationObservations[annotationObservationIndex]),
@@ -783,54 +841,109 @@ function validateReview(review, state, sourceByRef, transactions, annotations, a
     const fields = aggregated.get(transaction.id) ?? new Map();
     for (const field of ["date", "person", "project", "sourceAmount"]) {
       const values = [...(fields.get(field) ?? [])];
-      if (values.length === 0) blockReview("independent-review-transaction-field-missing", { transactionId: transaction.id, field, artifact: "independent-evidence-review" });
-      else if (values.length > 1) blockReview("independent-review-transaction-field-conflict", { transactionId: transaction.id, field, artifact: "independent-evidence-review", actual: values.sort(stableTextCompare) });
+      if (values.length === 0) findReviewConflict("independent-review-transaction-field-missing", { transactionId: transaction.id, field, artifact: "independent-evidence-review" });
+      else if (values.length > 1) findReviewConflict("independent-review-transaction-field-conflict", { transactionId: transaction.id, field, artifact: "independent-evidence-review", actual: values.sort(stableTextCompare) });
       else pendingSemanticComparisons.push({ actual: values[0], expected: transaction[field], detail: { code: "independent-visual-observation-mismatch", transactionId: transaction.id, field, artifact: "independent-evidence-review" } });
     }
   }
-  if (!reviewBlocked) for (const comparison of pendingSemanticComparisons) compare(add, comparison.actual, comparison.expected, comparison.detail);
-  return observations;
+  if (!reviewBlocked) for (const comparison of pendingSemanticComparisons) compareReviewFinding(add, comparison.actual, comparison.expected, comparison.detail);
+  let findingResolution = null;
+  if (Object.hasOwn(review, "findingResolution")) {
+    exact(review.findingResolution, new Set(["kind", "priorReportDigest", "priorReviewSha256", "decision", "reason", "revisedManifestSha256"]), "independent evidence review findingResolution");
+    if (review.findingResolution.kind !== "gate2-finding-resolution-v1") fail("independent evidence review findingResolution.kind is unsupported.");
+    findingResolution = {
+      kind: review.findingResolution.kind,
+      priorReportDigest: sha(review.findingResolution.priorReportDigest, "findingResolution.priorReportDigest"),
+      priorReviewSha256: sha(review.findingResolution.priorReviewSha256, "findingResolution.priorReviewSha256"),
+      decision: text(review.findingResolution.decision, "findingResolution.decision"),
+      reason: text(review.findingResolution.reason, "findingResolution.reason"),
+      revisedManifestSha256: review.findingResolution.revisedManifestSha256,
+    };
+    if (!new Set(["gate1-content-error", "reviewer-error", "evidence-uncertain"]).has(findingResolution.decision)) fail("independent evidence review findingResolution.decision is invalid.");
+    if (findingResolution.decision === "gate1-content-error") findingResolution.revisedManifestSha256 = sha(findingResolution.revisedManifestSha256, "findingResolution.revisedManifestSha256");
+    else if (findingResolution.revisedManifestSha256 !== null) fail("findingResolution.revisedManifestSha256 must be null unless Gate 1 content is being corrected.");
+  }
+  return { observations, findingResolution };
 }
 
 async function freshReviewSources(sourceByRef, usedMediaFiles, observations, add, metrics, hooks) {
-  const unique = new Map();
-  for (const binding of sourceByRef.values()) if (!unique.has(binding.file.sha256)) unique.set(binding.file.sha256, binding.file);
-  for (const file of usedMediaFiles) if (!unique.has(file.sha256)) unique.set(file.sha256, file);
-  const settled = await mapSettledLimit([...unique.values()], SOURCE_CONCURRENCY, async (file) => {
-    await hooks?.beforeSourceRead?.(clone(file));
-    const stable = await readStableBinaryFile(file.path, { maxBytes: MAX_SOURCE_BYTES });
-    metrics.uniqueSourceReadCount += 1;
-    if (stable.sha256 !== file.sha256) return { file, error: "source SHA changed after Gate 1" };
-    let image = null;
-    if (file.kind === "image") {
-      metrics.uniqueMediaReadCount += 1;
-      try {
-        image = await inspectEvidenceImage(copyStableBinaryBytes(stable), `independent source ${file.id}`);
-        metrics.uniqueMediaDecodeCount += 1;
-      } catch (error) {
-        return { file, error: `source full decode failed: ${error instanceof Error ? error.message : String(error)}` };
-      }
+  const pathKey = (filePath) => process.platform === "win32" ? path.resolve(filePath).toLowerCase() : path.resolve(filePath);
+  const filesByPath = new Map();
+  for (const binding of sourceByRef.values()) filesByPath.set(pathKey(binding.file.path), binding.file);
+  for (const file of usedMediaFiles) filesByPath.set(pathKey(file.path), file);
+  const imageDecodeBySha = new Map();
+  const settled = await mapSettledLimit([...filesByPath.values()], SOURCE_CONCURRENCY, async (file) => {
+    let stable;
+    try {
+      await hooks?.beforeSourceRead?.(clone(file));
+      stable = await readStableBinaryFile(file.path, { maxBytes: MAX_SOURCE_BYTES });
+    } catch (error) {
+      if (!isRetryableInfrastructureError(error)) throw error;
+      const gate1Required = hasErrorCode(error, "ENOENT");
+      return {
+        file,
+        error: `source stable read ${gate1Required ? "missing after Gate 1" : "blocked"}: ${error instanceof Error ? error.message : String(error)}`,
+        ...(gate1Required ? { gate1Required } : {}),
+      };
     }
-    return { file, image };
+    metrics.uniqueSourceReadCount += 1;
+    if (stable.sha256 !== file.sha256) return { file, error: "source SHA changed after Gate 1", gate1Required: true };
+    if (file.kind !== "image") return { file };
+    let decode = imageDecodeBySha.get(file.sha256);
+    if (!decode) {
+      metrics.uniqueMediaReadCount += 1;
+      const inspected = hooks?.beforeSourceDecode
+        ? Promise.resolve(hooks.beforeSourceDecode(clone(file))).then(() => inspectEvidenceImage(copyStableBinaryBytes(stable), `independent source ${file.id}`))
+        : inspectEvidenceImage(copyStableBinaryBytes(stable), `independent source ${file.id}`);
+      decode = inspected.then(
+        (image) => { metrics.uniqueMediaDecodeCount += 1; return { image }; },
+        (error) => ({ decodeError: `source full decode failed: ${error instanceof Error ? error.message : String(error)}` }),
+      );
+      imageDecodeBySha.set(file.sha256, decode);
+    }
+    return { file, ...(await decode) };
   });
-  const results = new Map(settled.settled.map((entry) => [entry.value.file.sha256, entry.value]));
+  const pathResults = new Map(settled.settled.map((entry) => [pathKey(entry.value.file.path), entry.value]));
+  const sourceResults = new Map();
+  for (const result of pathResults.values()) {
+    const aggregate = sourceResults.get(result.file.sha256) ?? { file: result.file, image: null, errors: [] };
+    if (result.error) aggregate.errors.push(result.error);
+    if (result.image) aggregate.image ??= result.image;
+    if (result.decodeError && !aggregate.decodeError) {
+      aggregate.decodeError = result.decodeError;
+      aggregate.errors.push(result.decodeError);
+    }
+    sourceResults.set(result.file.sha256, aggregate);
+  }
+  const referencedPaths = new Set([...sourceByRef.values()].map((binding) => pathKey(binding.file.path)));
   for (const [sourceRef, binding] of sourceByRef) {
-    const result = results.get(binding.file.sha256);
+    const pathResult = pathResults.get(pathKey(binding.file.path));
+    const result = sourceResults.get(binding.file.sha256);
     const observation = observations.get(sourceRef);
-    if (!result || result.error) {
-      add("mismatches", "fresh-source-read-mismatch", { sourceRef, fileId: binding.file.id, artifact: "source", expected: binding.file.sha256, actual: result?.error ?? null });
+    if (!pathResult || pathResult.error || result?.decodeError) {
+      const gate1Required = pathResult?.gate1Required === true;
+      add(gate1Required ? "mismatches" : "blocking", gate1Required ? "fresh-source-sha-changed" : "fresh-source-read-or-decode-blocked", { sourceRef, fileId: binding.file.id, artifact: "source", expected: binding.file.sha256, actual: pathResult?.error ?? result?.decodeError ?? null });
       continue;
     }
     const expectedKind = binding.file.kind === "image" ? "image" : "other";
     if (observation) {
-      compare(add, observation.mediaKind, expectedKind, { code: "independent-review-media-kind-mismatch", sourceRef, fileId: binding.file.id, artifact: "independent-evidence-review" });
-      if (result.image) compare(add, { width: observation.width, height: observation.height }, { width: result.image.width, height: result.image.height }, { code: "independent-review-dimensions-mismatch", sourceRef, fileId: binding.file.id, artifact: "independent-evidence-review" });
+      compareReviewFinding(add, observation.mediaKind, expectedKind, { code: "independent-review-media-kind-mismatch", sourceRef, fileId: binding.file.id, artifact: "independent-evidence-review" });
+      if (result.image) compareReviewFinding(add, { width: observation.width, height: observation.height }, { width: result.image.width, height: result.image.height }, { code: "independent-review-dimensions-mismatch", sourceRef, fileId: binding.file.id, artifact: "independent-evidence-review" });
     }
   }
-  return results;
+  for (const file of usedMediaFiles) {
+    const key = pathKey(file.path);
+    if (referencedPaths.has(key)) continue;
+    const pathResult = pathResults.get(key);
+    if (!pathResult || pathResult.error) {
+      const gate1Required = pathResult?.gate1Required === true;
+      add(gate1Required ? "mismatches" : "blocking", gate1Required ? "fresh-source-sha-changed" : "fresh-source-read-or-decode-blocked", { fileId: file.id, artifact: "source", expected: file.sha256, actual: pathResult?.error ?? null });
+    }
+  }
+  return new Map([...sourceResults].map(([sourceSha256, result]) => [sourceSha256, { file: result.file, image: result.image, ...(result.errors.length ? { error: result.errors.join("; ") } : {}) }]));
 }
 
-function validateDetail(add, sheet, transactions, profileId, transactionResults) {
+function validateDetail(add, sheet, transactions, profileId, transactionResults, evidenceFiles) {
   const cells = cellMap(sheet);
   const employeeTotal = sum(transactions.filter((item) => item.settlement === "employee_reimbursement"), (item) => item.reimbursementMilliunits);
   const mainTotal = sum(transactions.filter((item) => item.reportingKind === "current"), (item) => item.reimbursementMilliunits);
@@ -854,14 +967,14 @@ function validateDetail(add, sheet, transactions, profileId, transactionResults)
     const end = start + section.transactions.length - 1;
     requireFormula(add, cells.get(`F${row}`), `SUM(C${start}:C${end})`, { profileId, artifact: "detail", location: `F${row}` });
     compare(add, amount(asAmount(cellScalar(cells.get(`F${row}`)), `detail.F${row}`)), amount(sum(section.transactions, (item) => item.sourceMilliunits)), { code: "detail-person-group-total-mismatch", profileId, transactionId: section.transactions[0]?.id, artifact: "detail", location: `F${row}` });
-    validateTabularRows({ add, sheet, expected: section.transactions, startRow: start, profileId, artifact: "detail", person: section.person, transactionResults });
+    validateTabularRows({ add, sheet, expected: section.transactions, startRow: start, profileId, artifact: "detail", person: section.person, transactionResults, evidenceFiles });
     row = end + 1;
   }
   const actualDataRows = sheet.rows.filter((item) => item.index >= 7 && item.cells.some((cell) => cell.column === 3 && cellScalar(cell) !== null)).length;
   compare(add, actualDataRows, transactions.length, { code: "detail-transaction-count-mismatch", profileId, artifact: "detail" });
 }
 
-function validateSupplement(add, sheet, expected, metadata, profileId, transactionResults) {
+function validateSupplement(add, sheet, expected, metadata, profileId, transactionResults, evidenceFiles) {
   const cells = cellMap(sheet);
   const ordered = [...expected].sort((left, right) => left.date.localeCompare(right.date) || left.sourceOrder - right.sourceOrder);
   const start = ordered[0]?.date ?? null;
@@ -890,7 +1003,7 @@ function validateSupplement(add, sheet, expected, metadata, profileId, transacti
   requireMerge(add, sheet, `C${footerRow}:F${footerRow}`, { profileId, artifact: "supplement", location: `C${footerRow}` });
   requireFormula(add, cells.get(`C${footerRow}`), `SUM(C5:C${footerRow - 1})`, { profileId, artifact: "supplement", location: `C${footerRow}` });
   compare(add, amount(asAmount(cellScalar(cells.get(`C${footerRow}`)), `supplement.C${footerRow}`)), amount(expectedSource), { code: "supplement-formula-total-mismatch", profileId, artifact: "supplement", location: `C${footerRow}` });
-  validateTabularRows({ add, sheet, expected: ordered, startRow: 5, profileId, artifact: "supplement", person: metadata.person, transactionResults });
+  validateTabularRows({ add, sheet, expected: ordered, startRow: 5, profileId, artifact: "supplement", person: metadata.person, transactionResults, evidenceFiles });
   const actualDataRows = sheet.rows.filter((item) => item.index >= 5 && item.index < footerRow && item.cells.some((cell) => cell.column === 3 && cellScalar(cell) !== null)).length;
   compare(add, actualDataRows, ordered.length, { code: "supplement-transaction-count-mismatch", profileId, artifact: "supplement" });
   const trailingBusinessRows = sheet.rows.filter((item) => item.index > footerRow && item.cells.some((cell) => cellScalar(cell) !== null)).map((item) => item.index);
@@ -1184,7 +1297,7 @@ async function validateEvidenceArchive(add, artifact, transactions, files, profi
   for (const [digest, entry] of actualBySha) if (!expectedBySha.has(digest)) add("extra", "evidence-archive-media-extra", { profileId, artifact: "evidence-archive", evidenceId: entry.evidenceId, actual: digest });
 }
 
-export async function auditFullCorrespondence(rawInput, { hooks } = {}) {
+export async function auditFullCorrespondence(rawInput, { hooks, verifiedManifestSnapshot } = {}) {
   exact(rawInput, new Set(["gate1State", "independentEvidenceReviewSnapshot"]), "full correspondence input");
   const state = object(rawInput.gate1State, "gate1State");
   const certificate = validateCertificate(state);
@@ -1213,7 +1326,15 @@ export async function auditFullCorrespondence(rawInput, { hooks } = {}) {
   const registry = await loadProfileRegistry();
   const summaryTemplate = await loadTextTemplateAsset("summary-text");
   if (registry.profileConfigDigest !== certificate.profileConfigDigest) fail("profile registry differs from the Gate 1 certificate.");
-  const manifestSnapshot = await readStableUtf8JsonFile(path.resolve(state.manifest.path), { maxBytes: MAX_JSON_BYTES });
+  const manifestPath = path.resolve(state.manifest.path);
+  let manifestSnapshot;
+  if (verifiedManifestSnapshot !== undefined) {
+    if (!verifiedManifestSnapshots.delete(verifiedManifestSnapshot)) fail("manifest snapshot was not produced by the current auditor instance or was already consumed.");
+    if (verifiedManifestSnapshot.path !== manifestPath) fail("verified manifest snapshot path differs from Gate 1.");
+    manifestSnapshot = verifiedManifestSnapshot;
+  } else {
+    manifestSnapshot = await readStableUtf8JsonFile(manifestPath, { maxBytes: MAX_JSON_BYTES });
+  }
   if (manifestSnapshot.sha256 !== state.manifest.sha256 || manifestSnapshot.sha256 !== certificate.manifestFileSha256) fail("manifest bytes changed after Gate 1.");
   const manifest = object(manifestSnapshot.value, "manifest");
   const transactions = bindTransactions(manifest, certificate, add, registry);
@@ -1224,7 +1345,7 @@ export async function auditFullCorrespondence(rawInput, { hooks } = {}) {
 
   const reviewSnapshot = suppliedReview;
   const review = object(reviewSnapshot.value, "independent evidence review");
-  const observations = validateReview(review, state, sourceByRef, transactions, summaryAnnotations, annotationResults, add, block);
+  const { observations, findingResolution } = validateReview(review, state, sourceByRef, transactions, summaryAnnotations, annotationResults, add, block);
   // Fresh source verification and Gate 1 artifact loading are independent inputs
   // to this one Gate 2 audit. Start the fresh reads now, but join them before any
   // artifact validation so the original source-first error and issue ordering is
@@ -1280,6 +1401,7 @@ export async function auditFullCorrespondence(rawInput, { hooks } = {}) {
       continue;
     }
     const issueCountsBefore = Object.fromEntries(Object.entries(issues).map(([key, value]) => [key, value.length]));
+    let evidenceArchiveSettled = null;
     try {
       const supplementsByPerson = Map.groupBy(profileTransactions.filter((item) => item.reportingKind === "supplement"), (item) => item.person);
       const supplementPlans = new Map();
@@ -1318,7 +1440,7 @@ export async function auditFullCorrespondence(rawInput, { hooks } = {}) {
         uniqueArchiveMediaReadCount: 0,
         archiveMediaCacheHits: 0,
       };
-      const evidenceArchiveSettled = validateEvidenceArchive(
+      evidenceArchiveSettled = validateEvidenceArchive(
         evidenceIssueStore.add,
         presentation,
         profileTransactions,
@@ -1343,7 +1465,7 @@ export async function auditFullCorrespondence(rawInput, { hooks } = {}) {
       const loadedByKey = new Map(loadTasks.map((task, index) => [task.key, loaded.settled[index].value]));
 
       const detailFacts = loadedByKey.get("detail");
-      validateDetail(add, sheetByName(detailFacts.facts, presentation.detail.sheetName, "detail"), profileTransactions, profileId, transactionResults);
+      validateDetail(add, sheetByName(detailFacts.facts, presentation.detail.sheetName, "detail"), profileTransactions, profileId, transactionResults, files);
 
       const screenshot = loadedByKey.get("screenshot");
       validateScreenshot(add, screenshot, profileTransactions, files, profileId, presentation.screenshot, transactionResults);
@@ -1361,7 +1483,7 @@ export async function auditFullCorrespondence(rawInput, { hooks } = {}) {
           continue;
         }
         const workbook = loadedByKey.get(`supplement:${index}`);
-        validateSupplement(add, sheetByName(workbook.facts, supplement.sheetName, "supplement"), plan.expected, supplement, profileId, transactionResults);
+        validateSupplement(add, sheetByName(workbook.facts, supplement.sheetName, "supplement"), plan.expected, supplement, profileId, transactionResults, files);
         supplementResults.push({ profileId, person: supplement.person, start: supplement.start, end: supplement.end, count: supplement.count, amount: supplement.amount, sourceAmount: supplement.sourceAmount, reimbursementAmount: supplement.reimbursementAmount, reasons: [...supplement.reasons], path: supplement.path });
       }
       for (const [person, expected] of supplementsByPerson) add("missing", "supplement-workbook-missing", { profileId, artifact: "supplement", person, expectedCount: expected.length });
@@ -1383,9 +1505,14 @@ export async function auditFullCorrespondence(rawInput, { hooks } = {}) {
       metrics.archiveMediaCacheHits += evidenceMetrics.archiveMediaCacheHits;
       for (const transaction of profileTransactions) markTransactionCheck(transactionResults, transaction.id, "evidence", { archiveCount: presentation.evidenceArchive.length });
     } catch (error) {
-      if (isRetryableInfrastructureError(error)) throw error;
-      if (error instanceof CorrespondenceValidationError) add("mismatches", "artifact-parse-or-validation-failure", { profileId, artifact: "gate1-deliverables", actual: error.message });
-      else block("artifact-audit-internal-failure", { profileId, artifact: "gate1-deliverables", actual: error instanceof Error ? error.message : String(error) });
+      const evidenceArchiveResult = evidenceArchiveSettled ? await evidenceArchiveSettled : null;
+      const evidenceArchiveFailure = evidenceArchiveResult?.status === "rejected" ? evidenceArchiveResult.reason : null;
+      if (evidenceArchiveFailure) block("evidence-archive-read-or-audit-blocked", { profileId, artifact: "evidence-archive", actual: evidenceArchiveFailure instanceof Error ? evidenceArchiveFailure.message : String(evidenceArchiveFailure) });
+      if (error !== evidenceArchiveFailure) {
+        if (isRetryableInfrastructureError(error)) block("artifact-read-blocked", { profileId, artifact: "gate1-deliverables", actual: error instanceof Error ? error.message : String(error) });
+        else if (error instanceof CorrespondenceValidationError) add("mismatches", "artifact-parse-or-validation-failure", { profileId, artifact: "gate1-deliverables", actual: error.message });
+        else block("artifact-audit-internal-failure", { profileId, artifact: "gate1-deliverables", actual: error instanceof Error ? error.message : String(error) });
+      }
     }
     const profileIssueCounts = Object.fromEntries(Object.entries(issues).map(([key, value]) => [key, value.length - issueCountsBefore[key]]));
     const body = {
@@ -1450,6 +1577,9 @@ export async function auditFullCorrespondence(rawInput, { hooks } = {}) {
   });
   const allIssueCount = Object.values(issues).reduce((total, items) => total + items.length, 0);
   const blockingIssueCount = issues.blocking.length;
+  const reviewFindingCount = issues.reviewFindings.length;
+  const substantiveIssueCount = ["missing", "extra", "mismatches", "duplicate", "unbound"].reduce((total, field) => total + issues[field].length, 0);
+  const gate1RequiredIssueCount = allIssues.filter((issue) => issue.code === "fresh-source-sha-changed").length;
   const knownSourceRefs = new Set(transactions.flatMap((transaction) => transaction.sourceRefs));
   const knownEvidenceIds = new Set(transactions.flatMap((transaction) => transaction.evidence));
   const publicTransactionResults = [...transactionResults.values()].sort((left, right) => (transactionsById.get(left.transactionId)?.sourceOrder ?? 0) - (transactionsById.get(right.transactionId)?.sourceOrder ?? 0) || stableTextCompare(left.transactionId, right.transactionId)).map((item) => {
@@ -1508,7 +1638,19 @@ export async function auditFullCorrespondence(rawInput, { hooks } = {}) {
     && publicAnnotationResults.every((item) => item.status === "matched")
     && profileAudits.every((item) => item.status === "passed")
     && publicSupplementResults.every((item) => item.status === "matched");
-  const disposition = allCorrespondenceMatched ? "PASSED" : blockingIssueCount > 0 ? "BLOCKED_RETRYABLE" : "SUBSTANTIVE_MISMATCH";
+  const disposition = findingResolution?.decision === "evidence-uncertain"
+    ? "GATE1_REQUIRED"
+    : allCorrespondenceMatched
+      ? "PASSED"
+      : gate1RequiredIssueCount > 0
+      ? "GATE1_REQUIRED"
+      : blockingIssueCount > 0
+      ? "BLOCKED_RETRYABLE"
+      : substantiveIssueCount > 0
+        ? "CORRECTION_REQUIRED"
+        : reviewFindingCount > 0
+          ? findingResolution?.decision === "gate1-content-error" ? "CORRECTION_REQUIRED" : "REVIEW_REQUIRED"
+          : "BLOCKED_RETRYABLE";
   const body = {
     kind: FULL_CORRESPONDENCE_AUDIT_KIND,
     gate1BindingDigest: state.gate1.bindingDigest,
@@ -1520,6 +1662,7 @@ export async function auditFullCorrespondence(rawInput, { hooks } = {}) {
     independentEvidenceReviewDigest: canonicalDigest(review),
     independentEvidenceReviewSha256: reviewSnapshot.sha256,
     reviewerRunId: review.reviewerRunId,
+    findingResolution,
     coverage: {
       expectedTransactions: transactions.length,
       auditedTransactions: publicTransactionResults.filter((item) => item.fullyAudited).length,
@@ -1548,7 +1691,7 @@ export async function auditFullCorrespondence(rawInput, { hooks } = {}) {
     ...issues,
     metrics,
     disposition,
-    status: disposition === "PASSED" ? "passed" : disposition === "BLOCKED_RETRYABLE" ? "blocked" : "failed",
+    status: disposition === "PASSED" ? "passed" : disposition === "REVIEW_REQUIRED" ? "review-required" : disposition === "CORRECTION_REQUIRED" ? "correction-required" : disposition === "GATE1_REQUIRED" ? "gate1-required" : "blocked",
   };
   return Object.freeze({ ...body, reportDigest: canonicalDigest(body) });
 }

@@ -246,6 +246,7 @@ test("same staging token resumes ready-preview and reruns only rendering", async
     const certificate = { certificateDigest: digest("certificate"), sourceCoverageDigest: digest("coverage") };
     const audit = {
       manifestFileSha256: sha256Bytes(manifestBytes),
+      manifestFileSize: manifestBytes.length,
       affectedProfileIds: ["xiaohongshu"],
       batch: { batchId: "anonymous-batch", archivePath: path.join(temp, "archive"), targetCategory: "小红书报销", period: "2035.1.1-2035.1.2", mainPeriod: { start: "2035-01-01", end: "2035-01-02" } },
       operationDigest: digest("operation"), sourceCoverageDigest: certificate.sourceCoverageDigest, factsDigest: digest("facts"), reimbursementFactsCertificate: certificate,

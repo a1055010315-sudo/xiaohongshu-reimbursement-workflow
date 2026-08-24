@@ -9,8 +9,14 @@ import test from "node:test";
 import { buildReimbursementArtifacts } from "../scripts/build_reimbursement_artifacts.mjs";
 import { buildRootWorkbookCandidates } from "../scripts/build_root_workbook_candidate.mjs";
 import {
+  GATE1_RESTART_REQUIRED_ERROR_CODE,
+  readVerifiedGate1ManifestSnapshot,
+} from "../scripts/audit_full_correspondence.mjs";
+import {
   finalizeReimbursementWorkflow,
   prepareReimbursementWorkflow,
+  publishReimbursementWorkflow,
+  reviseGate2ReimbursementWorkflow,
 } from "../scripts/run_reimbursement_workflow.mjs";
 import { canonicalDigest, loadBundledDependency, sha256Bytes } from "../scripts/workflow_primitives.mjs";
 
@@ -141,10 +147,41 @@ function reviewFor(gate1, firstImage, secondImage, mutate = (value) => value) {
   });
 }
 
+function resolveGate1ContentError(review, attempt, revisedManifestSha256) {
+  return {
+    ...structuredClone(review),
+    reviewerRunId: crypto.randomBytes(16).toString("hex"),
+    findingResolution: {
+      kind: "gate2-finding-resolution-v1",
+      priorReportDigest: attempt.fullCorrespondenceAudit.reportDigest,
+      priorReviewSha256: attempt.independentEvidenceReview.sha256,
+      decision: "gate1-content-error",
+      reason: "independent recheck confirmed the original material facts",
+      revisedManifestSha256,
+    },
+  };
+}
+
 async function writeJson(filePath, value) {
   const bytes = Buffer.from(`${JSON.stringify(value)}\n`, "utf8");
   await fs.writeFile(filePath, bytes, { flag: "wx" });
   return { path: filePath, sha256: sha256Bytes(bytes) };
+}
+
+async function rewriteWorkflowState(statePath, mutate) {
+  const state = JSON.parse(await fs.readFile(statePath, "utf8"));
+  mutate(state);
+  const core = structuredClone(state);
+  delete core.stateDigest;
+  state.stateDigest = canonicalDigest(core);
+  await fs.writeFile(statePath, Buffer.from(`${JSON.stringify(state)}\n`, "utf8"));
+  return state;
+}
+
+function refreshCorrectionAuthorization(correction) {
+  const core = structuredClone(correction);
+  delete core.authorizationDigest;
+  correction.authorizationDigest = canonicalDigest(core);
 }
 
 async function rewriteZipPart(filePath, partName, transform) {
@@ -230,10 +267,11 @@ function replaceOnce(pattern, replacement) {
   };
 }
 
-async function prepareFixture(temp, { buildPresentation = buildReimbursementArtifacts, buildRoot = buildRootWorkbookCandidates, mutateManifest = (value) => value } = {}) {
+async function prepareFixture(temp, { buildPresentation = buildReimbursementArtifacts, buildRoot = buildRootWorkbookCandidates, mutateManifest = (value) => value, afterFilesCreated = async () => {} } = {}) {
   const baseline = await makeBaseline(path.join(temp, "小红书支出总表.xlsx"));
   const firstImage = await makeImage(path.join(temp, "synthetic-a.jpg"), 420, 280, { r: 30, g: 110, b: 170 });
   const secondImage = await makeImage(path.join(temp, "synthetic-b.jpg"), 510, 330, { r: 150, g: 70, b: 40 });
+  await afterFilesCreated({ temp, baseline, firstImage, secondImage });
   const manifest = mutateManifest(manifestFor(temp, baseline, firstImage, secondImage));
   const manifestFile = await writeJson(path.join(temp, "manifest.json"), manifest);
   const token = crypto.randomBytes(32).toString("hex");
@@ -244,7 +282,51 @@ async function prepareFixture(temp, { buildPresentation = buildReimbursementArti
     manifestSha256: manifestFile.sha256,
     baselines: [{ profileId: "xiaohongshu", path: baseline.path, sha256: baseline.sha256, size: baseline.size, candidateRevision: 1 }],
   }, { testHooks: { runPreviewRenderer: fakeRenderer, buildReimbursementArtifacts: buildPresentation, buildRootWorkbookCandidates: buildRoot } });
-  return { baseline, firstImage, secondImage, manifest, gate1, workflowRoot: path.dirname(gate1.statePath) };
+  return { baseline, firstImage, secondImage, manifest, manifestFile, gate1, workflowRoot: path.dirname(gate1.statePath) };
+}
+
+async function reviseFromGate2Attempt(fixture, attempt, {
+  manifestFile = fixture.manifestFile,
+  buildPresentation,
+  buildRoot,
+} = {}) {
+  return reviseGate2ReimbursementWorkflow({
+    statePath: fixture.gate1.statePath,
+    expectedGate1BindingDigest: fixture.gate1.gate1BindingDigest,
+    gate2AttemptReportPath: attempt.fullCorrespondenceAudit.path,
+    gate2AttemptReportSha256: attempt.fullCorrespondenceAudit.sha256,
+    stagingToken: crypto.randomBytes(32).toString("hex"),
+    manifestPath: manifestFile.path,
+    manifestSha256: manifestFile.sha256,
+  }, {
+    testHooks: {
+      runPreviewRenderer: fakeRenderer,
+      ...(buildPresentation ? { buildReimbursementArtifacts: buildPresentation } : {}),
+      ...(buildRoot ? { buildRootWorkbookCandidates: buildRoot } : {}),
+    },
+  });
+}
+
+async function preparePersonCorrectionFixture(temp, { mutateCorrectedManifest = (value) => value } = {}) {
+  let correctedManifest;
+  const fixture = await prepareFixture(temp, { mutateManifest: (manifest) => {
+    manifest.batch.archivePath = path.join(temp, "2035.4.11-2035.4.16_小红书报销（含合成人员乙2035.3.8补报1笔8.21元）");
+    correctedManifest = structuredClone(manifest);
+    correctedManifest.batch.reviewRevision += 1;
+    correctedManifest = mutateCorrectedManifest(correctedManifest);
+    manifest.transactions[2].person = "错误付款主体";
+    return manifest;
+  } });
+  const reviewFile = await writeJson(path.join(temp, "lineage-original-review.json"), reviewFor(fixture.gate1, fixture.firstImage, fixture.secondImage));
+  const reviewRequired = await finalizeReimbursementWorkflow({ statePath: fixture.gate1.statePath, expectedGate1BindingDigest: fixture.gate1.gate1BindingDigest, approvalText: "本次报销通过无误", independentEvidenceReviewPath: reviewFile.path, independentEvidenceReviewSha256: reviewFile.sha256 });
+  const correctedManifestFile = await writeJson(path.join(temp, "lineage-corrected-manifest.json"), correctedManifest);
+  const resolvedReviewFile = await writeJson(
+    path.join(temp, "lineage-resolved-review.json"),
+    resolveGate1ContentError(await fs.readFile(reviewFile.path, "utf8").then(JSON.parse), reviewRequired, correctedManifestFile.sha256),
+  );
+  const correctionRequired = await finalizeReimbursementWorkflow({ statePath: fixture.gate1.statePath, expectedGate1BindingDigest: fixture.gate1.gate1BindingDigest, approvalText: "本次报销通过无误", independentEvidenceReviewPath: resolvedReviewFile.path, independentEvidenceReviewSha256: resolvedReviewFile.sha256 });
+  const corrected = await reviseFromGate2Attempt(fixture, correctionRequired, { manifestFile: correctedManifestFile });
+  return { fixture, corrected, correctedManifestFile, reviewFile };
 }
 
 test("real builders survive a ready-preview retry without rebuilding or losing committed candidate paths", async () => {
@@ -329,6 +411,8 @@ test("Gate 2 performs one cached full-correspondence pass and exposes its report
   try {
     const fixture = await prepareFixture(temp);
     workflowRoot = fixture.workflowRoot;
+    const gate1State = JSON.parse(await fs.readFile(fixture.gate1.statePath, "utf8"));
+    assert.equal(gate1State.manifest.size, (await fs.stat(fixture.manifestFile.path)).size);
     const review = reviewFor(fixture.gate1, fixture.firstImage, fixture.secondImage);
     const reviewFile = await writeJson(path.join(temp, "independent-review.json"), review);
     let gate2;
@@ -364,6 +448,68 @@ test("Gate 2 performs one cached full-correspondence pass and exposes its report
     assert.equal(report.transactionResults.every((item) => ["visual", "evidence", "root-preview", "preview-binding"].every((stage) => item.checks[stage].status === "passed")), true);
     assert.equal(report.reportDigest, canonicalDigest(Object.fromEntries(Object.entries(report).filter(([key]) => key !== "reportDigest"))));
     assert.equal(report.independentEvidenceReviewDigest, canonicalDigest(review));
+  } finally {
+    if (workflowRoot) await fs.rm(workflowRoot, { recursive: true, force: true });
+    await fs.rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("a lost successful Gate 2 response can be replayed idempotently", async () => {
+  const temp = await fs.mkdtemp(path.join(os.tmpdir(), "codex-xhs-gate2-success-replay-"));
+  let workflowRoot;
+  try {
+    const fixture = await prepareFixture(temp);
+    workflowRoot = fixture.workflowRoot;
+    const reviewFile = await writeJson(path.join(temp, "success-replay-review.json"), reviewFor(fixture.gate1, fixture.firstImage, fixture.secondImage));
+    const request = { statePath: fixture.gate1.statePath, expectedGate1BindingDigest: fixture.gate1.gate1BindingDigest, approvalText: "本次报销通过无误", independentEvidenceReviewPath: reviewFile.path, independentEvidenceReviewSha256: reviewFile.sha256 };
+    const first = await finalizeReimbursementWorkflow(request);
+    const second = await finalizeReimbursementWorkflow(request);
+    assert.equal(second.statePath, first.statePath);
+    assert.equal(second.stateSha256, first.stateSha256);
+    assert.equal(second.gate2BindingDigest, first.gate2BindingDigest);
+  } finally {
+    if (workflowRoot) await fs.rm(workflowRoot, { recursive: true, force: true });
+    await fs.rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("an invalid correspondence checkpoint takes precedence over a damaged candidate plan", async () => {
+  const temp = await fs.mkdtemp(path.join(os.tmpdir(), "codex-xhs-gate2-checkpoint-priority-"));
+  let workflowRoot;
+  try {
+    const fixture = await prepareFixture(temp);
+    workflowRoot = fixture.workflowRoot;
+    const reviewFile = await writeJson(path.join(temp, "checkpoint-priority-review.json"), reviewFor(fixture.gate1, fixture.firstImage, fixture.secondImage));
+    const request = { statePath: fixture.gate1.statePath, expectedGate1BindingDigest: fixture.gate1.gate1BindingDigest, approvalText: "本次报销通过无误", independentEvidenceReviewPath: reviewFile.path, independentEvidenceReviewSha256: reviewFile.sha256 };
+    const first = await finalizeReimbursementWorkflow(request);
+    const checkpoint = JSON.parse(await fs.readFile(first.fullCorrespondenceAudit.path, "utf8"));
+    checkpoint.status = "tampered";
+    delete checkpoint.reportDigest;
+    checkpoint.reportDigest = canonicalDigest(checkpoint);
+    await fs.writeFile(first.fullCorrespondenceAudit.path, `${JSON.stringify(checkpoint)}\n`, "utf8");
+    const gate1State = JSON.parse(await fs.readFile(fixture.gate1.statePath, "utf8"));
+    await fs.appendFile(gate1State.rootBuild.artifacts[0].planPath, Buffer.from("damaged-plan", "utf8"));
+    await assert.rejects(() => finalizeReimbursementWorkflow(request), /full correspondence checkpoint is invalid or bound to another Gate 1\/review/u);
+  } finally {
+    if (workflowRoot) await fs.rm(workflowRoot, { recursive: true, force: true });
+    await fs.rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("a Gate 2 state write conflict preserves reused Gate 1 previews without a false cleanup error", async () => {
+  const temp = await fs.mkdtemp(path.join(os.tmpdir(), "codex-xhs-gate2-state-conflict-"));
+  let workflowRoot;
+  try {
+    const fixture = await prepareFixture(temp);
+    workflowRoot = fixture.workflowRoot;
+    const reviewFile = await writeJson(path.join(temp, "state-conflict-review.json"), reviewFor(fixture.gate1, fixture.firstImage, fixture.secondImage));
+    const previewPaths = fixture.gate1.review.flatMap((entry) => entry.previews.map((preview) => preview.path));
+    await writeJson(path.join(workflowRoot, "ready-gate-2.json"), { kind: "synthetic-conflict" });
+    await assert.rejects(
+      () => finalizeReimbursementWorkflow({ statePath: fixture.gate1.statePath, expectedGate1BindingDigest: fixture.gate1.gate1BindingDigest, approvalText: "本次报销通过无误", independentEvidenceReviewPath: reviewFile.path, independentEvidenceReviewSha256: reviewFile.sha256 }),
+      (error) => /content-addressed JSON differs/u.test(error.message) && !/preview cleanup was incomplete/u.test(error.message),
+    );
+    await Promise.all(previewPaths.map((previewPath) => fs.access(previewPath)));
   } finally {
     if (workflowRoot) await fs.rm(workflowRoot, { recursive: true, force: true });
     await fs.rm(temp, { recursive: true, force: true });
@@ -486,6 +632,62 @@ test("Gate 2 overlaps fresh source decode with Gate 1 artifact loading while ret
   }
 });
 
+test("Gate 2 pipelines source reads into decode while preserving per-path SHA checks and one decode per SHA", async () => {
+  const temp = await fs.mkdtemp(path.join(os.tmpdir(), "codex-xhs-gate2-source-pipeline-"));
+  let workflowRoot;
+  try {
+    let duplicatePath;
+    const fixture = await prepareFixture(temp, { afterFilesCreated: async ({ firstImage }) => {
+      duplicatePath = path.join(temp, "synthetic-a-duplicate.jpg");
+      await fs.copyFile(firstImage.path, duplicatePath, fs.constants.COPYFILE_EXCL);
+    }, mutateManifest: (manifest) => {
+      const first = manifest.files.find((file) => file.id === "IMG-A");
+      manifest.files.push({ id: "IMG-C", role: "material", path: duplicatePath, sha256: first.sha256, kind: "image", disposition: "used", usage: "context" });
+      manifest.sourceScopes.push({ id: "SCOPE-C", fileId: "IMG-C", locator: "full", terminalConfirmed: true, expectedUnitCount: 1 });
+      manifest.sourceUnits.push({ id: "UNIT-D", scopeId: "SCOPE-C", locator: "fourth", disposition: "used" });
+      manifest.transactions[0].evidence.push("IMG-C");
+      manifest.transactions[0].sourceRefs.push("UNIT-D");
+      manifest.expected.mediaReferenceCount += 1;
+      return manifest;
+    } });
+    workflowRoot = fixture.workflowRoot;
+    const review = reviewFor(fixture.gate1, fixture.firstImage, fixture.secondImage);
+    review.observations.push({
+      sourceRef: "UNIT-D",
+      fileId: "IMG-C",
+      sourceSha256: fixture.firstImage.sha256,
+      mediaKind: "image",
+      width: fixture.firstImage.width,
+      height: fixture.firstImage.height,
+      facts: [{ transactionId: "SYN-001", date: "2035-04-12", person: "合成人员甲", project: "合成运营项目", sourceAmount: "19.37" }],
+    });
+    const reviewFile = await writeJson(path.join(temp, "source-pipeline-review.json"), review);
+    let sourceReadIndex = 0;
+    let firstReadStillWaiting = false;
+    let decodeStartedBeforeAllReadsFinished = false;
+    const gate2 = await finalizeReimbursementWorkflow({ statePath: fixture.gate1.statePath, expectedGate1BindingDigest: fixture.gate1.gate1BindingDigest, approvalText: "本次报销通过无误", independentEvidenceReviewPath: reviewFile.path, independentEvidenceReviewSha256: reviewFile.sha256 }, {
+      testHooks: { fullCorrespondenceHooks: {
+        beforeSourceRead: async () => {
+          sourceReadIndex += 1;
+          if (sourceReadIndex === 1) {
+            firstReadStillWaiting = true;
+            await new Promise((resolve) => setTimeout(resolve, 100));
+            firstReadStillWaiting = false;
+          }
+        },
+        beforeSourceDecode: () => { decodeStartedBeforeAllReadsFinished ||= firstReadStillWaiting; },
+      } },
+    });
+    assert.equal(gate2.status, "ready-for-gate-2");
+    assert.equal(decodeStartedBeforeAllReadsFinished, true, "a completed path must begin decode before an unrelated slow path finishes reading");
+    assert.equal(gate2.fullCorrespondenceAudit.metrics.uniqueSourceReadCount, 3);
+    assert.equal(gate2.fullCorrespondenceAudit.metrics.uniqueMediaDecodeCount, 2);
+  } finally {
+    if (workflowRoot) await fs.rm(workflowRoot, { recursive: true, force: true });
+    await fs.rm(temp, { recursive: true, force: true });
+  }
+});
+
 test("Gate 2 cannot pass when a required transaction correspondence stage was not checked", async () => {
   const temp = await fs.mkdtemp(path.join(os.tmpdir(), "codex-xhs-gate2-required-stage-"));
   let workflowRoot;
@@ -500,7 +702,9 @@ test("Gate 2 cannot pass when a required transaction correspondence stage was no
       independentEvidenceReviewPath: reviewFile.path,
       independentEvidenceReviewSha256: reviewFile.sha256,
     };
-    await assert.rejects(() => finalizeReimbursementWorkflow(request, { testHooks: { fullCorrespondenceHooks: { omitTransactionCheckStages: [{ transactionId: "SYN-001", stage: "evidence" }] } } }), /Gate 1 remains valid|retry/iu);
+    const blocked = await finalizeReimbursementWorkflow(request, { testHooks: { fullCorrespondenceHooks: { omitTransactionCheckStages: [{ transactionId: "SYN-001", stage: "evidence" }] } } });
+    assert.equal(blocked.status, "gate-2-blocked-retryable");
+    assert.equal(blocked.fullCorrespondenceAudit.blocking.some((item) => item.code === "required-transaction-stage-incomplete"), true);
     await assert.rejects(fs.access(path.join(workflowRoot, "gate1-invalidation.json")), /ENOENT/u);
     await assert.rejects(fs.access(path.join(workflowRoot, "gate2-full-correspondence.json")), /ENOENT/u);
     const retried = await finalizeReimbursementWorkflow(request);
@@ -511,9 +715,10 @@ test("Gate 2 cannot pass when a required transaction correspondence stage was no
   }
 });
 
-test("Gate 2 invalidates a wrong summary already bound and displayed by Gate 1", async () => {
+test("Gate 2 repairs a wrong bound summary without asking for Gate 1 approval again", async () => {
   const temp = await fs.mkdtemp(path.join(os.tmpdir(), "codex-xhs-gate2-bound-wrong-"));
   let workflowRoot;
+  let correctedWorkflowRoot;
   try {
     const tamperedBuilder = async (...args) => {
       const original = await buildReimbursementArtifacts(...args);
@@ -535,22 +740,701 @@ test("Gate 2 invalidates a wrong summary already bound and displayed by Gate 1",
       result.buildDigest = canonicalDigest(buildBody);
       return result;
     };
-    const fixture = await prepareFixture(temp, { buildPresentation: tamperedBuilder });
+    const fixture = await prepareFixture(temp, {
+      buildPresentation: tamperedBuilder,
+      mutateManifest: (manifest) => {
+        manifest.batch.archivePath = path.join(temp, "2035.4.11-2035.4.16_小红书报销（含合成人员乙2035.3.8补报1笔8.21元）");
+        return manifest;
+      },
+    });
     workflowRoot = fixture.workflowRoot;
     assert.match(fixture.gate1.review[0].summary, /91\.73元/u, "Gate 1 must bind and display the wrong synthetic summary for this regression");
     const review = reviewFor(fixture.gate1, fixture.firstImage, fixture.secondImage);
     const reviewFile = await writeJson(path.join(temp, "correct-independent-review.json"), review);
-    await assert.rejects(() => finalizeReimbursementWorkflow({
+    const correctionRequired = await finalizeReimbursementWorkflow({
       statePath: fixture.gate1.statePath,
       expectedGate1BindingDigest: fixture.gate1.gate1BindingDigest,
       approvalText: "本次报销通过无误",
       independentEvidenceReviewPath: reviewFile.path,
       independentEvidenceReviewSha256: reviewFile.sha256,
-    }), /permanently invalid/u);
-    const report = JSON.parse(await fs.readFile(path.join(workflowRoot, "gate2-full-correspondence.json"), "utf8"));
-    assert.equal(report.status, "failed");
+    });
+    assert.equal(correctionRequired.status, "gate-2-correction-required");
+    assert.equal(correctionRequired.disposition, "CORRECTION_REQUIRED");
+    assert.equal(correctionRequired.retryWithoutNewGate1, true);
+    const report = JSON.parse(await fs.readFile(correctionRequired.fullCorrespondenceAudit.path, "utf8"));
+    assert.equal(report.status, "correction-required");
     assert.equal(report.mismatches.some((item) => item.code === "summary-contract-mismatch"), true);
-    assert.equal(JSON.parse(await fs.readFile(path.join(workflowRoot, "gate1-invalidation.json"), "utf8")).kind, "gate1-invalidation-v1");
+    await assert.rejects(fs.access(path.join(workflowRoot, "gate1-invalidation.json")), /ENOENT/u);
+
+    const corrected = await reviseFromGate2Attempt(fixture, correctionRequired);
+    correctedWorkflowRoot = path.dirname(corrected.statePath);
+    assert.equal(corrected.status, "ready-for-gate-2-correction-review");
+    assert.equal(corrected.approvalText, null);
+    const [priorState, correctedState] = await Promise.all([
+      fs.readFile(fixture.gate1.statePath, "utf8").then(JSON.parse),
+      fs.readFile(corrected.statePath, "utf8").then(JSON.parse),
+    ]);
+    assert.deepEqual(correctedState.baselines.map(({ profileId, path: filePath, sha256, size }) => ({ profileId, path: filePath, sha256, size })), priorState.baselines.map(({ profileId, path: filePath, sha256, size }) => ({ profileId, path: filePath, sha256, size })));
+    assert.equal(correctedState.baselines[0].candidateRevision, priorState.baselines[0].candidateRevision + 1);
+    const correctedReview = await writeJson(path.join(temp, "review-after-bound-summary-rebuild.json"), reviewFor(corrected, fixture.firstImage, fixture.secondImage));
+    const gate2 = await finalizeReimbursementWorkflow({
+      statePath: corrected.statePath,
+      expectedGate1BindingDigest: corrected.gate1BindingDigest,
+      approvalText: null,
+      independentEvidenceReviewPath: correctedReview.path,
+      independentEvidenceReviewSha256: correctedReview.sha256,
+    });
+    assert.equal(gate2.status, "ready-for-gate-2");
+    const readyState = JSON.parse(await fs.readFile(gate2.statePath, "utf8"));
+    assert.equal(readyState.requiresGate1Approval, false);
+    assert.equal(readyState.gate2Correction.priorGate1BindingDigest, fixture.gate1.gate1BindingDigest);
+    const receipt = await publishReimbursementWorkflow({
+      statePath: gate2.statePath,
+      expectedGate1BindingDigest: corrected.gate1BindingDigest,
+      gate1ApprovalText: null,
+      expectedGate2BindingDigest: gate2.gate2BindingDigest,
+      gate2ApprovalText: "确认更新根目录支出总表",
+    });
+    assert.equal(receipt.outputs.length, 1);
+    await assert.rejects(fs.access(correctionRequired.fullCorrespondenceAudit.path), /ENOENT/u);
+    await assert.rejects(fs.access(workflowRoot), /ENOENT/u);
+    await assert.rejects(fs.access(correctedWorkflowRoot), /ENOENT/u);
+  } finally {
+    if (workflowRoot) await fs.rm(workflowRoot, { recursive: true, force: true });
+    if (correctedWorkflowRoot) await fs.rm(correctedWorkflowRoot, { recursive: true, force: true });
+    await fs.rm(temp, { recursive: true, force: true });
+  }
+});
+
+const GATE1_SEMANTIC_CORRECTIONS = [
+  { field: "person", wrong: "错误付款主体", correct: "合成主体丙" },
+  { field: "project", wrong: "错误项目", correct: "合成对公项目" },
+  { field: "date", wrong: "2035-04-14", correct: "2035-04-15" },
+  {
+    field: "sourceAmount",
+    wrong: "5.56",
+    correct: "4.56",
+    makeWrongExpected: (expected) => ({ ...expected, feeTotal: "33.14", companyPaidNoReimbursementTotal: "5.56" }),
+    makeCorrectExpected: (expected) => ({ ...expected, feeTotal: "32.14", companyPaidNoReimbursementTotal: "4.56" }),
+  },
+];
+
+for (const scenario of GATE1_SEMANTIC_CORRECTIONS) test(`Gate 2 corrects a wrong Gate 1 ${scenario.field} without a second approval`, async () => {
+  const temp = await fs.mkdtemp(path.join(os.tmpdir(), `codex-xhs-gate2-semantic-${scenario.field}-`));
+  let oldWorkflowRoot;
+  let correctedWorkflowRoot;
+  try {
+    const fixture = await prepareFixture(temp, { mutateManifest: (manifest) => {
+      manifest.batch.archivePath = path.join(temp, "2035.4.11-2035.4.16_小红书报销（含合成人员乙2035.3.8补报1笔8.21元）");
+      manifest.transactions[2][scenario.field] = scenario.wrong;
+      if (scenario.makeWrongExpected) manifest.expected = scenario.makeWrongExpected(manifest.expected);
+      return manifest;
+    } });
+    oldWorkflowRoot = fixture.workflowRoot;
+    const independentReview = await writeJson(path.join(temp, `independent-${scenario.field}-review.json`), reviewFor(fixture.gate1, fixture.firstImage, fixture.secondImage));
+    const reviewRequired = await finalizeReimbursementWorkflow({
+      statePath: fixture.gate1.statePath,
+      expectedGate1BindingDigest: fixture.gate1.gate1BindingDigest,
+      approvalText: "本次报销通过无误",
+      independentEvidenceReviewPath: independentReview.path,
+      independentEvidenceReviewSha256: independentReview.sha256,
+    });
+    assert.equal(reviewRequired.disposition, "REVIEW_REQUIRED");
+    assert.equal(reviewRequired.fullCorrespondenceAudit.reviewFindings.some((item) => item.transactionId === "SYN-003" && item.field === scenario.field), true);
+
+    const correctedManifest = structuredClone(fixture.manifest);
+    correctedManifest.batch.reviewRevision += 1;
+    correctedManifest.transactions[2][scenario.field] = scenario.correct;
+    if (scenario.makeCorrectExpected) correctedManifest.expected = scenario.makeCorrectExpected(correctedManifest.expected);
+    const correctedManifestFile = await writeJson(path.join(temp, `corrected-${scenario.field}-manifest.json`), correctedManifest);
+    const resolvedReview = resolveGate1ContentError(await fs.readFile(independentReview.path, "utf8").then(JSON.parse), reviewRequired, correctedManifestFile.sha256);
+    const resolvedReviewFile = await writeJson(path.join(temp, `resolved-${scenario.field}-review.json`), resolvedReview);
+    const correctionRequired = await finalizeReimbursementWorkflow({
+      statePath: fixture.gate1.statePath,
+      expectedGate1BindingDigest: fixture.gate1.gate1BindingDigest,
+      approvalText: "本次报销通过无误",
+      independentEvidenceReviewPath: resolvedReviewFile.path,
+      independentEvidenceReviewSha256: resolvedReviewFile.sha256,
+    });
+    assert.equal(correctionRequired.disposition, "CORRECTION_REQUIRED");
+    if (scenario.field === "project") {
+      const unauthorizedManifest = structuredClone(correctedManifest);
+      unauthorizedManifest.batch.reviewRevision += 1;
+      const unauthorizedManifestFile = await writeJson(path.join(temp, "unauthorized-second-revised-manifest.json"), unauthorizedManifest);
+      await assert.rejects(
+        () => reviseFromGate2Attempt(fixture, correctionRequired, { manifestFile: unauthorizedManifestFile }),
+        /revised manifest SHA differs from the Gate 2 finding resolution authorization/u,
+      );
+    }
+    const corrected = await reviseFromGate2Attempt(fixture, correctionRequired, { manifestFile: correctedManifestFile });
+    correctedWorkflowRoot = path.dirname(corrected.statePath);
+    assert.equal(corrected.status, "ready-for-gate-2-correction-review");
+    assert.equal(corrected.approvalText, null);
+    const correctedReview = await writeJson(path.join(temp, `corrected-${scenario.field}-review.json`), reviewFor(corrected, fixture.firstImage, fixture.secondImage));
+    let attemptBytes;
+    if (scenario.field === "person") {
+      attemptBytes = await fs.readFile(correctionRequired.fullCorrespondenceAudit.path);
+      await fs.appendFile(correctionRequired.fullCorrespondenceAudit.path, Buffer.from("tampered", "utf8"));
+      await assert.rejects(() => finalizeReimbursementWorkflow({
+        statePath: corrected.statePath,
+        expectedGate1BindingDigest: corrected.gate1BindingDigest,
+        approvalText: null,
+        independentEvidenceReviewPath: correctedReview.path,
+        independentEvidenceReviewSha256: correctedReview.sha256,
+      }), /Gate 2 correction attempt report changed after binding/u);
+      await fs.writeFile(correctionRequired.fullCorrespondenceAudit.path, attemptBytes);
+    }
+    const gate2 = await finalizeReimbursementWorkflow({
+      statePath: corrected.statePath,
+      expectedGate1BindingDigest: corrected.gate1BindingDigest,
+      approvalText: null,
+      independentEvidenceReviewPath: correctedReview.path,
+      independentEvidenceReviewSha256: correctedReview.sha256,
+    });
+    assert.equal(gate2.status, "ready-for-gate-2");
+    assert.notEqual(corrected.gate1BindingDigest, fixture.gate1.gate1BindingDigest);
+    if (scenario.field === "person") {
+      await fs.appendFile(correctionRequired.fullCorrespondenceAudit.path, Buffer.from("tampered-before-publish", "utf8"));
+      await assert.rejects(() => publishReimbursementWorkflow({
+        statePath: gate2.statePath,
+        expectedGate1BindingDigest: corrected.gate1BindingDigest,
+        gate1ApprovalText: null,
+        expectedGate2BindingDigest: gate2.gate2BindingDigest,
+        gate2ApprovalText: "确认更新根目录支出总表",
+      }), /publish Gate 2 correction attempt report changed after binding/u);
+    }
+  } finally {
+    if (oldWorkflowRoot) await fs.rm(oldWorkflowRoot, { recursive: true, force: true });
+    if (correctedWorkflowRoot) await fs.rm(correctedWorkflowRoot, { recursive: true, force: true });
+    await fs.rm(temp, { recursive: true, force: true });
+  }
+});
+
+for (const kind of ["missing", "duplicate"]) test(`Gate 2 corrects a ${kind} transaction from the same source material`, async () => {
+  const temp = await fs.mkdtemp(path.join(os.tmpdir(), `codex-xhs-gate2-${kind}-transaction-`));
+  let oldWorkflowRoot;
+  let correctedWorkflowRoot;
+  try {
+    let correctedManifest;
+    const fixture = await prepareFixture(temp, { mutateManifest: (manifest) => {
+      manifest.batch.archivePath = path.join(temp, "2035.4.11-2035.4.16_小红书报销（含合成人员乙2035.3.8补报1笔8.21元）");
+      correctedManifest = structuredClone(manifest);
+      correctedManifest.batch.reviewRevision += 1;
+      if (kind === "missing") {
+        manifest.transactions = manifest.transactions.slice(0, 2);
+        manifest.sourceUnits[2] = { ...manifest.sourceUnits[2], disposition: "excluded", reason: "synthetic Gate 1 omission" };
+        manifest.expected = { transactionCount: 2, feeTotal: "27.58", reimbursementTotal: "27.58", companyPaidNoReimbursementTotal: "0", uniqueMediaCount: 2, mediaReferenceCount: 3 };
+      } else {
+        manifest.transactions.push({ ...structuredClone(manifest.transactions[2]), id: "SYN-004", sourceOrder: 4 });
+        manifest.expected = { ...manifest.expected, transactionCount: 4, feeTotal: "36.70", companyPaidNoReimbursementTotal: "9.12", mediaReferenceCount: 5 };
+      }
+      return manifest;
+    } });
+    oldWorkflowRoot = fixture.workflowRoot;
+    const independentReview = await writeJson(path.join(temp, `${kind}-transaction-review.json`), reviewFor(fixture.gate1, fixture.firstImage, fixture.secondImage));
+    const blocked = await finalizeReimbursementWorkflow({
+      statePath: fixture.gate1.statePath,
+      expectedGate1BindingDigest: fixture.gate1.gate1BindingDigest,
+      approvalText: "本次报销通过无误",
+      independentEvidenceReviewPath: independentReview.path,
+      independentEvidenceReviewSha256: independentReview.sha256,
+    });
+    assert.equal(blocked.status, "gate-2-review-required");
+    assert.equal(blocked.disposition, "REVIEW_REQUIRED");
+    assert.equal(blocked.gate1RemainsValid, true);
+    const correctedManifestFile = await writeJson(path.join(temp, `corrected-${kind}-transaction-manifest.json`), correctedManifest);
+    const resolvedReview = resolveGate1ContentError(await fs.readFile(independentReview.path, "utf8").then(JSON.parse), blocked, correctedManifestFile.sha256);
+    const resolvedReviewFile = await writeJson(path.join(temp, `resolved-${kind}-transaction-review.json`), resolvedReview);
+    const correctionRequired = await finalizeReimbursementWorkflow({
+      statePath: fixture.gate1.statePath,
+      expectedGate1BindingDigest: fixture.gate1.gate1BindingDigest,
+      approvalText: "本次报销通过无误",
+      independentEvidenceReviewPath: resolvedReviewFile.path,
+      independentEvidenceReviewSha256: resolvedReviewFile.sha256,
+    });
+    assert.equal(correctionRequired.disposition, "CORRECTION_REQUIRED");
+    const corrected = await reviseFromGate2Attempt(fixture, correctionRequired, { manifestFile: correctedManifestFile });
+    correctedWorkflowRoot = path.dirname(corrected.statePath);
+    assert.equal(corrected.approvalText, null);
+    const correctedReview = await writeJson(path.join(temp, `corrected-${kind}-transaction-review.json`), reviewFor(corrected, fixture.firstImage, fixture.secondImage));
+    const gate2 = await finalizeReimbursementWorkflow({
+      statePath: corrected.statePath,
+      expectedGate1BindingDigest: corrected.gate1BindingDigest,
+      approvalText: null,
+      independentEvidenceReviewPath: correctedReview.path,
+      independentEvidenceReviewSha256: correctedReview.sha256,
+    });
+    assert.equal(gate2.status, "ready-for-gate-2");
+  } finally {
+    if (oldWorkflowRoot) await fs.rm(oldWorkflowRoot, { recursive: true, force: true });
+    if (correctedWorkflowRoot) await fs.rm(correctedWorkflowRoot, { recursive: true, force: true });
+    await fs.rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("review-only findings cannot rebuild unchanged Gate 1 artifacts", async () => {
+  const temp = await fs.mkdtemp(path.join(os.tmpdir(), "codex-xhs-gate2-review-only-revise-"));
+  let workflowRoot;
+  try {
+    const fixture = await prepareFixture(temp);
+    workflowRoot = fixture.workflowRoot;
+    const review = reviewFor(fixture.gate1, fixture.firstImage, fixture.secondImage);
+    review.observations[2].facts[0].person = "错误 reviewer 主体";
+    const reviewFile = await writeJson(path.join(temp, "review-only-mismatch.json"), review);
+    const reviewRequired = await finalizeReimbursementWorkflow({ statePath: fixture.gate1.statePath, expectedGate1BindingDigest: fixture.gate1.gate1BindingDigest, approvalText: "本次报销通过无误", independentEvidenceReviewPath: reviewFile.path, independentEvidenceReviewSha256: reviewFile.sha256 });
+    await assert.rejects(() => reviseFromGate2Attempt(fixture, reviewRequired), /only a Gate 2 CORRECTION_REQUIRED report can authorize artifact or manifest rebuilding/u);
+  } finally {
+    if (workflowRoot) await fs.rm(workflowRoot, { recursive: true, force: true });
+    await fs.rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("an evidence-uncertain finding resolution requires a new Gate 1", async () => {
+  const temp = await fs.mkdtemp(path.join(os.tmpdir(), "codex-xhs-gate2-evidence-uncertain-"));
+  let workflowRoot;
+  try {
+    const fixture = await prepareFixture(temp);
+    workflowRoot = fixture.workflowRoot;
+    const review = reviewFor(fixture.gate1, fixture.firstImage, fixture.secondImage);
+    review.observations[2].facts[0].person = "无法确定的付款主体";
+    const reviewFile = await writeJson(path.join(temp, "uncertain-first-review.json"), review);
+    const reviewRequired = await finalizeReimbursementWorkflow({ statePath: fixture.gate1.statePath, expectedGate1BindingDigest: fixture.gate1.gate1BindingDigest, approvalText: "本次报销通过无误", independentEvidenceReviewPath: reviewFile.path, independentEvidenceReviewSha256: reviewFile.sha256 });
+    const uncertainReview = {
+      ...structuredClone(review),
+      reviewerRunId: crypto.randomBytes(16).toString("hex"),
+      findingResolution: {
+        kind: "gate2-finding-resolution-v1",
+        priorReportDigest: reviewRequired.fullCorrespondenceAudit.reportDigest,
+        priorReviewSha256: reviewRequired.independentEvidenceReview.sha256,
+        decision: "evidence-uncertain",
+        reason: "the original image does not identify the payment subject conclusively",
+        revisedManifestSha256: null,
+      },
+    };
+    uncertainReview.observations[2].facts[0].person = "合成主体丙";
+    const uncertainFile = await writeJson(path.join(temp, "uncertain-resolution-review.json"), uncertainReview);
+    const restart = await finalizeReimbursementWorkflow({ statePath: fixture.gate1.statePath, expectedGate1BindingDigest: fixture.gate1.gate1BindingDigest, approvalText: "本次报销通过无误", independentEvidenceReviewPath: uncertainFile.path, independentEvidenceReviewSha256: uncertainFile.sha256 });
+    assert.equal(restart.status, "gate-1-required");
+    assert.equal(restart.gate1RemainsValid, false);
+    const restartReport = JSON.parse(await fs.readFile(restart.fullCorrespondenceAudit.path, "utf8"));
+    assert.equal(restartReport.mismatches.length, 0, "evidence uncertainty must require Gate 1 even when the current observation matches Gate 1");
+  } finally {
+    if (workflowRoot) await fs.rm(workflowRoot, { recursive: true, force: true });
+    await fs.rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("Gate 2 correction rejects added or replacement source material", async () => {
+  const temp = await fs.mkdtemp(path.join(os.tmpdir(), "codex-xhs-gate2-source-scope-change-"));
+  let workflowRoot;
+  try {
+    const fixture = await prepareFixture(temp);
+    workflowRoot = fixture.workflowRoot;
+    const review = reviewFor(fixture.gate1, fixture.firstImage, fixture.secondImage);
+    review.observations[2].facts[0].project = "reviewed corrected project";
+    const reviewFile = await writeJson(path.join(temp, "source-scope-review.json"), review);
+    const reviewRequired = await finalizeReimbursementWorkflow({ statePath: fixture.gate1.statePath, expectedGate1BindingDigest: fixture.gate1.gate1BindingDigest, approvalText: "本次报销通过无误", independentEvidenceReviewPath: reviewFile.path, independentEvidenceReviewSha256: reviewFile.sha256 });
+    const changedManifests = [
+      ["added", (manifest) => manifest.files.push({ id: "IMG-C", role: "material", path: fixture.firstImage.path, sha256: fixture.firstImage.sha256, kind: "image", disposition: "excluded", reason: "synthetic new source" })],
+      ["replacement-sha", (manifest) => { manifest.files[1].sha256 = "0".repeat(64); }],
+    ];
+    for (const [name, mutate] of changedManifests) {
+      const changed = structuredClone(fixture.manifest);
+      changed.batch.reviewRevision += 1;
+      mutate(changed);
+      const changedFile = await writeJson(path.join(temp, `${name}-source-manifest.json`), changed);
+      await assert.rejects(() => reviseFromGate2Attempt(fixture, reviewRequired, { manifestFile: changedFile }), /changed the original file set, path, kind, or SHA; a new Gate 1 is required/u);
+    }
+  } finally {
+    if (workflowRoot) await fs.rm(workflowRoot, { recursive: true, force: true });
+    await fs.rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("a source SHA change permanently requires a new Gate 1", async () => {
+  const temp = await fs.mkdtemp(path.join(os.tmpdir(), "codex-xhs-gate2-source-sha-changed-"));
+  let workflowRoot;
+  try {
+    const fixture = await prepareFixture(temp);
+    workflowRoot = fixture.workflowRoot;
+    const reviewFile = await writeJson(path.join(temp, "source-sha-review.json"), reviewFor(fixture.gate1, fixture.firstImage, fixture.secondImage));
+    const originalBytes = await fs.readFile(fixture.firstImage.path);
+    await fs.writeFile(fixture.firstImage.path, Buffer.concat([originalBytes, Buffer.from("changed-after-gate1", "utf8")]));
+    const request = { statePath: fixture.gate1.statePath, expectedGate1BindingDigest: fixture.gate1.gate1BindingDigest, approvalText: "本次报销通过无误", independentEvidenceReviewPath: reviewFile.path, independentEvidenceReviewSha256: reviewFile.sha256 };
+    const restart = await finalizeReimbursementWorkflow(request);
+    assert.equal(restart.status, "gate-1-required");
+    assert.equal(restart.gate1RemainsValid, false);
+    assert.equal(restart.retryWithoutNewGate1, false);
+    const report = JSON.parse(await fs.readFile(restart.fullCorrespondenceAudit.path, "utf8"));
+    assert.equal(report.mismatches.some((item) => item.code === "fresh-source-sha-changed"), true);
+    await fs.writeFile(fixture.firstImage.path, originalBytes);
+    await assert.rejects(() => finalizeReimbursementWorkflow(request), /source material changed after Gate 1; a new Gate 1 is required/u);
+    await assert.rejects(() => reviseFromGate2Attempt(fixture, restart), /source material changed after Gate 1; a new Gate 1 is required/u);
+  } finally {
+    if (workflowRoot) await fs.rm(workflowRoot, { recursive: true, force: true });
+    await fs.rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("a source missing after Gate 1 permanently requires a new Gate 1", async () => {
+  const temp = await fs.mkdtemp(path.join(os.tmpdir(), "codex-xhs-gate2-source-missing-"));
+  let workflowRoot;
+  try {
+    const fixture = await prepareFixture(temp);
+    workflowRoot = fixture.workflowRoot;
+    const reviewFile = await writeJson(path.join(temp, "source-missing-review.json"), reviewFor(fixture.gate1, fixture.firstImage, fixture.secondImage));
+    await fs.rm(fixture.firstImage.path);
+    const restart = await finalizeReimbursementWorkflow({ statePath: fixture.gate1.statePath, expectedGate1BindingDigest: fixture.gate1.gate1BindingDigest, approvalText: "本次报销通过无误", independentEvidenceReviewPath: reviewFile.path, independentEvidenceReviewSha256: reviewFile.sha256 });
+    assert.equal(restart.status, "gate-1-required");
+    assert.equal(restart.gate1RemainsValid, false);
+    assert.equal(restart.retryWithoutNewGate1, false);
+    const report = JSON.parse(await fs.readFile(restart.fullCorrespondenceAudit.path, "utf8"));
+    assert.equal(report.mismatches.some((item) => item.code === "fresh-source-sha-changed" && item.fileId === "IMG-A" && /missing after Gate 1/u.test(item.actual)), true);
+  } finally {
+    if (workflowRoot) await fs.rm(workflowRoot, { recursive: true, force: true });
+    await fs.rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("a source change overrides a bound Gate 1 content-error resolution", async () => {
+  const temp = await fs.mkdtemp(path.join(os.tmpdir(), "codex-xhs-gate2-resolved-source-change-"));
+  let workflowRoot;
+  try {
+    const fixture = await prepareFixture(temp, { mutateManifest: (manifest) => {
+      manifest.transactions[2].person = "错误付款主体";
+      return manifest;
+    } });
+    workflowRoot = fixture.workflowRoot;
+    const review = reviewFor(fixture.gate1, fixture.firstImage, fixture.secondImage);
+    const reviewFile = await writeJson(path.join(temp, "resolved-source-change-first-review.json"), review);
+    const reviewRequired = await finalizeReimbursementWorkflow({ statePath: fixture.gate1.statePath, expectedGate1BindingDigest: fixture.gate1.gate1BindingDigest, approvalText: "本次报销通过无误", independentEvidenceReviewPath: reviewFile.path, independentEvidenceReviewSha256: reviewFile.sha256 });
+    assert.equal(reviewRequired.disposition, "REVIEW_REQUIRED");
+    const correctedManifest = structuredClone(fixture.manifest);
+    correctedManifest.batch.reviewRevision += 1;
+    correctedManifest.transactions[2].person = "合成主体丙";
+    const correctedManifestFile = await writeJson(path.join(temp, "resolved-source-change-manifest.json"), correctedManifest);
+    const resolvedReviewFile = await writeJson(path.join(temp, "resolved-source-change-review.json"), resolveGate1ContentError(review, reviewRequired, correctedManifestFile.sha256));
+    await fs.appendFile(fixture.firstImage.path, Buffer.from("changed-after-resolution", "utf8"));
+    const restart = await finalizeReimbursementWorkflow({ statePath: fixture.gate1.statePath, expectedGate1BindingDigest: fixture.gate1.gate1BindingDigest, approvalText: "本次报销通过无误", independentEvidenceReviewPath: resolvedReviewFile.path, independentEvidenceReviewSha256: resolvedReviewFile.sha256 });
+    assert.equal(restart.status, "gate-1-required");
+    assert.equal(restart.disposition, "GATE1_REQUIRED");
+    assert.equal(restart.gate1RemainsValid, false);
+  } finally {
+    if (workflowRoot) await fs.rm(workflowRoot, { recursive: true, force: true });
+    await fs.rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("a manifest change permanently requires a new Gate 1", async () => {
+  const temp = await fs.mkdtemp(path.join(os.tmpdir(), "codex-xhs-gate2-manifest-changed-"));
+  let workflowRoot;
+  try {
+    const fixture = await prepareFixture(temp);
+    workflowRoot = fixture.workflowRoot;
+    const reviewFile = await writeJson(path.join(temp, "manifest-change-review.json"), reviewFor(fixture.gate1, fixture.firstImage, fixture.secondImage));
+    const request = { statePath: fixture.gate1.statePath, expectedGate1BindingDigest: fixture.gate1.gate1BindingDigest, approvalText: "本次报销通过无误", independentEvidenceReviewPath: reviewFile.path, independentEvidenceReviewSha256: reviewFile.sha256 };
+    const originalBytes = await fs.readFile(fixture.manifestFile.path);
+    await fs.appendFile(fixture.manifestFile.path, Buffer.from(" ", "utf8"));
+    await assert.rejects(() => finalizeReimbursementWorkflow(request), /manifest changed after Gate 1; a new Gate 1 is required/u);
+    await fs.writeFile(fixture.manifestFile.path, originalBytes);
+    await assert.rejects(() => finalizeReimbursementWorkflow(request), /manifest changed after Gate 1; a new Gate 1 is required/u);
+  } finally {
+    if (workflowRoot) await fs.rm(workflowRoot, { recursive: true, force: true });
+    await fs.rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("a verified manifest snapshot honors an optional size binding", async () => {
+  const temp = await fs.mkdtemp(path.join(os.tmpdir(), "codex-xhs-gate2-manifest-size-"));
+  try {
+    const manifestFile = await writeJson(path.join(temp, "manifest.json"), { version: 1 });
+    const size = (await fs.stat(manifestFile.path)).size;
+    await assert.rejects(
+      () => readVerifiedGate1ManifestSnapshot({ ...manifestFile, size: size + 1 }),
+      (error) => error?.code === GATE1_RESTART_REQUIRED_ERROR_CODE && /manifest size changed after Gate 1/u.test(error.message),
+    );
+    const snapshot = await readVerifiedGate1ManifestSnapshot({ ...manifestFile, size });
+    assert.deepEqual({ path: snapshot.path, sha256: snapshot.sha256, size: snapshot.size }, { path: manifestFile.path, sha256: manifestFile.sha256, size });
+  } finally {
+    await fs.rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("a transient manifest read failure preserves Gate 1 for a direct retry", async () => {
+  const temp = await fs.mkdtemp(path.join(os.tmpdir(), "codex-xhs-gate2-manifest-retry-"));
+  let workflowRoot;
+  try {
+    const fixture = await prepareFixture(temp);
+    workflowRoot = fixture.workflowRoot;
+    const reviewFile = await writeJson(path.join(temp, "manifest-retry-review.json"), reviewFor(fixture.gate1, fixture.firstImage, fixture.secondImage));
+    const request = { statePath: fixture.gate1.statePath, expectedGate1BindingDigest: fixture.gate1.gate1BindingDigest, approvalText: "本次报销通过无误", independentEvidenceReviewPath: reviewFile.path, independentEvidenceReviewSha256: reviewFile.sha256 };
+    await assert.rejects(
+      () => finalizeReimbursementWorkflow(request, { testHooks: { manifestSnapshotHooks: { afterInitialRead: () => {
+        const error = new Error("synthetic manifest lock");
+        error.code = "EACCES";
+        throw error;
+      } } } }),
+      /Gate 1 remains valid and may be retried: synthetic manifest lock/u,
+    );
+    await assert.rejects(fs.access(path.join(workflowRoot, "gate1-restart-required.json")), /ENOENT/u);
+    const gate2 = await finalizeReimbursementWorkflow(request);
+    assert.equal(gate2.status, "ready-for-gate-2");
+  } finally {
+    if (workflowRoot) await fs.rm(workflowRoot, { recursive: true, force: true });
+    await fs.rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("Gate 2 hashes every original path even when two materials share one SHA", async () => {
+  const temp = await fs.mkdtemp(path.join(os.tmpdir(), "codex-xhs-gate2-same-sha-paths-"));
+  let workflowRoot;
+  try {
+    const duplicatePath = path.join(temp, "synthetic-a-duplicate.jpg");
+    const fixture = await prepareFixture(temp, {
+      afterFilesCreated: async ({ firstImage }) => fs.copyFile(firstImage.path, duplicatePath, fs.constants.COPYFILE_EXCL),
+      mutateManifest: (manifest) => {
+      const first = manifest.files.find((file) => file.id === "IMG-A");
+      manifest.files.push({ id: "IMG-C", role: "material", path: duplicatePath, sha256: first.sha256, kind: "image", disposition: "used", usage: "context" });
+      manifest.sourceScopes.push({ id: "SCOPE-C", fileId: "IMG-C", locator: "full", terminalConfirmed: true, expectedUnitCount: 1 });
+      manifest.sourceUnits.push({ id: "UNIT-D", scopeId: "SCOPE-C", locator: "fourth", disposition: "used" });
+      manifest.transactions[0].evidence.push("IMG-C");
+      manifest.transactions[0].sourceRefs.push("UNIT-D");
+      manifest.expected.mediaReferenceCount = 5;
+      return manifest;
+      },
+    });
+    workflowRoot = fixture.workflowRoot;
+    const review = reviewFor(fixture.gate1, fixture.firstImage, fixture.secondImage);
+    review.observations.push({
+      sourceRef: "UNIT-D",
+      fileId: "IMG-C",
+      sourceSha256: fixture.firstImage.sha256,
+      mediaKind: "image",
+      width: fixture.firstImage.width,
+      height: fixture.firstImage.height,
+      facts: [{ transactionId: "SYN-001", date: "2035-04-12", person: "合成人员甲", project: "合成运营项目", sourceAmount: "19.37" }],
+    });
+    const reviewFile = await writeJson(path.join(temp, "same-sha-path-review.json"), review);
+    await fs.appendFile(duplicatePath, Buffer.from("changed-second-path", "utf8"));
+    const restart = await finalizeReimbursementWorkflow({ statePath: fixture.gate1.statePath, expectedGate1BindingDigest: fixture.gate1.gate1BindingDigest, approvalText: "本次报销通过无误", independentEvidenceReviewPath: reviewFile.path, independentEvidenceReviewSha256: reviewFile.sha256 });
+    assert.equal(restart.status, "gate-1-required");
+    const report = JSON.parse(await fs.readFile(restart.fullCorrespondenceAudit.path, "utf8"));
+    assert.equal(report.mismatches.some((item) => item.code === "fresh-source-sha-changed" && item.fileId === "IMG-C"), true);
+    assert.equal(report.metrics.uniqueSourceReadCount, 3, "all three material paths must be hashed even though only two SHA values are unique");
+  } finally {
+    if (workflowRoot) await fs.rm(workflowRoot, { recursive: true, force: true });
+    await fs.rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("a formal ledger baseline change requires a new Gate 1", async () => {
+  const temp = await fs.mkdtemp(path.join(os.tmpdir(), "codex-xhs-gate2-baseline-changed-"));
+  let workflowRoot;
+  try {
+    const fixture = await prepareFixture(temp);
+    workflowRoot = fixture.workflowRoot;
+    const reviewFile = await writeJson(path.join(temp, "baseline-change-review.json"), reviewFor(fixture.gate1, fixture.firstImage, fixture.secondImage));
+    const originalBytes = await fs.readFile(fixture.baseline.path);
+    await fs.appendFile(fixture.baseline.path, Buffer.from("changed-after-gate1", "utf8"));
+    const request = { statePath: fixture.gate1.statePath, expectedGate1BindingDigest: fixture.gate1.gate1BindingDigest, approvalText: "本次报销通过无误", independentEvidenceReviewPath: reviewFile.path, independentEvidenceReviewSha256: reviewFile.sha256 };
+    await assert.rejects(() => finalizeReimbursementWorkflow(request), /formal ledger baseline changed after Gate 1; a new Gate 1 is required/u);
+    await fs.writeFile(fixture.baseline.path, originalBytes);
+    await assert.rejects(() => finalizeReimbursementWorkflow(request), /formal ledger baseline changed after Gate 1; a new Gate 1 is required/u);
+  } finally {
+    if (workflowRoot) await fs.rm(workflowRoot, { recursive: true, force: true });
+    await fs.rm(temp, { recursive: true, force: true });
+  }
+});
+
+for (const changedInput of ["source", "baseline"]) test(`a ${changedInput} change at publish permanently requires a new Gate 1`, async () => {
+  const temp = await fs.mkdtemp(path.join(os.tmpdir(), `codex-xhs-gate2-publish-${changedInput}-changed-`));
+  let workflowRoot;
+  try {
+    const fixture = await prepareFixture(temp);
+    workflowRoot = fixture.workflowRoot;
+    const reviewFile = await writeJson(path.join(temp, `${changedInput}-publish-review.json`), reviewFor(fixture.gate1, fixture.firstImage, fixture.secondImage));
+    const gate2 = await finalizeReimbursementWorkflow({ statePath: fixture.gate1.statePath, expectedGate1BindingDigest: fixture.gate1.gate1BindingDigest, approvalText: "本次报销通过无误", independentEvidenceReviewPath: reviewFile.path, independentEvidenceReviewSha256: reviewFile.sha256 });
+    const publishRequest = {
+      statePath: gate2.statePath,
+      expectedGate1BindingDigest: fixture.gate1.gate1BindingDigest,
+      gate1ApprovalText: "本次报销通过无误",
+      expectedGate2BindingDigest: gate2.gate2BindingDigest,
+      gate2ApprovalText: "确认更新根目录支出总表",
+    };
+    const changedPath = changedInput === "source" ? fixture.firstImage.path : fixture.baseline.path;
+    const originalBytes = await fs.readFile(changedPath);
+    await fs.appendFile(changedPath, Buffer.from(`changed-before-publish-${changedInput}`, "utf8"));
+    await assert.rejects(
+      () => publishReimbursementWorkflow(publishRequest),
+      changedInput === "source" ? /publish source material changed after Gate 2/u : /formal ledger baseline changed after Gate 1/u,
+    );
+    await fs.writeFile(changedPath, originalBytes);
+    await assert.rejects(
+      () => publishReimbursementWorkflow(publishRequest),
+      changedInput === "source" ? /source material or manifest changed after Gate 2; a new Gate 1 is required/u : /formal ledger baseline changed after Gate 2; a new Gate 1 is required/u,
+    );
+  } finally {
+    if (workflowRoot) await fs.rm(workflowRoot, { recursive: true, force: true });
+    await fs.rm(temp, { recursive: true, force: true });
+  }
+});
+
+for (const direction of ["corrected-to-original", "original-to-corrected"]) test(`Gate 1 restart markers propagate ${direction} across a correction lineage`, async () => {
+  const temp = await fs.mkdtemp(path.join(os.tmpdir(), `codex-xhs-gate2-lineage-${direction}-`));
+  let originalWorkflowRoot;
+  let correctedWorkflowRoot;
+  try {
+    const { fixture, corrected, reviewFile } = await preparePersonCorrectionFixture(temp);
+    originalWorkflowRoot = fixture.workflowRoot;
+    correctedWorkflowRoot = path.dirname(corrected.statePath);
+    const correctedReviewFile = await writeJson(path.join(temp, `${direction}-corrected-review.json`), reviewFor(corrected, fixture.firstImage, fixture.secondImage));
+    const originalRequest = { statePath: fixture.gate1.statePath, expectedGate1BindingDigest: fixture.gate1.gate1BindingDigest, approvalText: "本次报销通过无误", independentEvidenceReviewPath: reviewFile.path, independentEvidenceReviewSha256: reviewFile.sha256 };
+    const correctedRequest = { statePath: corrected.statePath, expectedGate1BindingDigest: corrected.gate1BindingDigest, approvalText: null, independentEvidenceReviewPath: correctedReviewFile.path, independentEvidenceReviewSha256: correctedReviewFile.sha256 };
+    if (direction === "corrected-to-original") {
+      const originalBytes = await fs.readFile(fixture.firstImage.path);
+      await fs.appendFile(fixture.firstImage.path, Buffer.from("lineage-source-change", "utf8"));
+      const restart = await finalizeReimbursementWorkflow(correctedRequest);
+      assert.equal(restart.disposition, "GATE1_REQUIRED");
+      await fs.writeFile(fixture.firstImage.path, originalBytes);
+      await assert.rejects(() => finalizeReimbursementWorkflow(originalRequest), /source material changed after Gate 1; a new Gate 1 is required/u);
+    } else {
+      const originalBytes = await fs.readFile(fixture.baseline.path);
+      await fs.appendFile(fixture.baseline.path, Buffer.from("lineage-baseline-change", "utf8"));
+      await assert.rejects(() => finalizeReimbursementWorkflow(originalRequest), /formal ledger baseline changed after Gate 1; a new Gate 1 is required/u);
+      await fs.writeFile(fixture.baseline.path, originalBytes);
+      await assert.rejects(() => finalizeReimbursementWorkflow(correctedRequest), /formal ledger baseline changed after Gate 1; a new Gate 1 is required/u);
+    }
+  } finally {
+    if (originalWorkflowRoot) await fs.rm(originalWorkflowRoot, { recursive: true, force: true });
+    if (correctedWorkflowRoot) await fs.rm(correctedWorkflowRoot, { recursive: true, force: true });
+    await fs.rm(temp, { recursive: true, force: true });
+  }
+});
+
+for (const scenario of [
+  {
+    name: "empty lineage",
+    expected: /restartLineage must contain the prior Gate 1 workflow/u,
+    mutate: (correction) => { correction.restartLineage = []; },
+  },
+  {
+    name: "mismatched lineage tail",
+    expected: /restartLineage tail does not match priorGate1BindingDigest/u,
+    mutate: (correction) => { correction.restartLineage.at(-1).gate1BindingDigest = "0".repeat(64); },
+  },
+  {
+    name: "attempt report outside the lineage tail",
+    expected: /attemptReport must belong to the prior Gate 1 workflow root/u,
+    mutate: (correction, temp) => { correction.attemptReport.path = path.join(temp, "outside-attempt.json"); },
+  },
+]) test(`Gate 2 correction rejects ${scenario.name}`, async () => {
+  const temp = await fs.mkdtemp(path.join(os.tmpdir(), "codex-xhs-gate2-lineage-binding-"));
+  let originalWorkflowRoot;
+  let correctedWorkflowRoot;
+  try {
+    const { fixture, corrected } = await preparePersonCorrectionFixture(temp);
+    originalWorkflowRoot = fixture.workflowRoot;
+    correctedWorkflowRoot = path.dirname(corrected.statePath);
+    await rewriteWorkflowState(corrected.statePath, (state) => {
+      scenario.mutate(state.gate2Correction, temp);
+      refreshCorrectionAuthorization(state.gate2Correction);
+    });
+    const reviewFile = await writeJson(path.join(temp, "lineage-binding-review.json"), reviewFor(corrected, fixture.firstImage, fixture.secondImage));
+    await assert.rejects(
+      () => finalizeReimbursementWorkflow({ statePath: corrected.statePath, expectedGate1BindingDigest: corrected.gate1BindingDigest, approvalText: null, independentEvidenceReviewPath: reviewFile.path, independentEvidenceReviewSha256: reviewFile.sha256 }),
+      scenario.expected,
+    );
+  } finally {
+    if (originalWorkflowRoot) await fs.rm(originalWorkflowRoot, { recursive: true, force: true });
+    if (correctedWorkflowRoot) await fs.rm(correctedWorkflowRoot, { recursive: true, force: true });
+    await fs.rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("two consecutive Gate 2 corrections keep a flat restart lineage and carry approval", async () => {
+  const temp = await fs.mkdtemp(path.join(os.tmpdir(), "codex-xhs-gate2-lineage-two-hop-"));
+  const workflowRoots = new Set();
+  try {
+    const { fixture, corrected, correctedManifestFile } = await preparePersonCorrectionFixture(temp, { mutateCorrectedManifest: (manifest) => {
+      manifest.transactions[2].project = "仍然错误项目";
+      return manifest;
+    } });
+    workflowRoots.add(fixture.workflowRoot);
+    workflowRoots.add(path.dirname(corrected.statePath));
+    const firstReview = reviewFor(corrected, fixture.firstImage, fixture.secondImage);
+    const firstReviewFile = await writeJson(path.join(temp, "two-hop-first-review.json"), firstReview);
+    const reviewRequired = await finalizeReimbursementWorkflow({ statePath: corrected.statePath, expectedGate1BindingDigest: corrected.gate1BindingDigest, approvalText: null, independentEvidenceReviewPath: firstReviewFile.path, independentEvidenceReviewSha256: firstReviewFile.sha256 });
+    assert.equal(reviewRequired.disposition, "REVIEW_REQUIRED");
+
+    const secondManifest = JSON.parse(await fs.readFile(correctedManifestFile.path, "utf8"));
+    secondManifest.batch.reviewRevision += 1;
+    secondManifest.transactions[2].project = "合成对公项目";
+    const secondManifestFile = await writeJson(path.join(temp, "two-hop-second-manifest.json"), secondManifest);
+    const resolvedReviewFile = await writeJson(path.join(temp, "two-hop-resolved-review.json"), resolveGate1ContentError(firstReview, reviewRequired, secondManifestFile.sha256));
+    const correctionRequired = await finalizeReimbursementWorkflow({ statePath: corrected.statePath, expectedGate1BindingDigest: corrected.gate1BindingDigest, approvalText: null, independentEvidenceReviewPath: resolvedReviewFile.path, independentEvidenceReviewSha256: resolvedReviewFile.sha256 });
+    assert.equal(correctionRequired.disposition, "CORRECTION_REQUIRED");
+    const twiceCorrected = await reviseGate2ReimbursementWorkflow({
+      statePath: corrected.statePath,
+      expectedGate1BindingDigest: corrected.gate1BindingDigest,
+      gate2AttemptReportPath: correctionRequired.fullCorrespondenceAudit.path,
+      gate2AttemptReportSha256: correctionRequired.fullCorrespondenceAudit.sha256,
+      stagingToken: crypto.randomBytes(32).toString("hex"),
+      manifestPath: secondManifestFile.path,
+      manifestSha256: secondManifestFile.sha256,
+    }, { testHooks: { runPreviewRenderer: fakeRenderer } });
+    workflowRoots.add(path.dirname(twiceCorrected.statePath));
+    assert.equal(twiceCorrected.approvalText, null);
+    const twiceCorrectedState = JSON.parse(await fs.readFile(twiceCorrected.statePath, "utf8"));
+    assert.equal(twiceCorrectedState.gate2Correction.restartLineage.length, 2);
+    assert.equal(twiceCorrectedState.gate2Correction.restartLineage.at(-1).workflowRoot, path.dirname(corrected.statePath));
+    assert.equal(twiceCorrectedState.gate2Correction.restartLineage.at(-1).gate1BindingDigest, corrected.gate1BindingDigest);
+    assert.equal(twiceCorrectedState.gate2Correction.restartLineage.every((item) => !Object.hasOwn(item, "restartLineage")), true);
+
+    const finalReviewFile = await writeJson(path.join(temp, "two-hop-final-review.json"), reviewFor(twiceCorrected, fixture.firstImage, fixture.secondImage));
+    const gate2 = await finalizeReimbursementWorkflow({ statePath: twiceCorrected.statePath, expectedGate1BindingDigest: twiceCorrected.gate1BindingDigest, approvalText: null, independentEvidenceReviewPath: finalReviewFile.path, independentEvidenceReviewSha256: finalReviewFile.sha256 });
+    assert.equal(gate2.status, "ready-for-gate-2");
+  } finally {
+    for (const workflowRoot of workflowRoots) await fs.rm(workflowRoot, { recursive: true, force: true });
+    await fs.rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("a failed publish removes its registered rollback backup and reports non-empty cleanup errors", async () => {
+  const temp = await fs.mkdtemp(path.join(os.tmpdir(), "codex-xhs-gate2-publish-backup-cleanup-"));
+  let workflowRoot;
+  try {
+    const fixture = await prepareFixture(temp, { mutateManifest: (manifest) => {
+      manifest.batch.archivePath = path.join(temp, "2035.4.11-2035.4.16_小红书报销（含合成人员乙2035.3.8补报1笔8.21元）");
+      return manifest;
+    } });
+    workflowRoot = fixture.workflowRoot;
+    const reviewFile = await writeJson(path.join(temp, "publish-backup-review.json"), reviewFor(fixture.gate1, fixture.firstImage, fixture.secondImage));
+    const gate2 = await finalizeReimbursementWorkflow({ statePath: fixture.gate1.statePath, expectedGate1BindingDigest: fixture.gate1.gate1BindingDigest, approvalText: "本次报销通过无误", independentEvidenceReviewPath: reviewFile.path, independentEvidenceReviewSha256: reviewFile.sha256 });
+    const publishRequest = { statePath: gate2.statePath, expectedGate1BindingDigest: fixture.gate1.gate1BindingDigest, gate1ApprovalText: "本次报销通过无误", expectedGate2BindingDigest: gate2.gate2BindingDigest, gate2ApprovalText: "确认更新根目录支出总表" };
+    await assert.rejects(
+      () => publishReimbursementWorkflow(publishRequest, { testHooks: { afterBackupCreated: () => { throw new Error("synthetic failure before rollback backup verification"); } } }),
+      /synthetic failure before rollback backup verification/u,
+    );
+    assert.equal((await fs.readdir(workflowRoot)).some((name) => name.startsWith(".rollback-")), false);
+
+    const archiveKeepPath = path.join(fixture.manifest.batch.archivePath, "external-keep.txt");
+    await assert.rejects(
+      () => publishReimbursementWorkflow(publishRequest, { testHooks: { afterBackupCreated: async () => {
+        await fs.writeFile(archiveKeepPath, Buffer.from("external", "utf8"), { flag: "wx" });
+        throw new Error("synthetic failure with non-empty archive");
+      } } }),
+      /synthetic failure with non-empty archive; recovery incomplete: .+\[ENOTEMPTY\]/u,
+    );
+    assert.equal((await fs.readdir(workflowRoot)).some((name) => name.startsWith(".rollback-")), false);
+    await fs.unlink(archiveKeepPath);
+    await fs.rmdir(fixture.manifest.batch.archivePath);
+
+    const externalPath = path.join(workflowRoot, "external-keep.txt");
+    await fs.writeFile(externalPath, Buffer.from("external", "utf8"), { flag: "wx" });
+    const receipt = await publishReimbursementWorkflow(publishRequest);
+    assert.equal(receipt.outputs.length, 1);
+    assert.equal(receipt.cleanup.failures.some((item) => item.path === workflowRoot && item.error?.code === "ENOTEMPTY"), true);
+    await fs.unlink(externalPath);
   } finally {
     if (workflowRoot) await fs.rm(workflowRoot, { recursive: true, force: true });
     await fs.rm(temp, { recursive: true, force: true });
@@ -595,7 +1479,7 @@ test("Gate 2 binds commission, bonus, and allowance annotations to transactions 
   }
 });
 
-test("Gate 2 rejects a summary annotation not confirmed by the independent source review", async () => {
+test("Gate 2 keeps Gate 1 valid when an independent reviewer disputes a summary annotation", async () => {
   const temp = await fs.mkdtemp(path.join(os.tmpdir(), "codex-xhs-gate2-annotation-review-"));
   let workflowRoot;
   try {
@@ -622,20 +1506,35 @@ test("Gate 2 rejects a summary annotation not confirmed by the independent sourc
       sourceRefs: ["UNIT-A"],
     }];
     const reviewFile = await writeJson(path.join(temp, "wrong-annotation-review.json"), review);
-    await assert.rejects(() => finalizeReimbursementWorkflow({
+    const reviewRequired = await finalizeReimbursementWorkflow({
       statePath: fixture.gate1.statePath,
       expectedGate1BindingDigest: fixture.gate1.gate1BindingDigest,
       approvalText: "本次报销通过无误",
       independentEvidenceReviewPath: reviewFile.path,
       independentEvidenceReviewSha256: reviewFile.sha256,
-    }), /permanently invalid/u);
-    const report = JSON.parse(await fs.readFile(path.join(workflowRoot, "gate2-full-correspondence.json"), "utf8"));
+    });
+    assert.equal(reviewRequired.status, "gate-2-review-required");
+    assert.equal(reviewRequired.gate1RemainsValid, true);
+    assert.equal(reviewRequired.retryWithoutNewGate1, true);
+    const report = JSON.parse(await fs.readFile(reviewRequired.fullCorrespondenceAudit.path, "utf8"));
     assert.equal(report.annotationResults[0].status, "failed");
-    assert.equal(report.disposition, "SUBSTANTIVE_MISMATCH");
-    assert.equal(report.mismatches.some((item) => item.code === "independent-review-summary-annotation-amount-mismatch"), true);
+    assert.equal(report.disposition, "REVIEW_REQUIRED");
+    assert.equal(report.reviewFindings.some((item) => item.code === "independent-review-summary-annotation-amount-mismatch"), true);
+    assert.equal(report.mismatches.some((item) => item.code === "independent-review-summary-annotation-amount-mismatch"), false);
     assert.equal(report.missing.some((item) => item.code === "independent-review-summary-annotation-missing"), false);
     assert.equal(report.extra.some((item) => item.code === "independent-review-summary-annotation-extra"), false);
-    assert.equal(JSON.parse(await fs.readFile(path.join(workflowRoot, "gate1-invalidation.json"), "utf8")).kind, "gate1-invalidation-v1");
+    await assert.rejects(fs.access(path.join(workflowRoot, "gate1-invalidation.json")), /ENOENT/u);
+
+    review.annotationObservations[0].amount = "19.37";
+    const correctedReview = await writeJson(path.join(temp, "corrected-annotation-review.json"), review);
+    const gate2 = await finalizeReimbursementWorkflow({
+      statePath: fixture.gate1.statePath,
+      expectedGate1BindingDigest: fixture.gate1.gate1BindingDigest,
+      approvalText: "本次报销通过无误",
+      independentEvidenceReviewPath: correctedReview.path,
+      independentEvidenceReviewSha256: correctedReview.sha256,
+    });
+    assert.equal(gate2.status, "ready-for-gate-2");
   } finally {
     if (workflowRoot) await fs.rm(workflowRoot, { recursive: true, force: true });
     await fs.rm(temp, { recursive: true, force: true });
@@ -682,7 +1581,9 @@ for (const conflict of [false, true]) test(`independent visual observations ${co
       const gate2 = await finalizeReimbursementWorkflow(request);
       assert.equal(gate2.fullCorrespondenceAudit.status, "passed");
     } else {
-      await assert.rejects(() => finalizeReimbursementWorkflow(request), /Gate 1 remains valid|retry/iu);
+      const blocked = await finalizeReimbursementWorkflow(request);
+      assert.equal(blocked.status, "gate-2-review-required");
+      assert.equal(blocked.gate1RemainsValid, true);
       await assert.rejects(fs.access(path.join(workflowRoot, "gate1-invalidation.json")), /ENOENT/u);
       await assert.rejects(fs.access(path.join(workflowRoot, "gate2-full-correspondence.json")), /ENOENT/u);
       review.observations[0].facts[1].sourceAmount = "8.21";
@@ -754,18 +1655,19 @@ const GATE1_BOUND_TAMPERS = [
   },
 ];
 
-for (const scenario of GATE1_BOUND_TAMPERS) test(`Gate 2 invalidates Gate 1-bound wrong ${scenario.name}`, async () => {
+for (const scenario of GATE1_BOUND_TAMPERS) test(`Gate 2 requests an internal correction for Gate 1-bound wrong ${scenario.name}`, async () => {
   const temp = await fs.mkdtemp(path.join(os.tmpdir(), "codex-xhs-gate2-bound-artifact-"));
   let workflowRoot;
   try {
     const fixture = await prepareFixture(temp, scenario.options);
     workflowRoot = fixture.workflowRoot;
     const reviewFile = await writeJson(path.join(temp, "correct-review.json"), reviewFor(fixture.gate1, fixture.firstImage, fixture.secondImage));
-    await assert.rejects(() => finalizeReimbursementWorkflow({ statePath: fixture.gate1.statePath, expectedGate1BindingDigest: fixture.gate1.gate1BindingDigest, approvalText: "本次报销通过无误", independentEvidenceReviewPath: reviewFile.path, independentEvidenceReviewSha256: reviewFile.sha256 }), /permanently invalid/u);
-    const report = JSON.parse(await fs.readFile(path.join(workflowRoot, "gate2-full-correspondence.json"), "utf8"));
-    assert.equal(report.status, "failed");
+    const correctionRequired = await finalizeReimbursementWorkflow({ statePath: fixture.gate1.statePath, expectedGate1BindingDigest: fixture.gate1.gate1BindingDigest, approvalText: "本次报销通过无误", independentEvidenceReviewPath: reviewFile.path, independentEvidenceReviewSha256: reviewFile.sha256 });
+    assert.equal(correctionRequired.disposition, "CORRECTION_REQUIRED");
+    const report = JSON.parse(await fs.readFile(correctionRequired.fullCorrespondenceAudit.path, "utf8"));
+    assert.equal(report.status, "correction-required");
     assert.equal([...report.mismatches, ...report.missing, ...report.extra, ...report.duplicate, ...report.unbound].some((item) => item.code === scenario.issueCode), true, JSON.stringify(report.mismatches, null, 2));
-    assert.equal(JSON.parse(await fs.readFile(path.join(workflowRoot, "gate1-invalidation.json"), "utf8")).kind, "gate1-invalidation-v1");
+    await assert.rejects(fs.access(path.join(workflowRoot, "gate1-invalidation.json")), /ENOENT/u);
   } finally {
     if (workflowRoot) await fs.rm(workflowRoot, { recursive: true, force: true });
     await fs.rm(temp, { recursive: true, force: true });
@@ -780,8 +1682,9 @@ test("transaction coverage never reports matched rows after an early profile art
     const fixture = await prepareFixture(temp, { buildPresentation: brokenDetail });
     workflowRoot = fixture.workflowRoot;
     const reviewFile = await writeJson(path.join(temp, "parse-coverage-review.json"), reviewFor(fixture.gate1, fixture.firstImage, fixture.secondImage));
-    await assert.rejects(() => finalizeReimbursementWorkflow({ statePath: fixture.gate1.statePath, expectedGate1BindingDigest: fixture.gate1.gate1BindingDigest, approvalText: "本次报销通过无误", independentEvidenceReviewPath: reviewFile.path, independentEvidenceReviewSha256: reviewFile.sha256 }), /permanently invalid/u);
-    const report = JSON.parse(await fs.readFile(path.join(workflowRoot, "gate2-full-correspondence.json"), "utf8"));
+    const correctionRequired = await finalizeReimbursementWorkflow({ statePath: fixture.gate1.statePath, expectedGate1BindingDigest: fixture.gate1.gate1BindingDigest, approvalText: "本次报销通过无误", independentEvidenceReviewPath: reviewFile.path, independentEvidenceReviewSha256: reviewFile.sha256 });
+    assert.equal(correctionRequired.disposition, "CORRECTION_REQUIRED");
+    const report = JSON.parse(await fs.readFile(correctionRequired.fullCorrespondenceAudit.path, "utf8"));
     assert.equal(report.coverage.auditedTransactions, 0);
     assert.equal(report.transactionResults.every((item) => item.status === "failed" && item.fullyAudited === false && item.checks.detail.status === "not-checked"), true);
     assert.equal(report.transactionResults.every((item) => item.canonicalFacts && Array.isArray(item.observedFactsBySourceRef)), true);
@@ -819,8 +1722,9 @@ for (const scenario of ROOT_PREVIEW_STRUCTURE_TAMPERS) test(`root batch preview 
     const fixture = await prepareFixture(temp, { buildRoot: tamperedRootPreviewBuilder(scenario.mutate) });
     workflowRoot = fixture.workflowRoot;
     const reviewFile = await writeJson(path.join(temp, "root-preview-review.json"), reviewFor(fixture.gate1, fixture.firstImage, fixture.secondImage));
-    await assert.rejects(() => finalizeReimbursementWorkflow({ statePath: fixture.gate1.statePath, expectedGate1BindingDigest: fixture.gate1.gate1BindingDigest, approvalText: "本次报销通过无误", independentEvidenceReviewPath: reviewFile.path, independentEvidenceReviewSha256: reviewFile.sha256 }), /permanently invalid/u);
-    const report = JSON.parse(await fs.readFile(path.join(workflowRoot, "gate2-full-correspondence.json"), "utf8"));
+    const correctionRequired = await finalizeReimbursementWorkflow({ statePath: fixture.gate1.statePath, expectedGate1BindingDigest: fixture.gate1.gate1BindingDigest, approvalText: "本次报销通过无误", independentEvidenceReviewPath: reviewFile.path, independentEvidenceReviewSha256: reviewFile.sha256 });
+    assert.equal(correctionRequired.disposition, "CORRECTION_REQUIRED");
+    const report = JSON.parse(await fs.readFile(correctionRequired.fullCorrespondenceAudit.path, "utf8"));
     assert.equal(report.mismatches.some((item) => item.code === "artifact-parse-or-validation-failure" && item.artifact === "gate1-deliverables"), true);
   } finally {
     if (workflowRoot) await fs.rm(workflowRoot, { recursive: true, force: true });
@@ -828,14 +1732,17 @@ for (const scenario of ROOT_PREVIEW_STRUCTURE_TAMPERS) test(`root batch preview 
   }
 });
 
-test("a wrong second visual observation permanently invalidates that Gate 1", async () => {
+test("a reviewer payment-subject misjudgment stays in Gate 2 and can be corrected without a new Gate 1", async () => {
   const temp = await fs.mkdtemp(path.join(os.tmpdir(), "codex-xhs-gate2-invalid-"));
   let workflowRoot;
   try {
-    const fixture = await prepareFixture(temp);
+    const fixture = await prepareFixture(temp, { mutateManifest: (manifest) => {
+      manifest.batch.archivePath = path.join(temp, "2035.4.11-2035.4.16_小红书报销（含合成人员乙2035.3.8补报1笔8.21元）");
+      return manifest;
+    } });
     workflowRoot = fixture.workflowRoot;
     const review = reviewFor(fixture.gate1, fixture.firstImage, fixture.secondImage, (value) => {
-      value.observations[0].facts[0].sourceAmount = "77.31";
+      value.observations[2].facts[0].person = "合成报销人丁";
       return value;
     });
     const reviewFile = await writeJson(path.join(temp, "wrong-review.json"), review);
@@ -846,10 +1753,87 @@ test("a wrong second visual observation permanently invalidates that Gate 1", as
       independentEvidenceReviewPath: reviewFile.path,
       independentEvidenceReviewSha256: reviewFile.sha256,
     };
-    await assert.rejects(() => finalizeReimbursementWorkflow(request), /permanently invalid/u);
-    const marker = JSON.parse(await fs.readFile(path.join(fixture.workflowRoot, "gate1-invalidation.json"), "utf8"));
-    assert.equal(marker.kind, "gate1-invalidation-v1");
-    await assert.rejects(() => finalizeReimbursementWorkflow(request), /permanently invalidated/u);
+    const reviewRequired = await finalizeReimbursementWorkflow(request);
+    assert.equal(reviewRequired.status, "gate-2-review-required");
+    assert.equal(reviewRequired.disposition, "REVIEW_REQUIRED");
+    assert.equal(reviewRequired.gate1RemainsValid, true);
+    assert.match(path.basename(reviewRequired.fullCorrespondenceAudit.path), /^gate2-review-[0-9a-f]{64}\.json$/u);
+    const report = JSON.parse(await fs.readFile(reviewRequired.fullCorrespondenceAudit.path, "utf8"));
+    const finding = report.reviewFindings.find((item) => item.code === "independent-visual-observation-mismatch" && item.transactionId === "SYN-003" && item.field === "person");
+    assert.deepEqual({ expected: finding?.expected, actual: finding?.actual }, { expected: "合成主体丙", actual: "合成报销人丁" });
+    assert.equal(report.mismatches.some((item) => item.code === "independent-visual-observation-mismatch"), false);
+    await assert.rejects(fs.access(path.join(fixture.workflowRoot, "gate1-invalidation.json")), /ENOENT/u);
+    const repeated = await finalizeReimbursementWorkflow(request);
+    assert.deepEqual(repeated.fullCorrespondenceAudit, reviewRequired.fullCorrespondenceAudit, "the same review must reuse the same content-addressed report");
+    const secondWrongReview = { ...structuredClone(review), reviewerRunId: crypto.randomBytes(16).toString("hex") };
+    const secondWrongFile = await writeJson(path.join(temp, "second-wrong-review.json"), secondWrongReview);
+    const secondReviewRequired = await finalizeReimbursementWorkflow({ ...request, independentEvidenceReviewPath: secondWrongFile.path, independentEvidenceReviewSha256: secondWrongFile.sha256 });
+    assert.equal(secondReviewRequired.status, "gate-2-review-required");
+
+    review.observations[2].facts[0].person = "合成主体丙";
+    const correctedReview = {
+      ...structuredClone(review),
+      reviewerRunId: crypto.randomBytes(16).toString("hex"),
+      findingResolution: {
+        kind: "gate2-finding-resolution-v1",
+        priorReportDigest: reviewRequired.fullCorrespondenceAudit.reportDigest,
+        priorReviewSha256: reviewRequired.independentEvidenceReview.sha256,
+        decision: "reviewer-error",
+        reason: "the independent reviewer had mistaken the reimbursement claimant for the payment subject",
+        revisedManifestSha256: null,
+      },
+    };
+    const corrected = await writeJson(path.join(temp, "corrected-payment-subject-review.json"), correctedReview);
+    const gate2 = await finalizeReimbursementWorkflow({ ...request, independentEvidenceReviewPath: corrected.path, independentEvidenceReviewSha256: corrected.sha256 });
+    assert.equal(gate2.status, "ready-for-gate-2");
+    const passedReport = JSON.parse(await fs.readFile(gate2.fullCorrespondenceAudit.path, "utf8"));
+    assert.equal(passedReport.disposition, "PASSED");
+    assert.equal(passedReport.findingResolution.decision, "reviewer-error");
+    for (const field of ["missing", "extra", "mismatches", "duplicate", "unbound", "reviewFindings", "blocking"]) assert.deepEqual(passedReport[field], []);
+    const readyState = JSON.parse(await fs.readFile(gate2.statePath, "utf8"));
+    assert.equal(readyState.gate1.bindingDigest, fixture.gate1.gate1BindingDigest);
+    assert.equal(readyState.gate2AttemptReports.some((item) => item.reportDigest === report.reportDigest && item.disposition === "REVIEW_REQUIRED"), true);
+    const attemptReportNames = readyState.gate2AttemptReports.map((item) => path.basename(item.path));
+    assert.deepEqual(attemptReportNames, [...attemptReportNames].sort((left, right) => left.localeCompare(right, "en")));
+    const receipt = await publishReimbursementWorkflow({
+      statePath: gate2.statePath,
+      expectedGate1BindingDigest: fixture.gate1.gate1BindingDigest,
+      gate1ApprovalText: "本次报销通过无误",
+      expectedGate2BindingDigest: gate2.gate2BindingDigest,
+      gate2ApprovalText: "确认更新根目录支出总表",
+    });
+    assert.equal(receipt.outputs.length, 1);
+    await assert.rejects(fs.access(reviewRequired.fullCorrespondenceAudit.path), /ENOENT/u);
+    await assert.rejects(fs.access(secondReviewRequired.fullCorrespondenceAudit.path), /ENOENT/u);
+  } finally {
+    if (workflowRoot) await fs.rm(workflowRoot, { recursive: true, force: true });
+    await fs.rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("reviewer media metadata mistakes require only a corrected Gate 2 review", async () => {
+  const temp = await fs.mkdtemp(path.join(os.tmpdir(), "codex-xhs-gate2-reviewer-media-"));
+  let workflowRoot;
+  try {
+    const fixture = await prepareFixture(temp);
+    workflowRoot = fixture.workflowRoot;
+    const review = reviewFor(fixture.gate1, fixture.firstImage, fixture.secondImage);
+    review.observations[0].mediaKind = "other";
+    review.observations[1].width += 1;
+    const wrong = await writeJson(path.join(temp, "wrong-media-metadata-review.json"), review);
+    const request = { statePath: fixture.gate1.statePath, expectedGate1BindingDigest: fixture.gate1.gate1BindingDigest, approvalText: "本次报销通过无误", independentEvidenceReviewPath: wrong.path, independentEvidenceReviewSha256: wrong.sha256 };
+    const reviewRequired = await finalizeReimbursementWorkflow(request);
+    const report = JSON.parse(await fs.readFile(reviewRequired.fullCorrespondenceAudit.path, "utf8"));
+    assert.equal(report.disposition, "REVIEW_REQUIRED");
+    assert.deepEqual(report.reviewFindings.map((item) => item.code).sort(), ["independent-review-dimensions-mismatch", "independent-review-media-kind-mismatch"]);
+    assert.equal(report.mismatches.length, 0);
+    await assert.rejects(fs.access(path.join(workflowRoot, "gate1-invalidation.json")), /ENOENT/u);
+
+    review.observations[0].mediaKind = "image";
+    review.observations[1].width -= 1;
+    const corrected = await writeJson(path.join(temp, "corrected-media-metadata-review.json"), review);
+    const gate2 = await finalizeReimbursementWorkflow({ ...request, independentEvidenceReviewPath: corrected.path, independentEvidenceReviewSha256: corrected.sha256 });
+    assert.equal(gate2.status, "ready-for-gate-2");
   } finally {
     if (workflowRoot) await fs.rm(workflowRoot, { recursive: true, force: true });
     await fs.rm(temp, { recursive: true, force: true });
@@ -860,9 +1844,36 @@ test("a transient Gate 2 infrastructure error preserves Gate 1 for retry", async
   const temp = await fs.mkdtemp(path.join(os.tmpdir(), "codex-xhs-gate2-retryable-system-"));
   let workflowRoot;
   try {
-    const fixture = await prepareFixture(temp);
+    const duplicatePaths = [];
+    const fixture = await prepareFixture(temp, {
+      afterFilesCreated: async ({ firstImage }) => {
+        for (const suffix of ["c", "d", "e"]) {
+          const duplicatePath = path.join(temp, `synthetic-${suffix}.jpg`);
+          await fs.copyFile(firstImage.path, duplicatePath, fs.constants.COPYFILE_EXCL);
+          duplicatePaths.push(duplicatePath);
+        }
+      },
+      mutateManifest: (manifest) => {
+        const first = manifest.files.find((file) => file.id === "IMG-A");
+        for (const [index, duplicatePath] of duplicatePaths.entries()) {
+          const suffix = String.fromCharCode(67 + index);
+          manifest.files.push({ id: `IMG-${suffix}`, role: "material", path: duplicatePath, sha256: first.sha256, kind: "image", disposition: "used", usage: "context" });
+          manifest.sourceScopes.push({ id: `SCOPE-${suffix}`, fileId: `IMG-${suffix}`, locator: "full", terminalConfirmed: true, expectedUnitCount: 1 });
+          manifest.sourceUnits.push({ id: `UNIT-${String.fromCharCode(68 + index)}`, scopeId: `SCOPE-${suffix}`, locator: `extra-${index + 1}`, disposition: "used" });
+          manifest.transactions[0].evidence.push(`IMG-${suffix}`);
+          manifest.transactions[0].sourceRefs.push(`UNIT-${String.fromCharCode(68 + index)}`);
+        }
+        manifest.expected.mediaReferenceCount += duplicatePaths.length;
+        return manifest;
+      },
+    });
     workflowRoot = fixture.workflowRoot;
     const review = reviewFor(fixture.gate1, fixture.firstImage, fixture.secondImage);
+    for (const [index] of duplicatePaths.entries()) review.observations.push({
+      ...structuredClone(review.observations[0]),
+      sourceRef: `UNIT-${String.fromCharCode(68 + index)}`,
+      fileId: `IMG-${String.fromCharCode(67 + index)}`,
+    });
     const invalidReview = structuredClone(review);
     delete invalidReview.annotationObservations;
     const invalidReviewFile = await writeJson(path.join(temp, "invalid-review-schema.json"), invalidReview);
@@ -870,25 +1881,44 @@ test("a transient Gate 2 infrastructure error preserves Gate 1 for retry", async
     await assert.rejects(fs.access(path.join(workflowRoot, "gate1-invalidation.json")), /ENOENT/u);
     const reviewFile = await writeJson(path.join(temp, "retryable-review.json"), review);
     const request = { statePath: fixture.gate1.statePath, expectedGate1BindingDigest: fixture.gate1.gate1BindingDigest, approvalText: "本次报销通过无误", independentEvidenceReviewPath: reviewFile.path, independentEvidenceReviewSha256: reviewFile.sha256 };
-    await assert.rejects(
-      () => finalizeReimbursementWorkflow(request, {
-        testHooks: {
-          beforeGate2PreviewRead: () => { throw new Error("synthetic preview verification failure"); },
-          fullCorrespondenceHooks: {
-            beforeSourceRead: () => {
+    let sourceReadCalls = 0;
+    const blocked = await finalizeReimbursementWorkflow(request, {
+      testHooks: {
+        fullCorrespondenceHooks: {
+          beforeSourceRead: (file) => {
+            sourceReadCalls += 1;
+            if (file.id === "IMG-A") {
               const error = new Error("synthetic source is temporarily locked");
               error.code = "EACCES";
               throw error;
-            },
+            }
           },
         },
-      }),
-      (error) => {
-        assert.match(error.message, /Gate 1 remains valid/u);
-        assert.doesNotMatch(error.message, /synthetic preview verification failure/u);
-        return true;
       },
-    );
+    });
+    assert.equal(blocked.status, "gate-2-blocked-retryable");
+    assert.equal(blocked.disposition, "BLOCKED_RETRYABLE");
+    assert.equal(blocked.gate1RemainsValid, true);
+    assert.equal(sourceReadCalls, 5, "one temporary source error must not stop a path beyond the four-worker concurrency window from being checked");
+    assert.equal(blocked.fullCorrespondenceAudit.blocking.some((item) => item.code === "fresh-source-read-or-decode-blocked" && /synthetic source is temporarily locked/u.test(item.actual)), true);
+    assert.match(path.basename(blocked.fullCorrespondenceAudit.path), /^gate2-review-[0-9a-f]{64}\.json$/u);
+    const blockedReport = JSON.parse(await fs.readFile(blocked.fullCorrespondenceAudit.path, "utf8"));
+    const { reportDigest: blockedDigest, ...blockedBody } = blockedReport;
+    assert.equal(blockedDigest, canonicalDigest(blockedBody));
+    assert.equal(blockedReport.metrics.uniqueSourceReadCount, 4);
+    const forgedResolution = structuredClone(review);
+    forgedResolution.reviewerRunId = crypto.randomBytes(16).toString("hex");
+    forgedResolution.observations[2].facts[0].person = "synthetic disputed payment subject";
+    forgedResolution.findingResolution = {
+      kind: "gate2-finding-resolution-v1",
+      priorReportDigest: blocked.fullCorrespondenceAudit.reportDigest,
+      priorReviewSha256: blocked.independentEvidenceReview.sha256,
+      decision: "gate1-content-error",
+      reason: "a pure infrastructure report cannot authorize a semantic correction",
+      revisedManifestSha256: fixture.manifestFile.sha256,
+    };
+    const forgedResolutionFile = await writeJson(path.join(temp, "blocked-report-forged-resolution.json"), forgedResolution);
+    await assert.rejects(() => finalizeReimbursementWorkflow({ ...request, independentEvidenceReviewPath: forgedResolutionFile.path, independentEvidenceReviewSha256: forgedResolutionFile.sha256 }), /not bound to a valid prior review attempt/u);
     await assert.rejects(fs.access(path.join(workflowRoot, "gate1-invalidation.json")), /ENOENT/u);
     await assert.rejects(fs.access(path.join(workflowRoot, "gate2-full-correspondence.json")), /ENOENT/u);
     const retried = await finalizeReimbursementWorkflow(request);
@@ -909,7 +1939,9 @@ test("duplicate independent-review observations block Gate 2 without invalidatin
     review.observations.push(structuredClone(review.observations[0]));
     const duplicateReview = await writeJson(path.join(temp, "duplicate-review.json"), review);
     const request = { statePath: fixture.gate1.statePath, expectedGate1BindingDigest: fixture.gate1.gate1BindingDigest, approvalText: "本次报销通过无误", independentEvidenceReviewPath: duplicateReview.path, independentEvidenceReviewSha256: duplicateReview.sha256 };
-    await assert.rejects(() => finalizeReimbursementWorkflow(request), /Gate 1 remains valid|retry/iu);
+    const blocked = await finalizeReimbursementWorkflow(request);
+    assert.equal(blocked.status, "gate-2-blocked-retryable");
+    assert.equal(blocked.fullCorrespondenceAudit.blocking.some((item) => item.code === "independent-review-source-ref-duplicate"), true);
     await assert.rejects(fs.access(path.join(workflowRoot, "gate1-invalidation.json")), /ENOENT/u);
     await assert.rejects(fs.access(path.join(workflowRoot, "gate2-full-correspondence.json")), /ENOENT/u);
     review.observations.pop();
@@ -930,7 +1962,24 @@ test("unknown Gate 2 internal artifact exceptions default to retryable blocking"
     workflowRoot = fixture.workflowRoot;
     const reviewFile = await writeJson(path.join(temp, "unknown-internal-review.json"), reviewFor(fixture.gate1, fixture.firstImage, fixture.secondImage));
     const request = { statePath: fixture.gate1.statePath, expectedGate1BindingDigest: fixture.gate1.gate1BindingDigest, approvalText: "本次报销通过无误", independentEvidenceReviewPath: reviewFile.path, independentEvidenceReviewSha256: reviewFile.sha256 };
-    await assert.rejects(() => finalizeReimbursementWorkflow(request, { testHooks: { fullCorrespondenceHooks: { beforeArtifactLoad: () => { throw new Error("synthetic unknown artifact exception"); } } } }), /Gate 1 remains valid|retry/iu);
+    let archiveReadFinished = 0;
+    const blocked = await finalizeReimbursementWorkflow(request, { testHooks: { fullCorrespondenceHooks: {
+      beforeEvidenceArchiveRead: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 1_000));
+        archiveReadFinished += 1;
+        if (archiveReadFinished === 1) {
+          const error = new Error("synthetic evidence archive is temporarily locked");
+          error.code = "EACCES";
+          throw error;
+        }
+      },
+      beforeArtifactTasksExecute: () => { throw new Error("synthetic unknown artifact exception"); },
+    } } });
+    assert.equal(blocked.status, "gate-2-blocked-retryable");
+    assert.equal(blocked.disposition, "BLOCKED_RETRYABLE");
+    assert.equal(blocked.fullCorrespondenceAudit.blocking.some((item) => item.code === "artifact-audit-internal-failure"), true);
+    assert.equal(blocked.fullCorrespondenceAudit.blocking.some((item) => item.code === "evidence-archive-read-or-audit-blocked" && /temporarily locked/u.test(item.actual)), true);
+    assert.equal(archiveReadFinished, 2, "an early artifact failure must join every already-started evidence archive read before returning");
     await assert.rejects(fs.access(path.join(workflowRoot, "gate1-invalidation.json")), /ENOENT/u);
     await assert.rejects(fs.access(path.join(workflowRoot, "gate2-full-correspondence.json")), /ENOENT/u);
     const retried = await finalizeReimbursementWorkflow(request);
@@ -965,8 +2014,9 @@ test("evidence archive cache verifies every bound path even when expected SHA is
     const fixture = await prepareFixture(temp, { buildPresentation: duplicateArchiveBuilder });
     workflowRoot = fixture.workflowRoot;
     const reviewFile = await writeJson(path.join(temp, "archive-review.json"), reviewFor(fixture.gate1, fixture.firstImage, fixture.secondImage));
-    await assert.rejects(() => finalizeReimbursementWorkflow({ statePath: fixture.gate1.statePath, expectedGate1BindingDigest: fixture.gate1.gate1BindingDigest, approvalText: "本次报销通过无误", independentEvidenceReviewPath: reviewFile.path, independentEvidenceReviewSha256: reviewFile.sha256 }), /permanently invalid/u);
-    const report = JSON.parse(await fs.readFile(path.join(workflowRoot, "gate2-full-correspondence.json"), "utf8"));
+    const correctionRequired = await finalizeReimbursementWorkflow({ statePath: fixture.gate1.statePath, expectedGate1BindingDigest: fixture.gate1.gate1BindingDigest, approvalText: "本次报销通过无误", independentEvidenceReviewPath: reviewFile.path, independentEvidenceReviewSha256: reviewFile.sha256 });
+    assert.equal(correctionRequired.disposition, "CORRECTION_REQUIRED");
+    const report = JSON.parse(await fs.readFile(correctionRequired.fullCorrespondenceAudit.path, "utf8"));
     assert.equal(report.mismatches.some((item) => item.code === "evidence-archive-bytes-mismatch" && item.evidenceId === "SYN-DUPLICATE-ARCHIVE"), true);
     assert.equal(report.metrics.uniqueArchiveMediaReadCount, 3, "each distinct archive path must be read once");
   } finally {

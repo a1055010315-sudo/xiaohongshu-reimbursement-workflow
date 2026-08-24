@@ -62,8 +62,8 @@ Gate 2 必须把每个 manifest 交易逐项对应到明细表、截图对应表
 
 Gate 2 为发现 Gate 1 内容错误而执行，不能退化为只比较 SHA256。独立复核不得进入 Gate 1 热路径；Gate 2 内文字说明、明细、截图表、各补报表和本批候选投影各解析一次，每个唯一媒体从原始路径 fresh-read/完整 decode 一次后复用于其全部引用，候选禁止读取 `batchRows` 之外的历史业务内容。
 
-`sourceRefs` 的输入顺序不具有业务语义：必须先逐元素校验，在原数组上查重，再用与 locale 无关的稳定排序做集合比较和报告输出；纯排列不得产生 mismatch，缺失、额外、重复或非法元素仍须保留对应失败。完整唯一观察确认的实质内容差异为 `SUBSTANTIVE_MISMATCH` 并使 Gate 1 失效；独立 review 自身不完整、重复、未绑定、内部冲突，或临时 I/O/解析/机器问题为 `BLOCKED_RETRYABLE`，绑定未变化时保留 Gate 1 供修正后重试。
+`sourceRefs` 的输入顺序不具有业务语义：必须先逐元素校验，在原数组上查重，再用与 locale 无关的稳定排序做集合比较和报告输出；纯排列不得产生 mismatch，缺失、额外、重复或非法元素仍须保留对应 finding。绑定 resolution 确认的实质内容差异为 `CORRECTION_REQUIRED`，在同材料/同基线内修复；reviewer 单方差异为 `REVIEW_REQUIRED`；证据不确定为 `GATE1_REQUIRED`；临时 I/O/解析/机器问题为 `BLOCKED_RETRYABLE`。
 
-性能评估以只读安装版本 `0.5.0+codex.20260819174146` 为基线，不以人为构造的朴素实现替代。必须在同一机器、同一完全合成批次和相同冷/热规则下，分别测量旧版 `prepare + Gate 1 + finalize` 与新版 `prepare + Gate 1 + full-correspondence Gate 2 finalize` 的插件可控代码阶段总耗时。20% 仅作为默认信息性改善目标；未达到时如实报告，不单独判失败。通过仍要求输出完全等价、p95 不退化且冷/热峰值内存增幅均不超过 15%。外部人员或模型生成 `independent-evidence-review-v1` 的等待时间单独记录且不计入总耗时，插件读取 review、每个唯一媒体的 fresh-read/decode、审计和报告生成全部计入。基线安装缓存只读且禁止修改；优化优先处理重复 I/O、解码或解析，不能减少复核范围。
+性能评估不以人为构造的朴素实现代替锁定基线：H 线只保留历史校准，普通 O 线必须以本轮修改前、与候选输出契约等价的已安装版本对比当前候选，并锁定双方 version、skill tree 与 package tree digest。必须在同一机器、同一完全合成批次和相同冷/热规则下，测量 `prepare + Gate 1 + full-correspondence Gate 2 finalize` 的插件可控代码阶段总耗时。20% 仅为信息性改善目标；通过要求输出完全等价，冷、热 p50 与 p95 均不得退化超过 5%，各轮采样峰值 RSS 的 p95 增幅均不超过 15%，且任何 renderer 的预览 PNG 均保持唯一。外部 reviewer 等待时间单独记录且不计入总耗时，插件读取 review、逐路径材料核验、唯一媒体 decode、审计和报告生成全部计入；任一硬条件失败都禁止打包、安装或发布。
 
 具体输入独立性、报告字段、失效和展示规则见 [Gate 2 全量对应复核](gate2-full-correspondence.md)。

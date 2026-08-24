@@ -211,12 +211,12 @@ test("distribution and paired-bootstrap statistics are deterministic", () => {
   assert.ok(first.lowerPercent > 20);
 });
 
-test("improvement target is informational while p95, RSS, and output safeguards remain mandatory", () => {
+test("improvement target is informational while the five-percent p50/p95, RSS, and output safeguards remain mandatory", () => {
   const passing = {
     thresholdPercent: 20,
     p50ImprovementPercent: 5,
     p50BootstrapLowerPercent: 2,
-    p95ImprovementPercent: 0,
+    p95ImprovementPercent: -5,
     peakRssRegressionPercent: 15,
     outputEquivalent: true,
   };
@@ -225,8 +225,11 @@ test("improvement target is informational while p95, RSS, and output safeguards 
   assert.equal(belowTarget.improvementTargetMet, false);
   assert.equal(belowTarget.criteria.p50PointAtLeastThreshold, false);
   assert.equal(belowTarget.criteria.p50PairedBootstrapLowerAtLeastThreshold, false);
+  assert.equal(belowTarget.criteria.p50PointRegressionAtMostFivePercent, true);
+  assert.equal(belowTarget.criteria.p95PointRegressionAtMostFivePercent, true);
   const failures = [
-    ["p95PointNotRegressed", { p95ImprovementPercent: -0.001 }],
+    ["p50PointRegressionAtMostFivePercent", { p50ImprovementPercent: -5.001 }],
+    ["p95PointRegressionAtMostFivePercent", { p95ImprovementPercent: -5.001 }],
     ["peakRssIncreaseAtMostFifteenPercent", { peakRssRegressionPercent: 15.01 }],
     ["outputExactlyEquivalent", { outputEquivalent: false }],
   ];
@@ -234,6 +237,9 @@ test("improvement target is informational while p95, RSS, and output safeguards 
     const result = evaluateStrictPerformanceAcceptance({ ...passing, ...mutation });
     assert.equal(result.passed, false, criterion);
     assert.equal(result.criteria[criterion], false, criterion);
+  }
+  for (const mutation of [{ p50ImprovementPercent: -5 }, { p95ImprovementPercent: -5 }]) {
+    assert.equal(evaluateStrictPerformanceAcceptance({ ...passing, ...mutation }).passed, true, "the exact five-percent boundary must pass");
   }
 });
 
@@ -266,6 +272,52 @@ test("O and D pass below the 20% improvement target when all safeguards pass", (
   assert.equal(disbursementSummary.improvementTargetMet, false);
   assert.equal(disbursementSummary.safeguardsPassed, true);
   assert.equal(disbursementSummary.acceptancePassed, true);
+});
+
+test("ordinary acceptance enforces the five-percent p50 and p95 boundary", () => {
+  const summarizeAt = (candidateTimes) => {
+    const samples = [];
+    for (const [round, candidateMs] of candidateTimes.entries()) {
+      samples.push(ordinarySample("old", round));
+      const candidate = ordinarySample("new", round);
+      candidate.totalPluginMs = candidateMs;
+      candidate.prepareMs = candidateMs / 2;
+      candidate.finalizeMs = candidateMs / 2;
+      samples.push(candidate);
+    }
+    return summarizeOrdinaryPerformanceSamples(samples, { threshold: 20, acceptance: true, line: "O", temperature: "hot", renderer: "com" });
+  };
+  const boundary = summarizeAt([105, 105, 105, 105]);
+  assert.equal(boundary.criteria.p50PointRegressionAtMostFivePercent, true);
+  assert.equal(boundary.criteria.p95PointRegressionAtMostFivePercent, true);
+  assert.equal(boundary.acceptancePassed, true);
+  const p50Failure = summarizeAt([105.001, 105.001, 105.001, 105.001]);
+  assert.equal(p50Failure.criteria.p50PointRegressionAtMostFivePercent, false);
+  assert.equal(p50Failure.acceptancePassed, false);
+  const p95Failure = summarizeAt([100, 100, 100, 106]);
+  assert.equal(p95Failure.criteria.p50PointRegressionAtMostFivePercent, true);
+  assert.equal(p95Failure.criteria.p95PointRegressionAtMostFivePercent, false);
+  assert.equal(p95Failure.acceptancePassed, false);
+});
+
+test("ordinary acceptance cannot bypass preview uniqueness or hide a peak RSS outlier", () => {
+  const duplicatePngSamples = [ordinarySample("old", 0), ordinarySample("new", 0)];
+  duplicatePngSamples[1].observedCounts.gate1UniquePreviewPngCount = 2;
+  const duplicatePng = summarizeOrdinaryPerformanceSamples(duplicatePngSamples, { threshold: 20, acceptance: true, line: "O", temperature: "hot", renderer: "com" });
+  assert.equal(duplicatePng.criteria.previewPngsAreDistinct, false);
+  assert.equal(duplicatePng.acceptancePassed, false);
+
+  const peakRssSamples = [];
+  for (let round = 0; round < 4; round += 1) {
+    peakRssSamples.push(ordinarySample("old", round));
+    const candidate = ordinarySample("new", round);
+    candidate.resources.sampledPeakRssBytes = round === 3 ? 2_000 : 1_000;
+    peakRssSamples.push(candidate);
+  }
+  const peakRss = summarizeOrdinaryPerformanceSamples(peakRssSamples, { threshold: 20, acceptance: true, line: "O", temperature: "hot", renderer: "com" });
+  assert.ok(peakRss.peakRssRegressionPercent > 15);
+  assert.equal(peakRss.criteria.peakRssIncreaseAtMostFifteenPercent, false);
+  assert.equal(peakRss.acceptancePassed, false);
 });
 
 function contractSha(label) {
@@ -308,7 +360,7 @@ function ordinarySample(version, round, outputContract = ordinaryContract()) {
     excludedIndependentReviewSetupMs: 1,
     excludedOutputContractReadMs: 1,
     outputContract,
-    observedCounts: {},
+    observedCounts: { gate1PreviewCount: 3, gate1UniquePreviewPngCount: 3 },
     resources: {
       rssStartBytes: 1_000,
       rssEndBytes: 1_000,

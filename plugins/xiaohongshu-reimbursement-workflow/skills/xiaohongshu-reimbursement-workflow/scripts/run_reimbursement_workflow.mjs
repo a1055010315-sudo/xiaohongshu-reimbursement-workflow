@@ -41,6 +41,11 @@ const PREVIEW_REQUEST_KIND = "ordinary-reimbursement-preview-request-v2";
 const PREVIEW_RESPONSE_KIND = "ordinary-reimbursement-preview-response-v2";
 const PREVIEW_RESULT_KIND = "ordinary-reimbursement-preview-set-v2";
 const FULL_CORRESPONDENCE_AUDIT_KIND = "gate2-full-correspondence-v1";
+const GATE2_ATTEMPT_REPORT_RE = /^gate2-review-([0-9a-f]{64})\.json$/u;
+const GATE2_CORRECTION_KIND = "gate2-correction-carry-forward-v1";
+const GATE1_RESTART_KIND = "gate1-restart-required-v1";
+const GATE1_RESTART_REQUIRED_ERROR_CODE = "XHS_GATE1_RESTART_REQUIRED";
+const VERIFIED_GATE2_CORRECTIONS = new WeakSet();
 const MAX_PREVIEW_BYTES = 32 * 1024 * 1024;
 const MAX_RENDERER_OUTPUT_BYTES = 2 * 1024 * 1024;
 const RENDERER_TIMEOUT_MS = 120_000;
@@ -58,6 +63,11 @@ function fail(message) {
 
 function object(value, field) {
   if (!value || typeof value !== "object" || Array.isArray(value)) fail(`${field} must be an object.`);
+  return value;
+}
+
+function array(value, field) {
+  if (!Array.isArray(value)) fail(`${field} must be an array.`);
   return value;
 }
 
@@ -144,6 +154,16 @@ function errorHasCode(error, code) {
   return false;
 }
 
+function isRetryableInfrastructureError(error) {
+  return ["EACCES", "EPERM", "EBUSY", "EMFILE", "ENFILE", "ENOMEM", "EIO", "ETIMEDOUT"].some((code) => errorHasCode(error, code));
+}
+
+function gate1RestartError(message, cause) {
+  const error = new Error(`Ordinary Reimbursement Workflow ${message}`, cause instanceof Error ? { cause } : undefined);
+  error.code = GATE1_RESTART_REQUIRED_ERROR_CODE;
+  return error;
+}
+
 async function readOptionalStableJson(filePath) {
   try {
     return await readStableUtf8JsonFile(filePath, { maxBytes: MAX_JSON_BYTES });
@@ -153,10 +173,234 @@ async function readOptionalStableJson(filePath) {
   }
 }
 
+async function writeIdempotentJson(filePath, value) {
+  try {
+    return await writeExclusiveJson(filePath, value);
+  } catch (error) {
+    if (!errorHasCode(error, "EEXIST")) throw error;
+    const existing = await readStableUtf8JsonFile(filePath, { maxBytes: MAX_JSON_BYTES });
+    if (canonicalDigest(existing.value) !== canonicalDigest(value)) fail(`content-addressed JSON differs at ${filePath}.`);
+    return { path: filePath, sha256: existing.sha256, size: existing.size };
+  }
+}
+
+async function writeGate1RestartMarker(workflowRoot, gate1BindingDigest, reason, evidenceDigest) {
+  const core = { kind: GATE1_RESTART_KIND, gate1BindingDigest, reason, evidenceDigest };
+  return writeIdempotentJson(path.join(workflowRoot, "gate1-restart-required.json"), { ...core, markerDigest: canonicalDigest(core) });
+}
+
+async function assertNoGate1RestartMarker(workflowRoot, gate1BindingDigest) {
+  const markerPath = path.join(workflowRoot, "gate1-restart-required.json");
+  const existing = await readOptionalStableJson(markerPath);
+  if (!existing) return markerPath;
+  const marker = object(existing.value, "Gate 1 restart marker");
+  if (marker.kind !== GATE1_RESTART_KIND || marker.gate1BindingDigest !== gate1BindingDigest || canonicalDigest(withoutDigest(marker, "markerDigest")) !== marker.markerDigest) fail("Gate 1 restart marker is invalid.");
+  throw gate1RestartError(`${marker.reason}; a new Gate 1 is required. Evidence: ${marker.evidenceDigest}`);
+}
+
+function validateGate1RestartLineage(value, field) {
+  const seen = new Set();
+  return array(value, field).map((entry, index) => {
+    const itemField = `${field}[${index}]`;
+    exact(entry, new Set(["workflowRoot", "gate1BindingDigest"]), itemField);
+    const workflowRoot = text(entry.workflowRoot, `${itemField}.workflowRoot`);
+    if (!path.isAbsolute(workflowRoot) || workflowRoot !== path.resolve(workflowRoot)) fail(`${itemField}.workflowRoot must be a normalized absolute path.`);
+    const key = process.platform === "win32" ? workflowRoot.toLowerCase() : workflowRoot;
+    if (seen.has(key)) fail(`${field} contains a duplicate workflow root.`);
+    seen.add(key);
+    return { workflowRoot, gate1BindingDigest: sha(entry.gate1BindingDigest, `${itemField}.gate1BindingDigest`) };
+  });
+}
+
+function gate1RestartLineage(state) {
+  const inherited = state.gate2Correction
+    ? validateGate2Correction(state.gate2Correction, "workflow Gate 2 correction").restartLineage
+    : [];
+  return validateGate1RestartLineage([
+    ...inherited,
+    { workflowRoot: path.resolve(state.workflowRoot), gate1BindingDigest: state.gate1.bindingDigest },
+  ], "Gate 1 restart lineage");
+}
+
+async function assertNoGate1RestartRequired(state) {
+  for (const item of gate1RestartLineage(state)) await assertNoGate1RestartMarker(item.workflowRoot, item.gate1BindingDigest);
+}
+
+async function writeGate1RestartRequired(state, reason, evidenceDigest) {
+  return Promise.all(gate1RestartLineage(state).map(async (item) => ({
+    ...item,
+    ...(await writeGate1RestartMarker(item.workflowRoot, item.gate1BindingDigest, reason, evidenceDigest)),
+  })));
+}
+
+async function listGate2AttemptReports(workflowRoot, gate1BindingDigest) {
+  const entries = await fs.readdir(workflowRoot, { withFileTypes: true });
+  const reports = [];
+  for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name, "en"))) {
+    const match = GATE2_ATTEMPT_REPORT_RE.exec(entry.name);
+    if (!match) continue;
+    if (!entry.isFile() || entry.isSymbolicLink()) fail(`Gate 2 attempt report ${entry.name} is not a plain file.`);
+    const filePath = path.join(workflowRoot, entry.name);
+    const stable = await readStableUtf8JsonFile(filePath, { maxBytes: MAX_JSON_BYTES });
+    const report = object(stable.value, `Gate 2 attempt report ${entry.name}`);
+    if (
+      report.kind !== FULL_CORRESPONDENCE_AUDIT_KIND
+      || report.reportDigest !== match[1]
+      || canonicalDigest(withoutDigest(report, "reportDigest")) !== report.reportDigest
+      || report.gate1BindingDigest !== gate1BindingDigest
+      || !new Set(["REVIEW_REQUIRED", "CORRECTION_REQUIRED", "BLOCKED_RETRYABLE", "GATE1_REQUIRED"]).has(report.disposition)
+    ) fail(`Gate 2 attempt report ${entry.name} is invalid.`);
+    reports.push({ path: filePath, sha256: stable.sha256, size: stable.size, reportDigest: report.reportDigest, disposition: report.disposition });
+  }
+  return reports;
+}
+
+async function validateFindingResolution(report, workflowRoot, gate1BindingDigest) {
+  const resolution = report.findingResolution;
+  if (!resolution) return;
+  if (resolution.decision === "gate1-content-error" && !new Set(["CORRECTION_REQUIRED", "BLOCKED_RETRYABLE", "GATE1_REQUIRED"]).has(report.disposition)) fail("gate1-content-error resolution has an invalid Gate 2 disposition.");
+  if (resolution.decision === "evidence-uncertain" && report.disposition !== "GATE1_REQUIRED") fail("evidence-uncertain resolution has an invalid Gate 2 disposition.");
+  const priorPath = path.join(workflowRoot, `gate2-review-${resolution.priorReportDigest}.json`);
+  const prior = await readStableUtf8JsonFile(priorPath, { maxBytes: MAX_JSON_BYTES });
+  const priorReport = object(prior.value, "prior Gate 2 finding report");
+  if (
+    priorReport.kind !== FULL_CORRESPONDENCE_AUDIT_KIND
+    || priorReport.reportDigest !== resolution.priorReportDigest
+    || canonicalDigest(withoutDigest(priorReport, "reportDigest")) !== priorReport.reportDigest
+    || priorReport.gate1BindingDigest !== gate1BindingDigest
+    || priorReport.independentEvidenceReviewSha256 !== resolution.priorReviewSha256
+    || priorReport.disposition !== "REVIEW_REQUIRED"
+    || array(priorReport.reviewFindings, "prior Gate 2 finding report reviewFindings").length === 0
+  ) fail("Gate 2 finding resolution is not bound to a valid prior review attempt.");
+}
+
+function correctionAuthorizationCore(value) {
+  const result = clone(value);
+  delete result.authorizationDigest;
+  return result;
+}
+
+function validateGate2Correction(value, field = "Gate 2 correction") {
+  exact(value, new Set(["kind", "priorGate1BindingDigest", "attemptReport", "manifestChanged", "restartLineage", "authorizationDigest"]), field);
+  if (value.kind !== GATE2_CORRECTION_KIND) fail(`${field} kind is invalid.`);
+  const priorGate1BindingDigest = sha(value.priorGate1BindingDigest, `${field}.priorGate1BindingDigest`);
+  exact(value.attemptReport, new Set(["path", "sha256", "size", "reportDigest", "disposition"]), `${field}.attemptReport`);
+  const attemptReportPath = text(value.attemptReport.path, `${field}.attemptReport.path`);
+  if (!path.isAbsolute(attemptReportPath) || attemptReportPath !== path.resolve(attemptReportPath)) fail(`${field}.attemptReport.path must be a normalized absolute path.`);
+  sha(value.attemptReport.sha256, `${field}.attemptReport.sha256`);
+  sha(value.attemptReport.reportDigest, `${field}.attemptReport.reportDigest`);
+  if (!Number.isSafeInteger(value.attemptReport.size) || value.attemptReport.size < 1) fail(`${field}.attemptReport.size is invalid.`);
+  if (!new Set(["REVIEW_REQUIRED", "CORRECTION_REQUIRED", "BLOCKED_RETRYABLE"]).has(value.attemptReport.disposition)) fail(`${field}.attemptReport.disposition is invalid.`);
+  if (typeof value.manifestChanged !== "boolean") fail(`${field}.manifestChanged must be boolean.`);
+  const restartLineage = validateGate1RestartLineage(value.restartLineage, `${field}.restartLineage`);
+  const lineageTail = restartLineage.at(-1);
+  if (!lineageTail) fail(`${field}.restartLineage must contain the prior Gate 1 workflow.`);
+  if (lineageTail.gate1BindingDigest !== priorGate1BindingDigest) fail(`${field}.restartLineage tail does not match priorGate1BindingDigest.`);
+  if (!samePath(path.dirname(attemptReportPath), lineageTail.workflowRoot)) fail(`${field}.attemptReport must belong to the prior Gate 1 workflow root.`);
+  if (sha(value.authorizationDigest, `${field}.authorizationDigest`) !== canonicalDigest(correctionAuthorizationCore(value))) fail(`${field} authorization digest is invalid.`);
+  return value;
+}
+
+function correctionSourceInventory(manifest) {
+  return array(manifest.files, "manifest.files").map((file, index) => ({
+    id: text(file?.id, `manifest.files[${index}].id`),
+    role: text(file?.role, `manifest.files[${index}].role`),
+    path: path.resolve(text(file?.path, `manifest.files[${index}].path`)),
+    sha256: sha(file?.sha256, `manifest.files[${index}].sha256`),
+    kind: file?.kind ?? null,
+  })).sort((left, right) => left.id.localeCompare(right.id, "en"));
+}
+
+function assertSameGate2CorrectionScope(priorManifest, revisedManifest) {
+  const same = (left, right) => canonicalDigest(left) === canonicalDigest(right);
+  if (priorManifest.version !== revisedManifest.version || priorManifest.rulesVersion !== revisedManifest.rulesVersion) fail("Gate 2 correction changed the manifest contract; a new Gate 1 is required.");
+  const priorBatch = object(priorManifest.batch, "prior manifest.batch");
+  const revisedBatch = object(revisedManifest.batch, "revised manifest.batch");
+  for (const field of ["batchId", "rootPath", "targetCategory"]) if (!same(priorBatch[field], revisedBatch[field])) fail(`Gate 2 correction changed batch.${field}; a new Gate 1 is required.`);
+  if (!same(priorBatch.mainPeriod, revisedBatch.mainPeriod) || !same(priorBatch.period, revisedBatch.period)) fail("Gate 2 correction changed the main reimbursement period; a new Gate 1 is required.");
+  if (!same(priorManifest.operation, revisedManifest.operation)) fail("Gate 2 correction changed the operation mode; a new Gate 1 is required.");
+  if (!same(correctionSourceInventory(priorManifest), correctionSourceInventory(revisedManifest))) fail("Gate 2 correction changed the original file set, path, kind, or SHA; a new Gate 1 is required.");
+  const priorArchiveParent = path.dirname(path.resolve(text(priorBatch.archivePath, "prior manifest.batch.archivePath")));
+  const revisedArchiveParent = path.dirname(path.resolve(text(revisedBatch.archivePath, "revised manifest.batch.archivePath")));
+  if (!samePath(priorArchiveParent, revisedArchiveParent)) fail("Gate 2 correction moved the archive outside its original parent; a new Gate 1 is required.");
+  const priorRevision = priorBatch.reviewRevision;
+  const revisedRevision = revisedBatch.reviewRevision;
+  if (!Number.isSafeInteger(priorRevision) || !Number.isSafeInteger(revisedRevision) || revisedRevision < priorRevision) fail("Gate 2 correction reviewRevision cannot decrease.");
+}
+
+function dedupeBoundFiles(files) {
+  const result = new Map();
+  for (const file of files) {
+    if (!file?.path || !file?.sha256) continue;
+    const key = process.platform === "win32" ? path.resolve(file.path).toLowerCase() : path.resolve(file.path);
+    const prior = result.get(key);
+    if (prior && (prior.sha256 !== file.sha256 || (prior.size !== undefined && file.size !== undefined && prior.size !== file.size))) fail(`cleanup binding conflicts for ${file.path}.`);
+    result.set(key, { path: path.resolve(file.path), sha256: file.sha256, ...(file.size === undefined ? {} : { size: file.size }) });
+  }
+  return [...result.values()];
+}
+
+async function correctionCleanupFor(ready) {
+  const attemptReports = await listGate2AttemptReports(ready.state.workflowRoot, ready.state.gate1.bindingDigest);
+  const inherited = ready.state.supersededWorkflowCleanup ?? { files: [], roots: [] };
+  return {
+    files: dedupeBoundFiles([
+      ...(inherited.files ?? []),
+      ...ready.state.rootBuild.ownedFiles,
+      ...ready.state.presentationBuild.ownedFiles,
+      ...ready.state.previewBuild.ownedFiles,
+      ...attemptReports,
+      ready.state.previewCheckpoint,
+      { path: ready.path, sha256: ready.snapshot.sha256, size: ready.snapshot.size },
+    ]),
+    roots: [...new Set([...(inherited.roots ?? []), ready.state.previewBuild.outputRoot, ready.state.rootBuild.stagingRoot, ready.state.presentationBuild.stagingRoot, ready.state.workflowRoot].filter(Boolean).map((item) => path.resolve(item)))],
+  };
+}
+
 async function assertBoundFile(binding, field) {
   const stable = await readStableBinaryFile(binding.path);
   if (stable.sha256 !== binding.sha256 || (binding.size !== undefined && stable.size !== binding.size)) fail(`${field} changed after binding.`);
   return stable;
+}
+
+async function assertGate1BaselinesUnchanged(baselines) {
+  const settled = await Promise.allSettled(baselines.map((baseline) => assertBoundFile(baseline, `${baseline.profileId} Gate 1 baseline`)));
+  const failure = settled.find((result) => result.status === "rejected");
+  if (!failure) return;
+  const error = failure.reason;
+  if (isRetryableInfrastructureError(error)) throw error;
+  throw gate1RestartError(
+    `formal ledger baseline changed after Gate 1; a new Gate 1 is required: ${error instanceof Error ? error.message : String(error)}`,
+    error,
+  );
+}
+
+async function assertSourceMaterialsUnchanged(manifestBinding, phase) {
+  try {
+    const stable = await readStableUtf8JsonFile(manifestBinding.path, { maxBytes: MAX_JSON_BYTES });
+    if (stable.sha256 !== manifestBinding.sha256) fail(`${phase} manifest changed after Gate 1.`);
+    const manifest = object(stable.value, `${phase} manifest`);
+    const materials = new Map();
+    for (const [index, file] of array(manifest.files, `${phase} manifest.files`).entries()) {
+      if (file?.role !== "material") continue;
+      const binding = {
+        path: path.resolve(text(file.path, `${phase} manifest.files[${index}].path`)),
+        sha256: sha(file.sha256, `${phase} manifest.files[${index}].sha256`),
+      };
+      const key = process.platform === "win32" ? binding.path.toLowerCase() : binding.path;
+      const prior = materials.get(key);
+      if (prior && prior.sha256 !== binding.sha256) fail(`${phase} manifest binds one material path to multiple SHA values.`);
+      materials.set(key, binding);
+    }
+    await mapSettledLimit([...materials.values()], 4, (binding) => assertBoundFile(binding, `${phase} source material`));
+    return manifest;
+  } catch (error) {
+    if (error?.code === GATE1_RESTART_REQUIRED_ERROR_CODE || isRetryableInfrastructureError(error)) throw error;
+    throw gate1RestartError(
+      `${phase} source material changed after Gate 2; a new Gate 1 is required: ${error instanceof Error ? error.message : String(error)}`,
+      error,
+    );
+  }
 }
 
 function createManifestAuditSession() {
@@ -285,11 +529,13 @@ async function cleanupBound(files, roots) {
       }
       await fs.unlink(item.path);
     } catch (error) {
-      if (error?.code !== "ENOENT") failures.push({ path: item.path, error });
+      if (!errorHasCode(error, "ENOENT")) failures.push({ path: item.path, error });
     }
   }
-  for (const root of [...new Set(roots)].reverse()) {
-    try { await fs.rmdir(root); } catch (error) { if (error?.code !== "ENOENT" && error?.code !== "ENOTEMPTY") failures.push({ path: root, error }); }
+  const orderedRoots = [...new Set(roots.map((root) => path.resolve(root)))]
+    .sort((left, right) => right.split(path.sep).length - left.split(path.sep).length || right.length - left.length);
+  for (const root of orderedRoots) {
+    try { await fs.rmdir(root); } catch (error) { if (error?.code !== "ENOENT") failures.push({ path: root, error }); }
   }
   return { preserved, failures };
 }
@@ -706,6 +952,7 @@ async function assertPreviewCheckpoint(checkpoint, expected) {
     || !samePath(state.workflowRoot, expected.workflowRoot)
     || state.prepareRequestDigest !== expected.prepareRequestDigest
     || state.manifest?.sha256 !== expected.manifestSha256
+    || (state.gate2Correction?.authorizationDigest ?? null) !== expected.correctionAuthorizationDigest
   ) fail("ready-preview checkpoint does not match the current prepare request.");
   if (
     !SHA_RE.test(state.certificate?.certificateDigest ?? "")
@@ -722,9 +969,12 @@ async function assertPreviewCheckpoint(checkpoint, expected) {
   return state;
 }
 
-export async function prepareReimbursementWorkflow(rawRequest, { testHooks } = {}) {
+export async function prepareReimbursementWorkflow(rawRequest, { testHooks, gate2CorrectionContext } = {}) {
   exact(rawRequest, new Set(["kind", "stagingToken", "manifestPath", "manifestSha256", "baselines"]), "prepare request");
   if (rawRequest.kind !== WORKFLOW_PREPARE_KIND || !TOKEN_RE.test(rawRequest.stagingToken ?? "")) fail("prepare kind or stagingToken is invalid.");
+  if (gate2CorrectionContext !== undefined && !VERIFIED_GATE2_CORRECTIONS.has(gate2CorrectionContext)) fail("Gate 2 correction context was not verified by the correction entrypoint.");
+  const gate2Correction = gate2CorrectionContext?.authorization ? validateGate2Correction(gate2CorrectionContext.authorization) : null;
+  const supersededWorkflowCleanup = gate2CorrectionContext?.cleanup ?? null;
   if (!Array.isArray(rawRequest.baselines) || rawRequest.baselines.length < 1 || rawRequest.baselines.length > 3) fail("baselines must contain one to three profiles.");
   const manifestPath = path.resolve(text(rawRequest.manifestPath, "manifestPath"));
   const manifestSha256 = sha(rawRequest.manifestSha256, "manifestSha256");
@@ -752,6 +1002,7 @@ export async function prepareReimbursementWorkflow(rawRequest, { testHooks } = {
     manifestPath,
     manifestSha256,
     baselines,
+    correctionAuthorizationDigest: gate2Correction?.authorizationDigest ?? null,
   });
   const checkpointPath = path.join(workflowRoot, "ready-preview.json");
   let rootBuild;
@@ -774,9 +1025,14 @@ export async function prepareReimbursementWorkflow(rawRequest, { testHooks } = {
         workflowRoot,
         prepareRequestDigest,
         manifestSha256,
+        correctionAuthorizationDigest: gate2Correction?.authorizationDigest ?? null,
       });
-      manifestRecord = checkpointState.manifest;
+      if (checkpointState.manifest.size !== undefined && checkpointState.manifest.size !== manifestSnapshot.size) {
+        fail("ready-preview checkpoint manifest size differs from the bound bytes.");
+      }
+      manifestRecord = { ...checkpointState.manifest, size: manifestSnapshot.size };
       manifestAudit = {
+        manifestFileSize: manifestRecord.size,
         affectedProfileIds: checkpointState.affectedProfileIds,
         batch: {
           batchId: manifestRecord.batchId,
@@ -816,11 +1072,17 @@ export async function prepareReimbursementWorkflow(rawRequest, { testHooks } = {
       const startupFailure = startup.find((item) => item.status === "rejected");
       if (startupFailure) throw startupFailure.reason;
       manifestAudit = startup[0].value;
-      if (manifestAudit.manifestFileSha256 !== manifestSha256 || !path.isAbsolute(manifestAudit.batch?.archivePath ?? "")) fail("manifest auditor did not bind the requested bytes and archive path.");
+      if (
+        manifestAudit.manifestFileSha256 !== manifestSha256
+        || !Number.isSafeInteger(manifestAudit.manifestFileSize)
+        || manifestAudit.manifestFileSize < 1
+        || !path.isAbsolute(manifestAudit.batch?.archivePath ?? "")
+      ) fail("manifest auditor did not bind the requested bytes, size, and archive path.");
       if (canonicalDigest(baselines.map((item) => item.profileId)) !== canonicalDigest(manifestAudit.affectedProfileIds)) fail("baselines must exactly match affected profiles in registry order.");
       manifestRecord = {
         path: manifestPath,
         sha256: manifestSha256,
+        size: manifestAudit.manifestFileSize,
         archivePath: path.resolve(manifestAudit.batch.archivePath),
         batchId: manifestAudit.batch.batchId,
         operationDigest: manifestAudit.operationDigest,
@@ -861,6 +1123,7 @@ export async function prepareReimbursementWorkflow(rawRequest, { testHooks } = {
         baselines,
         rootBuild,
         presentationBuild,
+        ...(gate2Correction ? { gate2Correction, supersededWorkflowCleanup } : {}),
       };
       const checkpointState = { ...checkpointCore, stateDigest: canonicalDigest(checkpointCore) };
       previewCheckpoint = await writeExclusiveJson(checkpointPath, checkpointState);
@@ -876,7 +1139,7 @@ export async function prepareReimbursementWorkflow(rawRequest, { testHooks } = {
     const gate1 = gate1For(manifestAudit, rootBuild, reviewPackageDigest);
     const core = {
       kind: WORKFLOW_GATE1_KIND,
-      requiresGate1Approval: true,
+      requiresGate1Approval: !gate2Correction,
       stagingToken: rawRequest.stagingToken,
       workflowRoot,
       manifest: manifestRecord,
@@ -890,13 +1153,14 @@ export async function prepareReimbursementWorkflow(rawRequest, { testHooks } = {
       reusedPreviewCheckpoint: reusedCheckpoint,
       reviewPackageDigest,
       gate1,
+      ...(gate2Correction ? { gate2Correction, supersededWorkflowCleanup } : {}),
     };
     const state = { ...core, stateDigest: canonicalDigest(core) };
-    const stateFile = await writeExclusiveJson(path.join(workflowRoot, "ready-gate-1.json"), state);
+    const stateFile = await writeIdempotentJson(path.join(workflowRoot, "ready-gate-1.json"), state);
     return deepFreeze({
-      status: "ready-for-gate-1",
+      status: gate2Correction ? "ready-for-gate-2-correction-review" : "ready-for-gate-1",
       gate1BindingDigest: gate1.bindingDigest,
-      approvalText: GATE1_TEXT,
+      approvalText: gate2Correction ? null : GATE1_TEXT,
       statePath: stateFile.path,
       stateSha256: stateFile.sha256,
       stateDigest: state.stateDigest,
@@ -933,25 +1197,155 @@ export async function prepareReimbursementWorkflow(rawRequest, { testHooks } = {
   }
 }
 
+export async function reviseGate2ReimbursementWorkflow(rawRequest, { testHooks } = {}) {
+  exact(rawRequest, new Set(["statePath", "expectedGate1BindingDigest", "gate2AttemptReportPath", "gate2AttemptReportSha256", "stagingToken", "manifestPath", "manifestSha256"]), "Gate 2 correction request");
+  if (!TOKEN_RE.test(rawRequest.stagingToken ?? "")) fail("Gate 2 correction stagingToken is invalid.");
+  const ready = await readState(rawRequest.statePath, WORKFLOW_GATE1_KIND);
+  const expectedGate1BindingDigest = sha(rawRequest.expectedGate1BindingDigest, "expectedGate1BindingDigest");
+  if (expectedGate1BindingDigest !== ready.state.gate1.bindingDigest) fail("Gate 2 correction Gate 1 binding differs from the reviewed state.");
+  if (rawRequest.stagingToken === ready.state.stagingToken) fail("Gate 2 correction requires a fresh stagingToken.");
+  await assertNoGate1RestartRequired(ready.state);
+  try {
+    await assertGate1BaselinesUnchanged(ready.state.baselines);
+  } catch (error) {
+    if (error?.code !== GATE1_RESTART_REQUIRED_ERROR_CODE) {
+      fail(`Gate 2 correction preflight could not complete; Gate 1 remains valid and may be retried: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    await writeGate1RestartRequired(ready.state, "formal ledger baseline changed after Gate 1", canonicalDigest(ready.state.baselines));
+    throw error;
+  }
+  try {
+    await assertSourceMaterialsUnchanged(ready.state.manifest, "Gate 2 correction");
+  } catch (error) {
+    if (error?.code !== GATE1_RESTART_REQUIRED_ERROR_CODE) {
+      fail(`Gate 2 correction source verification could not complete; Gate 1 remains valid and may be retried: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    await writeGate1RestartRequired(ready.state, "source material or manifest changed after Gate 1", canonicalDigest(ready.state.manifest));
+    throw error;
+  }
+
+  const reportPath = path.resolve(text(rawRequest.gate2AttemptReportPath, "gate2AttemptReportPath"));
+  if (!samePath(path.dirname(reportPath), ready.state.workflowRoot)) fail("Gate 2 correction report must belong to the prior workflow root.");
+  const reportSha256 = sha(rawRequest.gate2AttemptReportSha256, "gate2AttemptReportSha256");
+  const reportStable = await readStableUtf8JsonFile(reportPath, { maxBytes: MAX_JSON_BYTES });
+  if (reportStable.sha256 !== reportSha256) fail("Gate 2 correction report SHA differs from the reviewed attempt.");
+  const report = object(reportStable.value, "Gate 2 correction report");
+  if (
+    report.kind !== FULL_CORRESPONDENCE_AUDIT_KIND
+    || canonicalDigest(withoutDigest(report, "reportDigest")) !== report.reportDigest
+    || report.gate1BindingDigest !== ready.state.gate1.bindingDigest
+    || !new Set(["REVIEW_REQUIRED", "CORRECTION_REQUIRED", "BLOCKED_RETRYABLE"]).has(report.disposition)
+    || path.basename(reportPath) !== `gate2-review-${report.reportDigest}.json`
+  ) fail("Gate 2 correction report is not a valid retryable attempt bound to this Gate 1.");
+
+  const priorManifestStable = await readStableUtf8JsonFile(path.resolve(ready.state.manifest.path), { maxBytes: MAX_JSON_BYTES });
+  if (priorManifestStable.sha256 !== ready.state.manifest.sha256) fail("prior manifest changed after Gate 1; a new Gate 1 is required.");
+  const revisedManifestPath = path.resolve(text(rawRequest.manifestPath, "manifestPath"));
+  const revisedManifestSha256 = sha(rawRequest.manifestSha256, "manifestSha256");
+  const revisedManifestStable = await readStableUtf8JsonFile(revisedManifestPath, { maxBytes: MAX_JSON_BYTES });
+  if (revisedManifestStable.sha256 !== revisedManifestSha256) fail("revised manifest SHA differs from the correction request.");
+  assertSameGate2CorrectionScope(object(priorManifestStable.value, "prior manifest"), object(revisedManifestStable.value, "revised manifest"));
+  const manifestChanged = ready.state.manifest.sha256 !== revisedManifestSha256;
+  if (report.disposition !== "CORRECTION_REQUIRED") fail("only a Gate 2 CORRECTION_REQUIRED report can authorize artifact or manifest rebuilding; review/input findings must retry the independent review.");
+  if (manifestChanged && report.findingResolution?.decision !== "gate1-content-error") fail("Gate 2 artifact correction did not authorize a manifest change.");
+  if (report.findingResolution?.decision === "gate1-content-error" && report.findingResolution.revisedManifestSha256 !== revisedManifestSha256) fail("revised manifest SHA differs from the Gate 2 finding resolution authorization.");
+
+  const cleanup = await correctionCleanupFor(ready);
+  const correctionCore = {
+    kind: GATE2_CORRECTION_KIND,
+    priorGate1BindingDigest: ready.state.gate1.bindingDigest,
+    attemptReport: { path: reportPath, sha256: reportStable.sha256, size: reportStable.size, reportDigest: report.reportDigest, disposition: report.disposition },
+    manifestChanged,
+    restartLineage: gate1RestartLineage(ready.state),
+  };
+  const authorization = { ...correctionCore, authorizationDigest: canonicalDigest(correctionCore) };
+  const gate2CorrectionContext = { authorization, cleanup };
+  VERIFIED_GATE2_CORRECTIONS.add(gate2CorrectionContext);
+  const baselines = ready.state.baselines.map((baseline) => {
+    if (!Number.isSafeInteger(baseline.candidateRevision) || baseline.candidateRevision >= Number.MAX_SAFE_INTEGER) fail(`${baseline.profileId} candidateRevision cannot be advanced for Gate 2 correction.`);
+    return { profileId: baseline.profileId, path: baseline.path, sha256: baseline.sha256, size: baseline.size, candidateRevision: baseline.candidateRevision + 1 };
+  });
+  return prepareReimbursementWorkflow({
+    kind: WORKFLOW_PREPARE_KIND,
+    stagingToken: rawRequest.stagingToken,
+    manifestPath: revisedManifestPath,
+    manifestSha256: revisedManifestSha256,
+    baselines,
+  }, { testHooks, gate2CorrectionContext });
+}
+
 export async function finalizeReimbursementWorkflow(rawRequest, { testHooks } = {}) {
   exact(rawRequest, new Set(["statePath", "expectedGate1BindingDigest", "approvalText", "independentEvidenceReviewPath", "independentEvidenceReviewSha256"]), "finalize request");
-  if (rawRequest.approvalText !== GATE1_TEXT) fail("Gate 1 approval text is not exact.");
   const ready = await readState(rawRequest.statePath, WORKFLOW_GATE1_KIND);
+  const carriedCorrection = ready.state.gate2Correction ? validateGate2Correction(ready.state.gate2Correction, "workflow Gate 2 correction") : null;
+  const correctionApprovalCarried = rawRequest.approvalText === null && carriedCorrection !== null && ready.state.requiresGate1Approval === false;
+  if (rawRequest.approvalText !== GATE1_TEXT && !correctionApprovalCarried) fail("Gate 1 approval text is not exact and no verified Gate 2 correction carry-forward is present.");
+  if (carriedCorrection) await assertBoundFile(carriedCorrection.attemptReport, "Gate 2 correction attempt report");
   if (sha(rawRequest.expectedGate1BindingDigest, "expectedGate1BindingDigest") !== ready.state.gate1.bindingDigest) fail("Gate 1 binding digest differs from the displayed review package.");
-  const invalidationPath = path.join(ready.state.workflowRoot, "gate1-invalidation.json");
-  const priorInvalidation = await readOptionalStableJson(invalidationPath);
-  if (priorInvalidation) {
-    const marker = object(priorInvalidation.value, "Gate 1 invalidation marker");
-    if (marker.kind !== "gate1-invalidation-v1" || marker.gate1BindingDigest !== ready.state.gate1.bindingDigest || canonicalDigest(withoutDigest(marker, "markerDigest")) !== marker.markerDigest) fail("Gate 1 invalidation marker is invalid.");
-    fail(`Gate 1 was permanently invalidated by full correspondence audit ${marker.fullCorrespondenceAuditDigest}; a corrected batch requires a new Gate 1.`);
-  }
-  const independentEvidenceReviewPath = path.resolve(text(rawRequest.independentEvidenceReviewPath, "independentEvidenceReviewPath"));
-  const independentEvidenceReviewSha256 = sha(rawRequest.independentEvidenceReviewSha256, "independentEvidenceReviewSha256");
-  const independentReviewStable = await readStableUtf8JsonFile(independentEvidenceReviewPath, { maxBytes: MAX_JSON_BYTES });
-  if (independentReviewStable.sha256 !== independentEvidenceReviewSha256) fail("independent evidence review SHA differs before Gate 2.");
   const correspondencePath = path.join(ready.state.workflowRoot, "gate2-full-correspondence.json");
+  const auditModulePromise = import("./audit_full_correspondence.mjs");
+  void auditModulePromise.catch(() => {});
+  await assertNoGate1RestartRequired(ready.state);
+  const gate1Preflight = await Promise.allSettled([
+    assertGate1BaselinesUnchanged(ready.state.baselines),
+    auditModulePromise.then((module) => module.readVerifiedGate1ManifestSnapshot(
+      ready.state.manifest,
+      { testHooks: testHooks?.manifestSnapshotHooks },
+    )),
+  ]);
+  if (gate1Preflight[0].status === "rejected") {
+    if (gate1Preflight[0].reason?.code !== GATE1_RESTART_REQUIRED_ERROR_CODE) {
+      fail(`Gate 2 preflight could not complete; Gate 1 remains valid and may be retried: ${gate1Preflight[0].reason instanceof Error ? gate1Preflight[0].reason.message : String(gate1Preflight[0].reason)}`);
+    }
+    await writeGate1RestartRequired(ready.state, "formal ledger baseline changed after Gate 1", canonicalDigest(ready.state.baselines));
+    throw gate1Preflight[0].reason;
+  }
+  if (gate1Preflight[1].status === "rejected") {
+    if (gate1Preflight[1].reason?.code !== GATE1_RESTART_REQUIRED_ERROR_CODE) {
+      fail(`full correspondence audit could not complete; Gate 1 remains valid and may be retried: ${gate1Preflight[1].reason instanceof Error ? gate1Preflight[1].reason.message : String(gate1Preflight[1].reason)}`);
+    }
+    await writeGate1RestartRequired(ready.state, "manifest changed after Gate 1", canonicalDigest(ready.state.manifest));
+    throw gate1RestartError(
+      `manifest changed after Gate 1; a new Gate 1 is required: ${gate1Preflight[1].reason instanceof Error ? gate1Preflight[1].reason.message : String(gate1Preflight[1].reason)}`,
+      gate1Preflight[1].reason,
+    );
+  }
+  const auditModule = await auditModulePromise;
+  const verifiedManifestSnapshot = gate1Preflight[1].value;
+  const reviewSnapshotPromise = Promise.resolve().then(async () => {
+    const reviewPath = path.resolve(text(rawRequest.independentEvidenceReviewPath, "independentEvidenceReviewPath"));
+    const reviewSha256 = sha(rawRequest.independentEvidenceReviewSha256, "independentEvidenceReviewSha256");
+    const stable = await readStableUtf8JsonFile(reviewPath, { maxBytes: MAX_JSON_BYTES });
+    if (stable.sha256 !== reviewSha256) fail("independent evidence review SHA differs before Gate 2.");
+    return { path: reviewPath, sha256: reviewSha256, stable };
+  });
+  const planCheckPromise = Promise.all(ready.state.rootBuild.artifacts.map((artifact) => assertBoundFile(
+    { path: artifact.planPath, sha256: artifact.planSha256, size: artifact.planSize },
+    `${artifact.profileId} candidate plan`,
+  )));
+  const preflight = await Promise.allSettled([
+    reviewSnapshotPromise,
+    readOptionalStableJson(correspondencePath),
+    planCheckPromise,
+  ]);
+  if (preflight[0].status === "rejected") throw preflight[0].reason;
+  if (preflight[1].status === "rejected") throw preflight[1].reason;
+  const { path: independentEvidenceReviewPath, sha256: independentEvidenceReviewSha256, stable: independentReviewStable } = preflight[0].value;
+  const existingCorrespondence = preflight[1].value;
   let correspondence;
   let correspondenceFile;
+  if (existingCorrespondence) {
+    correspondence = object(existingCorrespondence.value, "full correspondence checkpoint");
+    if (
+      correspondence.kind !== FULL_CORRESPONDENCE_AUDIT_KIND
+      || canonicalDigest(withoutDigest(correspondence, "reportDigest")) !== correspondence.reportDigest
+      || correspondence.status !== "passed"
+      || correspondence.disposition !== "PASSED"
+      || correspondence.gate1BindingDigest !== ready.state.gate1.bindingDigest
+      || correspondence.independentEvidenceReviewSha256 !== independentEvidenceReviewSha256
+    ) fail("full correspondence checkpoint is invalid or bound to another Gate 1/review.");
+  }
+  if (preflight[2].status === "rejected") throw preflight[2].reason;
   // Gate 2 preview verification only rereads and hashes the already-bound Gate 1
   // PNGs. Start it alongside full correspondence, but keep a settled wrapper so
   // correspondence remains the first reported failure and no rejection escapes.
@@ -968,25 +1362,12 @@ export async function finalizeReimbursementWorkflow(rawRequest, { testHooks } = 
     (reason) => ({ status: "rejected", reason }),
   );
   try {
-  const existingCorrespondence = await readOptionalStableJson(correspondencePath);
   if (existingCorrespondence) {
-    correspondence = object(existingCorrespondence.value, "full correspondence checkpoint");
-    if (
-      correspondence.kind !== FULL_CORRESPONDENCE_AUDIT_KIND
-      || canonicalDigest(withoutDigest(correspondence, "reportDigest")) !== correspondence.reportDigest
-      || correspondence.status !== "passed"
-      || correspondence.disposition !== "PASSED"
-      || correspondence.gate1BindingDigest !== ready.state.gate1.bindingDigest
-      || correspondence.independentEvidenceReviewSha256 !== independentEvidenceReviewSha256
-    ) fail("full correspondence checkpoint is invalid or bound to another Gate 1/review.");
     correspondenceFile = { path: correspondencePath, sha256: existingCorrespondence.sha256, size: existingCorrespondence.size };
     await Promise.all([
-      assertBoundFile(ready.state.manifest, "checkpoint manifest"),
-      ...ready.state.baselines.map((baseline) => assertBoundFile(baseline, `${baseline.profileId} checkpoint baseline`)),
       ...ready.state.rootBuild.artifacts.flatMap((artifact) => [
         assertBoundFile({ path: artifact.candidatePath, sha256: artifact.candidateSha256, size: artifact.candidateSize }, `${artifact.profileId} checkpoint candidate`),
         assertBoundFile({ path: artifact.previewPath, sha256: artifact.previewSha256, size: artifact.previewSize }, `${artifact.profileId} checkpoint root preview`),
-        assertBoundFile({ path: artifact.planPath, sha256: artifact.planSha256, size: artifact.planSize }, `${artifact.profileId} checkpoint plan`),
       ]),
       ...ready.state.presentationBuild.artifacts.flatMap((artifact) => [
         assertBoundFile(artifact.detail, `${artifact.profileId} checkpoint detail`),
@@ -997,16 +1378,8 @@ export async function finalizeReimbursementWorkflow(rawRequest, { testHooks } = 
       ]),
     ]);
   } else {
-    await Promise.all([
-      ...ready.state.baselines.map((baseline) => assertBoundFile(baseline, `${baseline.profileId} baseline`)),
-      ...ready.state.rootBuild.artifacts.map((artifact) => assertBoundFile(
-        { path: artifact.planPath, sha256: artifact.planSha256, size: artifact.planSize },
-        `${artifact.profileId} candidate plan`,
-      )),
-    ]);
     try {
-      const { auditFullCorrespondence } = await import("./audit_full_correspondence.mjs");
-      correspondence = await auditFullCorrespondence({
+      correspondence = await auditModule.auditFullCorrespondence({
         gate1State: ready.state,
         independentEvidenceReviewSnapshot: {
           path: independentEvidenceReviewPath,
@@ -1014,30 +1387,59 @@ export async function finalizeReimbursementWorkflow(rawRequest, { testHooks } = 
           size: independentReviewStable.size,
           value: independentReviewStable.value,
         },
-      }, { hooks: testHooks?.fullCorrespondenceHooks });
+      }, { hooks: testHooks?.fullCorrespondenceHooks, verifiedManifestSnapshot });
     } catch (error) {
       fail(`full correspondence audit could not complete; Gate 1 remains valid and may be retried: ${error instanceof Error ? error.message : String(error)}`);
     }
-    if (correspondence.disposition === "BLOCKED_RETRYABLE") {
-      const blockingCount = correspondence.blocking?.length ?? 0;
-      fail(`full correspondence audit was blocked by ${blockingCount} retryable condition(s); Gate 1 remains valid and may be retried with corrected review/input.`);
-    }
-    if (!new Set(["PASSED", "SUBSTANTIVE_MISMATCH"]).has(correspondence.disposition)) fail("full correspondence audit returned an invalid disposition; Gate 1 remains valid and may be retried.");
-    correspondenceFile = await writeExclusiveJson(correspondencePath, correspondence);
-    if (correspondence.disposition === "SUBSTANTIVE_MISMATCH") {
-      const markerCore = {
-        kind: "gate1-invalidation-v1",
+    if (!new Set(["PASSED", "REVIEW_REQUIRED", "CORRECTION_REQUIRED", "BLOCKED_RETRYABLE", "GATE1_REQUIRED"]).has(correspondence.disposition)) fail("full correspondence audit returned an invalid disposition; Gate 1 remains valid and may be retried.");
+    await validateFindingResolution(correspondence, ready.state.workflowRoot, ready.state.gate1.bindingDigest);
+    if (new Set(["REVIEW_REQUIRED", "CORRECTION_REQUIRED", "BLOCKED_RETRYABLE", "GATE1_REQUIRED"]).has(correspondence.disposition)) {
+      const attemptPath = path.join(ready.state.workflowRoot, `gate2-review-${correspondence.reportDigest}.json`);
+      correspondenceFile = await writeIdempotentJson(attemptPath, correspondence);
+      let gate1Restart = null;
+      if (correspondence.disposition === "GATE1_REQUIRED") {
+        const reason = correspondence.findingResolution?.decision === "evidence-uncertain" ? "source evidence is uncertain after Gate 1" : "source material changed after Gate 1";
+        const markers = await writeGate1RestartRequired(ready.state, reason, correspondence.reportDigest);
+        gate1Restart = markers.at(-1);
+      }
+      const gate2PreviewBuildResult = await gate2PreviewBuildSettled;
+      if (gate2PreviewBuildResult.status === "rejected") throw gate2PreviewBuildResult.reason;
+      return deepFreeze({
+        status: correspondence.disposition === "REVIEW_REQUIRED"
+          ? "gate-2-review-required"
+          : correspondence.disposition === "CORRECTION_REQUIRED"
+            ? "gate-2-correction-required"
+            : correspondence.disposition === "GATE1_REQUIRED"
+              ? "gate-1-required"
+              : "gate-2-blocked-retryable",
+        disposition: correspondence.disposition,
+        gate1RemainsValid: correspondence.disposition !== "GATE1_REQUIRED",
+        retryWithoutNewGate1: correspondence.disposition !== "GATE1_REQUIRED",
+        ...(gate1Restart ? { gate1Restart } : {}),
         gate1BindingDigest: ready.state.gate1.bindingDigest,
-        fullCorrespondenceAuditDigest: correspondence.reportDigest,
-        fullCorrespondenceAuditSha256: correspondenceFile.sha256,
-        independentEvidenceReviewDigest: correspondence.independentEvidenceReviewDigest,
-        reason: "full-correspondence-mismatch",
-      };
-      const marker = { ...markerCore, markerDigest: canonicalDigest(markerCore) };
-      await writeExclusiveJson(invalidationPath, marker);
-      const issueCount = ["missing", "extra", "mismatches", "duplicate", "unbound"].reduce((total, field) => total + correspondence[field].length, 0);
-      fail(`full correspondence audit found ${issueCount} mismatch(es); Gate 1 is permanently invalid and a corrected batch requires a new Gate 1.`);
+        fullCorrespondenceAudit: {
+          ...correspondenceFile,
+          reportDigest: correspondence.reportDigest,
+          status: correspondence.status,
+          disposition: correspondence.disposition,
+          coverage: correspondence.coverage,
+          totals: correspondence.totals,
+          issueCounts: Object.fromEntries(["missing", "extra", "mismatches", "duplicate", "unbound", "reviewFindings", "blocking"].map((field) => [field, correspondence[field].length])),
+          reviewFindings: clone(correspondence.reviewFindings),
+          blocking: clone(correspondence.blocking),
+        },
+        independentEvidenceReview: {
+          path: independentEvidenceReviewPath,
+          sha256: independentEvidenceReviewSha256,
+          size: independentReviewStable.size,
+          digest: correspondence.independentEvidenceReviewDigest,
+          reviewerRunId: correspondence.reviewerRunId,
+        },
+        candidateBindings: clone(correspondence.candidateBindings),
+        previewBindingDigest: gate2PreviewBuildResult.value.previewDigest,
+      });
     }
+    correspondenceFile = await writeExclusiveJson(correspondencePath, correspondence);
   }
   } catch (error) {
     await gate2PreviewBuildSettled;
@@ -1051,6 +1453,7 @@ export async function finalizeReimbursementWorkflow(rawRequest, { testHooks } = 
   const gate2PreviewBuildResult = await gate2PreviewBuildSettled;
   if (gate2PreviewBuildResult.status === "rejected") throw gate2PreviewBuildResult.reason;
   const gate2PreviewBuild = gate2PreviewBuildResult.value;
+  const gate2AttemptReports = await listGate2AttemptReports(ready.state.workflowRoot, ready.state.gate1.bindingDigest);
   try {
     const gate2 = gate2For(
       { ...ready.state.manifest, batch: { batchId: ready.state.manifest.batchId }, sourceCoverageDigest: ready.state.certificate.sourceCoverageDigest },
@@ -1075,7 +1478,7 @@ export async function finalizeReimbursementWorkflow(rawRequest, { testHooks } = 
         disposition: correspondence.disposition,
         coverage: correspondence.coverage,
         totals: correspondence.totals,
-        issueCounts: Object.fromEntries(["missing", "extra", "mismatches", "duplicate", "unbound", "blocking"].map((field) => [field, correspondence[field].length])),
+        issueCounts: Object.fromEntries(["missing", "extra", "mismatches", "duplicate", "unbound", "reviewFindings", "blocking"].map((field) => [field, correspondence[field].length])),
         metrics: correspondence.metrics,
       },
       independentEvidenceReview: {
@@ -1085,12 +1488,13 @@ export async function finalizeReimbursementWorkflow(rawRequest, { testHooks } = 
         digest: correspondence.independentEvidenceReviewDigest,
         reviewerRunId: correspondence.reviewerRunId,
       },
+      gate2AttemptReports,
       gate2PreviewBuild,
       gate2,
       previousState: { path: ready.path, sha256: ready.snapshot.sha256 },
     };
     const state = { ...core, stateDigest: canonicalDigest(core) };
-    const stateFile = await writeExclusiveJson(path.join(ready.state.workflowRoot, "ready-gate-2.json"), state);
+    const stateFile = await writeIdempotentJson(path.join(ready.state.workflowRoot, "ready-gate-2.json"), state);
     return deepFreeze({
       status: "ready-for-gate-2",
       gate2BindingDigest: gate2.bindingDigest,
@@ -1125,7 +1529,7 @@ export async function finalizeReimbursementWorkflow(rawRequest, { testHooks } = 
       }),
     });
   } catch (error) {
-    const cleanup = await cleanupBound(gate2PreviewBuild.ownedFiles, [gate2PreviewBuild.outputRoot]);
+    const cleanup = await cleanupBound(gate2PreviewBuild.ownedFiles, []);
     if (cleanup.preserved.length || cleanup.failures.length) {
       fail(`${error instanceof Error ? error.message : String(error)}; Gate 2 preview cleanup was incomplete.`);
     }
@@ -1155,7 +1559,7 @@ async function cleanupCreatedDirectories(directories) {
     try {
       await fs.rmdir(directoryPath);
     } catch (error) {
-      if (error?.code !== "ENOENT") failures.push(directoryPath);
+      if (error?.code !== "ENOENT") failures.push({ path: directoryPath, error });
     }
   }
   return failures;
@@ -1198,14 +1602,37 @@ async function rollbackPublished(entries) {
   return errors;
 }
 
-export async function publishReimbursementWorkflow(rawRequest) {
+export async function publishReimbursementWorkflow(rawRequest, { testHooks } = {}) {
   exact(rawRequest, new Set(["statePath", "expectedGate1BindingDigest", "gate1ApprovalText", "expectedGate2BindingDigest", "gate2ApprovalText"]), "publish request");
-  if (rawRequest.gate1ApprovalText !== GATE1_TEXT || rawRequest.gate2ApprovalText !== GATE2_TEXT) fail("both approval texts must be exact and supplied from the current task.");
   const ready = await readState(rawRequest.statePath, WORKFLOW_GATE2_KIND);
+  const publishCorrection = ready.state.gate2Correction ? validateGate2Correction(ready.state.gate2Correction, "publish Gate 2 correction") : null;
+  if (rawRequest.gate2ApprovalText !== GATE2_TEXT) fail("Gate 2 approval text must be exact and supplied from the current task.");
+  if (publishCorrection ? rawRequest.gate1ApprovalText !== null : rawRequest.gate1ApprovalText !== GATE1_TEXT) fail("Gate 1 approval must be the original exact text for an unchanged Gate 1, or null for a verified Gate 2 correction carry-forward.");
+  await assertNoGate1RestartRequired(ready.state);
+  try {
+    await assertSourceMaterialsUnchanged(ready.state.manifest, "publish");
+  } catch (error) {
+    if (error?.code !== GATE1_RESTART_REQUIRED_ERROR_CODE) {
+      fail(`publish source verification could not complete; Gate 1 remains valid and may be retried: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    await writeGate1RestartRequired(ready.state, "source material or manifest changed after Gate 2", canonicalDigest(ready.state.manifest));
+    throw error;
+  }
+  try {
+    await assertGate1BaselinesUnchanged(ready.state.baselines);
+  } catch (error) {
+    if (error?.code !== GATE1_RESTART_REQUIRED_ERROR_CODE) {
+      fail(`publish baseline verification could not complete; Gate 1 remains valid and may be retried: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    await writeGate1RestartRequired(ready.state, "formal ledger baseline changed after Gate 2", canonicalDigest(ready.state.baselines));
+    throw error;
+  }
   if (sha(rawRequest.expectedGate1BindingDigest, "expectedGate1BindingDigest") !== ready.state.gate1.bindingDigest || sha(rawRequest.expectedGate2BindingDigest, "expectedGate2BindingDigest") !== ready.state.gate2.bindingDigest) fail("Gate binding digest differs from the reviewed state.");
   await Promise.all([
     assertBoundFile(ready.state.fullCorrespondenceAudit, "publish full correspondence audit"),
     assertBoundFile(ready.state.independentEvidenceReview, "publish independent evidence review"),
+    ...(publishCorrection ? [assertBoundFile(publishCorrection.attemptReport, "publish Gate 2 correction attempt report")] : []),
+    ...(ready.state.gate2AttemptReports ?? []).map((report) => assertBoundFile(report, "publish Gate 2 attempt report")),
   ]);
   const registry = await loadProfileRegistry();
   const rootByProfile = new Map(ready.state.rootBuild.artifacts.map((item) => [item.profileId, item]));
@@ -1266,6 +1693,7 @@ export async function publishReimbursementWorkflow(rawRequest) {
       archived.evidenceArchive = copies.slice(evidenceOffset).map((copied, index) => ({ evidenceId: presentation.evidenceArchive[index].evidenceId, ...copied }));
       const baselineStable = await readStableBinaryFile(baseline.path);
       const backupPath = path.join(ready.state.workflowRoot, `.rollback-${baseline.profileId}-${crypto.randomBytes(8).toString("hex")}.xlsx`);
+      const backupBinding = { path: backupPath, sha256: baselineStable.sha256, size: baselineStable.size };
       let backupCreated = false;
       try {
         const handle = await fs.open(backupPath, "wx", 0o600);
@@ -1277,9 +1705,9 @@ export async function publishReimbursementWorkflow(rawRequest) {
         }
         throw error;
       }
-      const backup = await readStableBinaryFile(backupPath);
-      const backupBinding = { path: backupPath, sha256: backup.sha256, size: backup.size };
       backups.push(backupBinding);
+      await testHooks?.afterBackupCreated?.(clone(backupBinding));
+      await assertBoundFile(backupBinding, `${baseline.profileId} rollback backup`);
       const targetPath = path.join(path.dirname(baseline.path), profile.canonicalRootWorkbookName);
       let targetOriginallyAbsent = false;
       if (!samePath(targetPath, baseline.path)) {
@@ -1364,26 +1792,29 @@ export async function publishReimbursementWorkflow(rawRequest) {
       };
     });
     const receiptCore = { kind: WORKFLOW_RECEIPT_KIND, batchId: ready.state.manifest.batchId, affectedProfileIds: ready.state.affectedProfileIds, outputs, postPublishAuditDigest: canonicalDigest(postAudit) };
-    const cleanupFiles = [...backups, ...temporaryAuditFiles, ...ready.state.rootBuild.ownedFiles, ...ready.state.presentationBuild.ownedFiles, ...ready.state.previewBuild.ownedFiles, ...ready.state.gate2PreviewBuild.ownedFiles, ready.state.fullCorrespondenceAudit, ready.state.previewCheckpoint, { path: ready.path, sha256: ready.snapshot.sha256 }, ready.state.previousState];
-    const cleanup = await cleanupBound(cleanupFiles, [ready.state.workflowRoot, ready.state.previewBuild.outputRoot, ready.state.gate2PreviewBuild.outputRoot, ready.state.rootBuild.stagingRoot, ready.state.presentationBuild.stagingRoot]);
+    const cleanupFiles = [...backups, ...temporaryAuditFiles, ...ready.state.rootBuild.ownedFiles, ...ready.state.presentationBuild.ownedFiles, ...ready.state.previewBuild.ownedFiles, ...ready.state.gate2PreviewBuild.ownedFiles, ...(ready.state.gate2AttemptReports ?? []), ...(ready.state.supersededWorkflowCleanup?.files ?? []), ready.state.fullCorrespondenceAudit, ready.state.previewCheckpoint, { path: ready.path, sha256: ready.snapshot.sha256 }, ready.state.previousState];
+    const cleanup = await cleanupBound(cleanupFiles, [...(ready.state.supersededWorkflowCleanup?.roots ?? []), ready.state.workflowRoot, ready.state.previewBuild.outputRoot, ready.state.gate2PreviewBuild.outputRoot, ready.state.rootBuild.stagingRoot, ready.state.presentationBuild.stagingRoot]);
     return deepFreeze({ ...receiptCore, receiptDigest: canonicalDigest(receiptCore), cleanup });
   } catch (error) {
     const rollbackErrors = await rollbackPublished(published);
+    const backupCleanup = rollbackErrors.length ? { preserved: backups.map((item) => item.path), failures: [] } : await cleanupBound(backups, []);
     const archiveCleanup = await cleanupBound([...archiveCopies, ...temporaryAuditFiles], []);
     const directoryCleanupFailures = await cleanupCreatedDirectories(createdDirectories);
-    if (rollbackErrors.length || archiveCleanup.preserved.length || archiveCleanup.failures.length || directoryCleanupFailures.length) fail(`${error instanceof Error ? error.message : String(error)}; recovery incomplete: ${[...rollbackErrors, ...archiveCleanup.preserved, ...archiveCleanup.failures.map((item) => item.path), ...directoryCleanupFailures].join(", ")}`);
+    if (rollbackErrors.length || backupCleanup.preserved.length || backupCleanup.failures.length || archiveCleanup.preserved.length || archiveCleanup.failures.length || directoryCleanupFailures.length) fail(`${error instanceof Error ? error.message : String(error)}; recovery incomplete: ${[...rollbackErrors, ...backupCleanup.preserved, ...backupCleanup.failures.map((item) => item.path), ...archiveCleanup.preserved, ...archiveCleanup.failures.map((item) => item.path), ...directoryCleanupFailures.map((item) => `${item.path}${item.error?.code ? ` [${item.error.code}]` : ""}`)].join(", ")}`);
     throw error;
   }
 }
 
 async function main() {
   const args = process.argv.slice(2);
-  if (args.length !== 2 || !["--prepare", "--finalize", "--publish"].includes(args[0])) fail("usage: run_reimbursement_workflow.mjs --prepare|--finalize|--publish <strict-json-request>.");
+  if (args.length !== 2 || !["--prepare", "--finalize", "--revise-gate2", "--publish"].includes(args[0])) fail("usage: run_reimbursement_workflow.mjs --prepare|--finalize|--revise-gate2|--publish <strict-json-request>.");
   const input = await readStableUtf8JsonFile(path.resolve(args[1]), { maxBytes: MAX_JSON_BYTES });
   const result = args[0] === "--prepare"
     ? await prepareReimbursementWorkflow(input.value)
     : args[0] === "--finalize"
       ? await finalizeReimbursementWorkflow(input.value)
+      : args[0] === "--revise-gate2"
+        ? await reviseGate2ReimbursementWorkflow(input.value)
       : await publishReimbursementWorkflow(input.value);
   process.stdout.write(`${JSON.stringify(result)}\n`);
 }

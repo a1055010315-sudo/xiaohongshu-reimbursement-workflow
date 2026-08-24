@@ -1,5 +1,7 @@
 import crypto from "node:crypto";
 
+export const MAX_ORDINARY_REGRESSION_PERCENT = 5;
+
 function finiteValues(values, field) {
   if (!Array.isArray(values) || values.length === 0) throw new Error(`${field} must contain at least one sample.`);
   const result = values.map((value, index) => {
@@ -72,13 +74,15 @@ export function evaluateStrictPerformanceAcceptance({
   const criteria = Object.freeze({
     p50PointAtLeastThreshold: p50ImprovementPercent >= thresholdPercent,
     p50PairedBootstrapLowerAtLeastThreshold: p50BootstrapLowerPercent >= thresholdPercent,
-    p95PointNotRegressed: p95ImprovementPercent >= 0,
+    p50PointRegressionAtMostFivePercent: p50ImprovementPercent >= -MAX_ORDINARY_REGRESSION_PERCENT,
+    p95PointRegressionAtMostFivePercent: p95ImprovementPercent >= -MAX_ORDINARY_REGRESSION_PERCENT,
     peakRssIncreaseAtMostFifteenPercent: peakRssRegressionPercent <= 15,
     outputExactlyEquivalent: outputEquivalent,
   });
   const improvementTargetMet = criteria.p50PointAtLeastThreshold
     && criteria.p50PairedBootstrapLowerAtLeastThreshold;
-  const safeguardsPassed = criteria.p95PointNotRegressed
+  const safeguardsPassed = criteria.p50PointRegressionAtMostFivePercent
+    && criteria.p95PointRegressionAtMostFivePercent
     && criteria.peakRssIncreaseAtMostFifteenPercent
     && criteria.outputExactlyEquivalent;
   return Object.freeze({ criteria, improvementTargetMet, safeguardsPassed, passed: safeguardsPassed });

@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 
-import { loadBundledDependency, canonicalDigest, readStableBinaryFile, sha256Bytes } from "./workflow_primitives.mjs";
+import { loadBundledDependency, canonicalDigest, mapSettledLimit, readStableBinaryFile, sha256Bytes } from "./workflow_primitives.mjs";
 import { assertXml10Text, formatDisbursementAmount, parseDisbursementAmount } from "./disbursement_domain.mjs";
 import { loadDisbursementTemplate } from "./disbursement_template.mjs";
 import { auditOpenedWorkbookStyleContract } from "./workbook_style_contract.mjs";
@@ -463,17 +463,162 @@ export async function buildDisbursementArchiveBytes(audit) {
   return Object.freeze({ summaryText, summaryBytes, workbookBytes, workbookInspection, vouchers: Object.freeze(vouchers), bindings, artifactDigest });
 }
 
-async function writeExclusive(filePath, bytes) {
-  const handle = await fs.open(filePath, "wx", 0o600);
+const candidateWrittenFileIdentities = new WeakMap();
+
+function candidateFileIdentity(stats) {
+  return Object.freeze({
+    dev: String(stats.dev),
+    ino: String(stats.ino),
+    mode: String(stats.mode),
+    size: String(stats.size),
+    mtimeNs: String(stats.mtimeNs),
+    ctimeNs: String(stats.ctimeNs),
+    birthtimeNs: String(stats.birthtimeNs),
+  });
+}
+
+async function inspectCandidateFileIdentity(filePath) {
+  const stats = await fs.lstat(filePath, { bigint: true });
+  if (!stats.isFile() || stats.isSymbolicLink()) fail(`candidate output is not a regular owned file: ${filePath}.`);
+  return candidateFileIdentity(stats);
+}
+
+async function inspectCandidateHandleIdentity(handle, filePath) {
+  const stats = await handle.stat({ bigint: true });
+  if (!stats.isFile()) fail(`candidate output handle is not a regular owned file: ${filePath}.`);
+  return candidateFileIdentity(stats);
+}
+
+function sameCandidateObjectIdentity(left, right) {
+  return left?.dev === right?.dev
+    && left?.ino === right?.ino
+    && left?.mode === right?.mode
+    && left?.birthtimeNs === right?.birthtimeNs;
+}
+
+function sameCandidateFileIdentity(left, right) {
+  return sameCandidateObjectIdentity(left, right)
+    && left?.size === right?.size
+    && left?.mtimeNs === right?.mtimeNs
+    && left?.ctimeNs === right?.ctimeNs;
+}
+
+function candidateCleanupFailure(operation, filePath, error) {
+  return Object.freeze({
+    operation,
+    path: path.resolve(filePath),
+    message: error instanceof Error ? error.message : String(error),
+  });
+}
+
+function wrapCandidateCleanupError(error, failures) {
+  const primary = error?.candidateCleanupPrimary instanceof Error
+    ? error.candidateCleanupPrimary
+    : error instanceof Error
+      ? error
+      : new Error("Candidate archive operation failed with a non-Error reason.", { cause: error });
+  const combined = [
+    ...(Array.isArray(error?.candidateCleanupFailures) ? error.candidateCleanupFailures : []),
+    ...failures,
+  ];
+  const byIdentity = new Map(combined.map((entry) => [`${entry.operation}\0${entry.path}\0${entry.message}`, entry]));
+  const cleanupFailures = Object.freeze([...byIdentity.values()]);
+  const preservedPaths = Object.freeze([...new Set(cleanupFailures.map((entry) => entry.path))].sort());
+  const wrapped = new Error(
+    `${primary.message} Candidate cleanup is incomplete; preserved paths: ${preservedPaths.join(", ")}.`,
+    { cause: primary },
+  );
+  Object.defineProperties(wrapped, {
+    candidateCleanupPrimary: { value: primary },
+    candidateCleanupFailures: { value: cleanupFailures },
+    preservedPaths: { value: preservedPaths },
+  });
+  return wrapped;
+}
+
+async function cleanupWrittenCandidateFile(entry, failures) {
   try {
+    const expectedIdentity = candidateWrittenFileIdentities.get(entry);
+    if (!expectedIdentity) fail(`candidate cleanup identity is missing for ${entry.path}.`);
+    const beforeIdentity = await inspectCandidateFileIdentity(entry.path);
+    if (!sameCandidateFileIdentity(beforeIdentity, expectedIdentity)) fail(`candidate cleanup identity changed for ${entry.path}.`);
+    const snapshot = await readStableBinaryFile(entry.path, { maxBytes: Math.max(entry.size, 1) });
+    if (snapshot.sha256 !== entry.sha256 || snapshot.size !== entry.size) {
+      fail(`candidate cleanup content changed for ${entry.path}.`);
+    }
+    const afterIdentity = await inspectCandidateFileIdentity(entry.path);
+    if (!sameCandidateFileIdentity(afterIdentity, expectedIdentity)) fail(`candidate cleanup identity changed for ${entry.path}.`);
+    await fs.unlink(entry.path);
+  } catch (error) {
+    if (error?.code === "ENOENT") return;
+    const stillExists = await fs.lstat(entry.path).then(() => true, (currentError) => {
+      if (currentError?.code === "ENOENT") return false;
+      return true;
+    });
+    if (stillExists) failures.push(candidateCleanupFailure("unlink", entry.path, error));
+  }
+}
+
+async function cleanupCandidateDirectory(directoryPath, failures) {
+  try {
+    await fs.rmdir(directoryPath);
+  } catch (error) {
+    if (error?.code !== "ENOENT") failures.push(candidateCleanupFailure("rmdir", directoryPath, error));
+  }
+}
+
+async function writeExclusive(filePath, bytes) {
+  let handle;
+  let created = false;
+  let createdIdentity;
+  try {
+    handle = await fs.open(filePath, "wx", 0o600);
+    created = true;
+    createdIdentity = await inspectCandidateHandleIdentity(handle, filePath);
+    const createdPathIdentity = await inspectCandidateFileIdentity(filePath);
+    if (!sameCandidateFileIdentity(createdPathIdentity, createdIdentity)) {
+      fail(`candidate path identity changed immediately after creation: ${filePath}.`);
+    }
     await handle.writeFile(bytes);
     await handle.sync();
-  } finally {
+    const finalHandleIdentity = await inspectCandidateHandleIdentity(handle, filePath);
+    if (!sameCandidateObjectIdentity(finalHandleIdentity, createdIdentity)) {
+      fail(`candidate handle identity changed while writing: ${filePath}.`);
+    }
     await handle.close();
+    handle = null;
+    const finalPathIdentity = await inspectCandidateFileIdentity(filePath);
+    if (!sameCandidateFileIdentity(finalPathIdentity, finalHandleIdentity)) {
+      fail(`candidate path identity changed after durable write: ${filePath}.`);
+    }
+    const snapshot = await readStableBinaryFile(filePath, { maxBytes: Math.max(bytes.length, 1) });
+    if (snapshot.sha256 !== sha256Bytes(bytes) || snapshot.size !== bytes.length) fail(`exclusive write verification failed for ${filePath}.`);
+    const verifiedPathIdentity = await inspectCandidateFileIdentity(filePath);
+    if (!sameCandidateFileIdentity(verifiedPathIdentity, finalHandleIdentity)) {
+      fail(`candidate path identity changed during durable write verification: ${filePath}.`);
+    }
+    const binding = Object.freeze({ path: filePath, sha256: snapshot.sha256, size: snapshot.size });
+    candidateWrittenFileIdentities.set(binding, finalHandleIdentity);
+    return binding;
+  } catch (error) {
+    if (handle) await handle.close().catch(() => {});
+    if (created) {
+      try {
+        const currentIdentity = await inspectCandidateFileIdentity(filePath);
+        if (!sameCandidateObjectIdentity(createdIdentity, currentIdentity)) {
+          fail(`candidate partial-file identity changed before cleanup: ${filePath}.`);
+        }
+        await fs.unlink(filePath);
+      } catch (cleanupError) {
+        const stillExists = await fs.lstat(filePath).then(() => true, (currentError) => {
+          if (currentError?.code === "ENOENT") return false;
+          return true;
+        });
+        if (stillExists) throw wrapCandidateCleanupError(error, [candidateCleanupFailure("unlink_partial", filePath, cleanupError)]);
+      }
+    }
+    throw error;
   }
-  const snapshot = await readStableBinaryFile(filePath, { maxBytes: Math.max(bytes.length, 1) });
-  if (snapshot.sha256 !== sha256Bytes(bytes) || snapshot.size !== bytes.length) fail(`exclusive write verification failed for ${filePath}.`);
-  return Object.freeze({ path: filePath, sha256: snapshot.sha256, size: snapshot.size });
 }
 
 export async function buildDisbursementArchive(audit, outputRoot) {
@@ -490,16 +635,35 @@ export async function buildDisbursementArchive(audit, outputRoot) {
     const voucherDirectory = path.join(resolvedOutputRoot, DISBURSEMENT_VOUCHER_DIRECTORY);
     await fs.mkdir(voucherDirectory, { recursive: false });
     voucherDirectoryCreated = true;
-    const summary = await writeExclusive(path.join(resolvedOutputRoot, DISBURSEMENT_SUMMARY_FILENAME), built.summaryBytes);
-    createdFiles.push(summary);
-    const workbook = await writeExclusive(path.join(resolvedOutputRoot, DISBURSEMENT_WORKBOOK_FILENAME), built.workbookBytes);
-    createdFiles.push(workbook);
-    const vouchers = [];
-    for (const entry of built.vouchers) {
-      const written = await writeExclusive(path.join(voucherDirectory, entry.archiveName), entry.bytes);
-      createdFiles.push(written);
-      vouchers.push(Object.freeze({ ...written, name: entry.archiveName, sourceIds: entry.sourceIds, rowReferences: entry.rowReferences }));
+    const writeJobs = [
+      { path: path.join(resolvedOutputRoot, DISBURSEMENT_SUMMARY_FILENAME), bytes: built.summaryBytes },
+      { path: path.join(resolvedOutputRoot, DISBURSEMENT_WORKBOOK_FILENAME), bytes: built.workbookBytes },
+      ...built.vouchers.map((entry) => ({ path: path.join(voucherDirectory, entry.archiveName), bytes: entry.bytes })),
+    ];
+    let writes;
+    try {
+      writes = await mapSettledLimit(writeJobs, 3, (job) => writeExclusive(job.path, job.bytes));
+    } catch (error) {
+      const rejectedCleanupFailures = [];
+      for (const entry of error?.settledDetails?.settled ?? []) {
+        if (entry?.status === "fulfilled") createdFiles.push(entry.value);
+        else if (entry?.status === "rejected" && Array.isArray(entry.reason?.candidateCleanupFailures)) {
+          rejectedCleanupFailures.push(...entry.reason.candidateCleanupFailures);
+        }
+      }
+      if (rejectedCleanupFailures.length > 0) throw wrapCandidateCleanupError(error, rejectedCleanupFailures);
+      throw error;
     }
+    const written = writes.settled.map((entry) => entry.value);
+    createdFiles.push(...written);
+    const summary = written[0];
+    const workbook = written[1];
+    const vouchers = built.vouchers.map((entry, index) => Object.freeze({
+      ...written[index + 2],
+      name: entry.archiveName,
+      sourceIds: entry.sourceIds,
+      rowReferences: entry.rowReferences,
+    }));
     const rootEntries = (await fs.readdir(resolvedOutputRoot)).sort();
     if (canonicalDigest(rootEntries) !== canonicalDigest([...DISBURSEMENT_FINAL_ROOT_ENTRIES].sort())) fail("candidate archive root does not contain exactly the three required entries.");
     return Object.freeze({
@@ -513,9 +677,13 @@ export async function buildDisbursementArchive(audit, outputRoot) {
       ownedFiles: Object.freeze(createdFiles),
     });
   } catch (error) {
-    for (const entry of [...createdFiles].reverse()) await fs.unlink(entry.path).catch(() => {});
-    if (voucherDirectoryCreated) await fs.rmdir(path.join(resolvedOutputRoot, DISBURSEMENT_VOUCHER_DIRECTORY)).catch(() => {});
-    if (rootCreated) await fs.rmdir(resolvedOutputRoot).catch(() => {});
+    const cleanupFailures = [];
+    for (const entry of [...createdFiles].reverse()) await cleanupWrittenCandidateFile(entry, cleanupFailures);
+    if (voucherDirectoryCreated) await cleanupCandidateDirectory(path.join(resolvedOutputRoot, DISBURSEMENT_VOUCHER_DIRECTORY), cleanupFailures);
+    if (rootCreated) await cleanupCandidateDirectory(resolvedOutputRoot, cleanupFailures);
+    if (cleanupFailures.length > 0 || error?.candidateCleanupFailures?.length > 0) {
+      throw wrapCandidateCleanupError(error, cleanupFailures);
+    }
     throw error;
   }
 }

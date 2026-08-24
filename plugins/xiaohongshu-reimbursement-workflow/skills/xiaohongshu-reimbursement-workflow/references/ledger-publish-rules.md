@@ -17,11 +17,11 @@
 
 `--finalize` 从磁盘独立读取全部 Gate 1 绑定工件、候选本批行、预览源绑定和 `independent-evidence-review-v1`，逐交易、逐媒体、逐引用、逐补报和逐说明注释生成 `gate2-full-correspondence-v1`。候选检查仍限本批行和局部补丁，不得扩展为历史全表业务检查。候选与完整预览绑定未变化时可复制已核验 Gate 1 PNG 字节；必须重新核对 PNG 与源工作簿哈希，并把全量对应报告摘要纳入新的 Gate 2 绑定。
 
-Gate 2 的目的在于发现已经进入 Gate 1 的内容错误，不能用“文件 SHA 未变化”代替内容复核。成功读取后的业务/工件 mismatch 使当前 Gate 1 永久失效；独立 review 格式或绑定错误、临时 I/O/权限和未知基础设施异常只阻塞并允许修正输入后重试。
+Gate 2 的目的在于发现已经进入 Gate 1 的内容错误，不能用“文件 SHA 未变化”代替内容复核。独立 reviewer 的单方差异返回 `REVIEW_REQUIRED`；绑定 resolution 确认的业务事实、漏项/重复项或可稳定重算的派生工件错误返回 `CORRECTION_REQUIRED`，在同材料、同基线内修复并自动携带原 Gate 1 确认。材料集合/SHA、正式基线变化或证据不确定返回 `GATE1_REQUIRED`；格式/绑定、临时 I/O/权限和未知基础设施异常返回 `BLOCKED_RETRYABLE`。
 
 展示 Gate 2 全量对应报告、`reportDigest`、`bindingDigest`、候选路径/SHA256 和终审结果后，只有用户在新消息中精确发送 `确认更新根目录支出总表` 才可发布。完整预览绑定未变时用户侧可以不重复展示相同 PNG，但报告不能省略。
 
-业务事实、来源覆盖、候选、计划、预览或基线任一变化时，两道门禁同时失效，必须回到 Gate 1。
+Gate 2 correction 引起的业务事实、候选、计划和预览变化不要求新的人工 Gate 1；原材料集合/路径/类型/SHA 或正式总表基线变化仍必须回到 Gate 1。
 
 ## 原子发布
 

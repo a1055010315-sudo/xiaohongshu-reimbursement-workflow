@@ -34,7 +34,7 @@ Gate 2 输出 `gate2-full-correspondence-v1`，至少包含：
 - `supplementResults`：每位补报人员的期间、原因、逐笔明细和汇总对应结果；
 - `annotationResults`：每条说明注释的独立观察、绑定和状态；
 - `coverage`、`perPerson`、`perClassification`、`totals`；
-- `missing`、`extra`、`duplicate`、`unbound` 和 `mismatches`；
+- `missing`、`extra`、`duplicate`、`unbound`、`mismatches`、`reviewFindings` 和 `blocking`；
 - `previewBindingDigest`；
 - `reportDigest`，其 preimage 必须覆盖上述全部字段，且不得包含自身。
 
@@ -46,14 +46,16 @@ Gate 2 输出 `gate2-full-correspondence-v1`，至少包含：
 - Gate 2 中每个交付工件只读取并解析一次，所得结构化表示供逐项对应、汇总和报告共同复用。
 - 每个唯一媒体从原始路径 fresh-read、核对 SHA256 并完整 decode 一次；多个交易引用不得触发重复磁盘读取或重复解码。
 - 候选总表只读取当前绑定的 `batchRows`、必要表头和局部补丁摘要，禁止为 Gate 2 扫描历史全表业务。
-- 性能评估基线固定为只读安装版本 `0.5.0+codex.20260819174146`，禁止修改其文件或缓存。使用同一机器、同一完全合成批次和相同冷/热规则，分别比较旧版 `prepare + Gate 1 + finalize` 与新版 `prepare + Gate 1 + full-correspondence Gate 2 finalize` 的插件可控代码阶段总耗时。20% 仅作为默认信息性改善目标；通过仍要求输出完全等价、p95 不退化且冷/热峰值内存增幅均不超过 15%。
+- H 线只保留历史校准；普通 O 线以本轮修改前、与候选输出契约等价的只读已安装版本为锁定基线，双方 version、skill tree 和 package tree digest 均须在运行前后一致。使用同一机器、同一完全合成批次和相同冷/热规则，比较 `prepare + Gate 1 + finalize` 的插件可控代码阶段总耗时。20% 仅为信息性改善目标；通过要求输出完全等价，冷、热 p50 与 p95 均不得退化超过 5%，各轮采样峰值 RSS 的 p95 增幅均不超过 15%，且任何 renderer 下预览 PNG 均保持唯一。任一硬条件失败都禁止打包、安装或发布。
 - 外部人员或模型生成独立观察的等待时间必须单列记录并从插件计时中排除；插件读取 `independent-evidence-review-v1`、校验其摘要、每个唯一媒体的 fresh-read/decode、逐项审计、汇总和 `gate2-full-correspondence-v1` 报告生成均属于插件可控阶段，必须计入。新旧测量使用同一计时边界，且不得以等待时间排除掩盖插件内部工作。
 - 未达到信息性改善目标时如实报告，并优先 review 重复文件读取、图片解码、OOXML 解析和摘要计算；不为跨过目标继续叠加低收益复杂度。不得通过跳过第二视觉读取、信任 Gate 1 抽取、减少媒体/交易/交付物覆盖或只验哈希来提速。
 
 ## 失效与展示
 
-只有 `missing`、`extra`、`duplicate`、`unbound`、`mismatches` 全为空，全部逐项状态通过，并且候选、计划、来源覆盖、本批行区段、独立复核和预览绑定均未变化时，才能生成 Gate 2 binding；成功报告的 disposition 为 `PASSED`。
+只有 `missing`、`extra`、`duplicate`、`unbound`、`mismatches`、`reviewFindings` 和 `blocking` 全为空，全部逐项状态通过，并且候选、计划、来源覆盖、本批行区段、独立复核和预览绑定均未变化时，才能生成 Gate 2 binding；成功报告的 disposition 为 `PASSED`。
 
-Gate 1 工件被成功读取且完成有效 review 后确认的任一内容 mismatch，都表示用户确认的 Gate 1 材料不再成立：报告 disposition 为 `SUBSTANTIVE_MISMATCH`，立即使当前 Gate 1 和未完成的 Gate 2 同时失效。修正业务事实或成品后必须重新生成、重新展示并重新获得一个新的 Gate 1，禁止沿用旧确认或只重新运行 Gate 2。独立 review 自身格式/绑定错误、missing/extra/duplicate/unbound、字段不完整或内部冲突、临时权限/I/O/解析/机器问题以及未知内部异常的 disposition 为 `BLOCKED_RETRYABLE`，只阻塞并允许绑定不变时修正后重试，不得据此永久判定 Gate 1 内容错误。
+独立 reviewer 的单方语义判断、注释金额或媒体元数据与 Gate 1 不同进入 `reviewFindings`，报告 disposition 为 `REVIEW_REQUIRED`。该结果必须写入以 `reportDigest` 命名的内容寻址尝试报告，向用户展示 expected/actual 和定位；当前 Gate 1 保持有效。修正独立 review 后使用新的 review SHA 直接重新运行 Gate 2。若再次核对确认 Gate 1 内容错，review 通过 `gate2-finding-resolution-v1` 绑定前一份确含 finding 的 `REVIEW_REQUIRED` 报告和 review SHA，明确选择 `gate1-content-error`；确认 reviewer 错选择 `reviewer-error`；证据无法确定选择 `evidence-uncertain`。纯 `BLOCKED_RETRYABLE` 报告不能授权语义裁决；先排除阻塞并重跑取得可裁决 finding。不得从同一差异自动猜测结论。
+
+同一批、相同原材料集合/路径/类型/SHA 和相同正式总表基线内，已裁决的业务事实、漏项、重复项，或 manifest/certificate、候选、明细、截图表、补报表、文字说明、预览之间可稳定重算的错误，报告 disposition 为 `CORRECTION_REQUIRED`。`--revise-gate2` 只接受该状态，重建受影响事实和下游工件，生成新的 Gate 1 binding 但自动携带原人工确认；后续 finalize 与 publish 的 Gate 1 文本均为 `null`。材料集合/SHA、正式基线变化或 `evidence-uncertain` 为 `GATE1_REQUIRED`；格式/绑定错误、临时权限/I/O/解析/机器和未知内部异常为 `BLOCKED_RETRYABLE`。
 
 若完整预览绑定未变化，Gate 2 可以复用已核验 Gate 1 PNG 字节，界面也可以不重复展示同一组 PNG；但必须向用户展示本次 `gate2-full-correspondence-v1` 报告及 `reportDigest`、新的 Gate 2 binding、候选路径和候选 SHA256。报告属于门禁工件，不进入最终归档。

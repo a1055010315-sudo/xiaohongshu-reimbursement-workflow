@@ -1,6 +1,6 @@
 ---
 name: xiaohongshu-reimbursement-workflow
-description: "Process Xiaohongshu, company, or residence reimbursement batches and supplements from one manifest, or explicitly build a compact downstream disbursement archive from already audited reimbursement facts, final salary artifacts, payment evidence, and human disposition decisions. Use for 小红书报销、公司报销、驻所/住所报销、补报、续跑、终审、发布或发放归档. Historical ledger correction and compact disbursement are separate explicit modes and are never invoked by ordinary reimbursement."
+description: "Process Xiaohongshu, company, or residence reimbursement batches and supplements, or explicitly build a compact downstream disbursement archive from user-identified published reimbursement artifacts or fresh evidence, final salary materials, payout vouchers, and disposition decisions. Use for 小红书报销、公司报销、驻所/住所报销、补报、续跑、终审、发布或发放归档. Historical ledger correction and compact disbursement are separate explicit modes and are never invoked by ordinary reimbursement."
 ---
 
 # 报销工作流
@@ -9,7 +9,7 @@ description: "Process Xiaohongshu, company, or residence reimbursement batches a
 
 - 普通新增或补报：只用 `scripts/run_reimbursement_workflow.mjs`。
 - 普通交付物使用 `assets/templates/xiaohongshu/` 中经 SHA256 校验的脱敏模板；模板数据区不预置业务合并，成品投影阶段可按真实业务数据恢复必要合并和明确行高规则。
-- 发放归档：只有用户明确提出“生成/更新发放归档”时才读 [简洁发放归档](references/compact-disbursement.md)，并只用独立入口 `scripts/run_compact_disbursement_workflow.mjs --archive <request.json>`。请求 kind 为 `compact-disbursement-archive-v1`，严格只含 `kind/stagingToken/manifestPath/manifestSha256`；一次完成 fresh 复核、候选、原子发布、最终三项复核和清理，不设置人工 Gate、不索取确认口令。普通报销不得导入发放模块、扫描工资目录或读取发放凭证。
+- 发放归档：只有用户明确提出时才读 [简洁发放归档](references/compact-disbursement.md)，并使用独立 `--archive` 入口。用户从明确业务材料开始；当前任务内部生成 `sourceReview`、默认 v2 manifest 和严格四字段 request，不索取原 manifest、publish receipt、工资 certificate 或内部 JSON，也不寻找 sidecar。图片和未冻结工资 schema 的工作簿保持 review-bound；歧义先询问，不声称机械 OCR 或金额解析。一次调用完成完整安全链，不设人工 Gate；manifest v1 仅严格兼容一个发布周期并返回弃用 warning。普通报销不得导入发放模块、扫描工资目录或读取发放凭证。
 - 历史总表修复或重排：只有用户明确提出时才读 [历史修正规则](references/ledger-business-correction.md)，并使用隔离的 ledger-reorder 脚本。
 - 用户只要求检查或修改本 skill/plugin 时，不得读取、生成或修改任何报销文件。
 - 普通模式绝不调用全表历史维护链，也不因历史空行、G/H 内容、共享公式、WPS 元数据或 `mc:AlternateContent` 拒绝本批。
@@ -37,7 +37,7 @@ description: "Process Xiaohongshu, company, or residence reimbursement batches a
 4. 运行 `--prepare`。只生成受影响 profile 的交付物和候选；正式总表保持原 SHA256。当前期追加只定位业务尾部和附近标准样式；补报先建立 A 列日期与 D:F 合并边界的局部索引，若插入点落在对齐的 D:F 跨日期组内，只定点读取该组 C 金额和 D:F 锚点并在可证明公式、缓存、子行与合计闭合时自动生成局部拆分计划。除此之外不得读取历史 B:F 业务内容。
 5. 展示 TXT 全文、明细预览、截图表预览、本批总表增量预览、候选路径/SHA256 和 Gate 1 `bindingDigest`。
 6. 只有用户在新消息中精确发送 `本次报销通过无误`，才运行 `--finalize`。
-7. Gate 2 从磁盘独立重算本批和局部补丁，并使用 `independent-evidence-review-v1` 对原始绑定证据进行第二次语义读取，生成 `gate2-full-correspondence-v1` 全量逐项报告。Gate 2 的用途是主动发现 Gate 1 的内容错误，不是只复验哈希。第二次视觉读取不得复制或由 Gate 1 的 OCR、抽取结果、manifest、成品表或预览自动生成。
+7. Gate 2 从磁盘独立重算本批和局部补丁，并使用 `independent-evidence-review-v1` 对原始绑定证据进行第二次语义读取，生成 `gate2-full-correspondence-v1` 全量逐项报告。Gate 2 的用途是主动发现 Gate 1 的内容错误，不是只复验哈希。第二次视觉读取不得复制或由 Gate 1 的 OCR、抽取结果、manifest、成品表或预览自动生成；若独立观察与 Gate 1 冲突，先形成可读 finding，再由绑定前次报告的 resolution 明确是 Gate 1 内容错、reviewer 错或证据不确定，禁止自动猜测。
 8. 展示 Gate 2 全量对应报告、绑定、候选路径/SHA256。绑定完全一致时可以不重复展示 Gate 1 PNG，但不得省略报告。只有用户在新消息中精确发送 `确认更新根目录支出总表`，才运行 `--publish`。
 9. 发布器再次核对正式总表基线 SHA256，原子替换，验证归档，再清理任务临时目录。
 
@@ -73,7 +73,7 @@ description: "Process Xiaohongshu, company, or residence reimbursement batches a
 
 ## 失效与安全
 
-- 任一业务事实、来源覆盖、候选字节、计划或预览发生变化，两道门禁全部失效。
+- Gate 1 之后若原始材料集合/路径/类型/SHA 或正式总表基线变化，必须建立新 Gate 1。同一批、同一材料和同一基线内，Gate 2 已确认的业务事实、漏项、重复项或派生工件错误属于例外：使用 `--revise-gate2` 重建并自动携带原确认，不再次索取人工 Gate 1。
 - 备注/分类修订复用未变化证据的 SHA 与图像元数据，只重建受影响事实及下游交付物。
 - Gate 2 前正式总表不得变化；外部修改使发布立即阻塞。
 - 对候选总表计算全文件 SHA256 只用于并发保护，不代表也不得触发历史全表业务检查。普通审计只核对本批行、局部补丁和未涉及 OOXML 部件不变性，不计算历史总额、不重排历史、不解析历史业务。
@@ -81,7 +81,7 @@ description: "Process Xiaohongshu, company, or residence reimbursement batches a
 - 普通 Gate 只能使用本批投影，并严格绑定工作簿 SHA、Sheet、渲染范围、候选 SHA、计划 SHA、来源覆盖、本批行区段和任务摘要；不得渲染历史全表或回退到旧预览。
 - 成品工作簿必须同时满足模板 manifest 与 [工作簿样式契约](references/workbook-style-contract.json)。运行时只核对已在构建或 Gate 2 中打开的关键 OOXML 部件，不得为样式检查在 Gate 1 增加文件读取、解码或 COM，也不得在 Gate 2 再次打开同一 ZIP；完整视觉 golden 只用于发布验证。
 - 渲染失败只重跑当前预览任务，复用同一 staging token 下已绑定且未变化的业务工件、候选和证据；持续失败时阻塞 Gate，禁止全流程重建或用旧图替代。
-- Gate 2 必须逐笔、逐媒体、逐引用和逐交付表核对原始证据、manifest、明细、截图表、补报表、文字说明及候选本批行。完整、唯一且绑定有效的独立观察确认内容不一致时标记 `SUBSTANTIVE_MISMATCH`，使当前 Gate 1 失效并要求重新生成、展示和确认；独立 review 自身的 missing、extra、duplicate、unbound、字段不完整/冲突，临时 I/O/解析/机器问题或未知内部异常标记 `BLOCKED_RETRYABLE`，保留绑定未变化的 Gate 1 供修正后重试。不得把 review 不完整当作 Gate 1 内容错误。
-- 普通 Gate 1 热路径不得增加普通 Gate 2 独立复核成本。普通 Gate 2 启动后每个工件只解析一次，每个唯一媒体从原始路径 fresh-read 并完整 decode 一次后供本门禁全部引用复用，候选只读取绑定的 `batchRows` 和局部补丁。正式性能评估必须使用锁定版本与树 digest 的 H/O/D 基准：H 对照只读旧安装缓存与未修改目标版，O 对照未修改目标版与修改后普通报销，D 对照首个完整安全、无人工门禁、单次 archive 的发放实现与优化后发放实现；旧分步发放树不能作为新 D 基线。20% 仅作为默认信息性改善目标，不是通过硬门；保存原始样本并报告 p50、p95、MAD 与配对 bootstrap 95% 置信区间，并如实标明目标是否达到。通过仍要求输出完全等价、p95 不退化、冷/热峰值内存增幅均不超过 15%，普通流程还须保持预览 PNG 唯一性。外部人员或模型生成独立观察的等待时间单列且不计入；D 线必须计入来源/媒体 fresh-read/decode、候选生成、全部独立审计、原子发布、最终三项复核和清理。未达改善目标不得单独判失败，也不得继续叠加低收益复杂度；任何情况下都不得修改只读基线、关闭样式检查，或通过跳过独立复核、减少逐项范围或信任前一轮语义结果提速。
+- Gate 2 必须逐笔、逐媒体、逐引用和逐交付表核对原始证据、manifest、明细、截图表、补报表、文字说明及候选本批行。reviewer 单方差异先标记 `REVIEW_REQUIRED`；修正 reviewer 后直接重跑。绑定 resolution 确认 Gate 1 内容错，或派生工件存在可稳定重算的确定性错误时标记 `CORRECTION_REQUIRED`，只允许 `--revise-gate2` 在同材料/同基线边界内修复。证据不确定、材料/SHA 或基线变化标记 `GATE1_REQUIRED`。格式、绑定、临时 I/O/解析/机器或未知内部问题标记 `BLOCKED_RETRYABLE`。
+- 普通 Gate 1 热路径不得增加普通 Gate 2 独立复核成本。普通 Gate 2 启动后每个工件只解析一次，每个原始材料路径 fresh-read 并核对 SHA，每个唯一媒体 SHA 完整 decode 一次，候选只读取绑定的 `batchRows` 和局部补丁。正式性能评估必须使用锁定版本与树 digest 的 H/O/D 基准。20% 仅作为信息性改善目标；保存原始样本并报告 p50、p95、MAD 与配对 bootstrap 95% 置信区间。普通成功路径的冷、热 p50 和 p95 相对锁定基线均不得退化超过 5%，同时要求输出完全等价、各轮采样峰值 RSS 的 p95 增幅不超过 15% 并保持所有 renderer 的预览 PNG 唯一性；任一项失败都禁止打包、安装或发布。不得为性能跳过独立复核或增加低收益的第二套状态/构建链。
 - 图片校验按 magic bytes、JPEG SOF/PNG 头和严格完整像素解码判断类型，保留原始字节与 SHA256，并执行 25 MiB 文件与一亿像素上限；唯一兼容例外是原字节只缺末尾 `FFD9` 时可在内存验证副本临时补尾，扫描数据或其他结构被截断仍必须拒绝。
 - 失败时只保留一个带任务标记的恢复现场；成功时删除所有 workflow 创建的临时内容。
